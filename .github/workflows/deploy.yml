@@ -37,7 +37,7 @@ jobs:
         run: bun run check:gateway
 
       - name: Validate Wrangler deployment config
-        run: bunx wrangler deploy --dry-run --var R2_ACCOUNT_ID:dry-run
+        run: bunx wrangler deploy --dry-run
         working-directory: apps/gateway
 
   deploy:
@@ -74,7 +74,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy --var R2_ACCOUNT_ID:${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
           packageManager: bun
           wranglerVersion: "4.137.0"
           workingDirectory: apps/gateway

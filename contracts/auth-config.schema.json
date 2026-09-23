@@ -8,19 +8,28 @@
     "serverUrl": { "type": "string", "format": "uri", "pattern": "^https?://" },
     "auth": {
       "type": "object",
-      "required": ["type", "token"],
+      "required": ["type", "accessToken", "refreshToken", "tokenId", "expiresAt", "cachedIdentity"],
       "properties": {
-        "type": { "const": "publisher_token" },
-        "token": { "type": "string", "pattern": "^as_pub_[A-Za-z0-9_-]{43}$" },
-        "tokenId": { "type": "string" },
+        "type": { "const": "team_token" },
+        "accessToken": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "refreshToken": { "type": "string", "pattern": "^as_(api|dev|rf)_[A-Za-z0-9_-]{43}$" },
+        "tokenId": { "type": "string", "pattern": "^api_[0-9a-f-]{36}$" },
         "expiresAt": { "type": "string", "format": "date-time" },
         "cachedIdentity": {
           "type": "object",
-          "required": ["publisherId", "team", "permissions"],
+          "required": ["userId", "email", "name", "teamId", "team", "permissions"],
           "properties": {
-            "publisherId": { "type": "string" },
-            "team": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
-            "permissions": { "type": "array", "items": { "enum": ["artifacts:publish"] }, "uniqueItems": true }
+            "userId": { "type": "string", "minLength": 1 },
+            "email": { "type": "string", "format": "email" },
+            "name": { "type": "string", "minLength": 1 },
+            "teamId": { "type": "string", "minLength": 1 },
+            "team": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+            "permissions": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "enum": ["artifacts:publish", "artifacts:read"] },
+              "uniqueItems": true
+            }
           },
           "additionalProperties": false
         }

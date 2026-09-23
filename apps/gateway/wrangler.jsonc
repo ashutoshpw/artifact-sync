@@ -3,24 +3,34 @@
   "name": "artifact-sync-gateway",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-23",
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "routes": [
     { "pattern": "artifact.w3dev.app", "custom_domain": true }
   ],
   "observability": { "enabled": true },
   "vars": {
-    "R2_ACCOUNT_ID": "replace-with-account-id",
-    "R2_BUCKET_NAME": "artifact-sync",
-    "ARTIFACTS_PUBLIC_PREFIX": "artifacts"
+    "APP_ORIGIN": "https://artifact.w3dev.app",
+    "AUTH_EMAIL_FROM": "Artifact Sync <no-reply@artifact.w3dev.app>"
   },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "artifact-sync-auth",
+      "database_id": "replace-with-d1-database-id",
+      "migrations_dir": "drizzle"
+    }
+  ],
+  "send_email": [{ "name": "EMAIL" }],
   "r2_buckets": [
     { "binding": "ARTIFACTS_BUCKET", "bucket_name": "artifact-sync" }
   ],
   "secrets": {
     "required": [
-      "ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY",
-      "R2_PARENT_ACCESS_KEY_ID",
-      "R2_PARENT_SECRET_ACCESS_KEY"
+      "BETTER_AUTH_SECRET",
+      "JWT_SECRET",
+      "GITHUB_CLIENT_ID",
+      "GITHUB_CLIENT_SECRET"
     ]
   }
 }

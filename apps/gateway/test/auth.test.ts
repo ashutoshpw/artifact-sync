@@ -1,195 +1,217 @@
 import { describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
 import worker from "../src/index.ts";
+import { issueAccessToken } from "../src/auth/jwt.ts";
+import { ACCESS_TOKEN_SECONDS, PUBLISH_PERMISSION, READ_PERMISSION } from "../src/auth/types.ts";
 
-const token = `as_pub_${"A".repeat(43)}`;
-const tokenHash = createHash("sha256").update(token).digest("hex");
-const expiresAt = "2030-01-01T00:00:00.000Z";
-const record = {
-  tokenId: "pub_fixture_01",
-  tokenHash,
-  publisherId: "publisher-device-01",
-  team: "w3dev",
-  permissions: ["artifacts:publish"],
-  expiresAt,
-};
+const JWT_SECRET = "test-secret-for-hmac-that-is-at-least-32-bytes";
 
-function makeEnv(overrides: Record<string, unknown> = {}) {
-  const lookedUp: string[] = [];
+async function accessToken(overrides: Record<string, unknown> = {}, now = Math.floor(Date.now() / 1000)) {
+  return issueAccessToken({ JWT_SECRET } as never, {
+    sub: "user-123",
+    email: "publisher@example.test",
+    name: "Publisher",
+    teamId: "team-abc123",
+    team: "w3dev",
+    permissions: [PUBLISH_PERMISSION, READ_PERMISSION],
+    tokenId: "api_12345678-1234-4234-9234-123456789abc",
+    ...overrides,
+  }, now);
+}
+
+function makeEnv() {
+  const uploads: Array<{ key: string; body: string; contentType?: string }> = [];
+  const lookups: string[] = [];
   const env = {
-    ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: JSON.stringify({ version: 1, tokens: [record] }),
-    R2_ACCOUNT_ID: "account-test",
-    R2_BUCKET_NAME: "artifacts-test",
-    ARTIFACTS_PUBLIC_PREFIX: "artifacts",
-    R2_PARENT_ACCESS_KEY_ID: "parent-access-id",
-    R2_PARENT_SECRET_ACCESS_KEY: "parent-secret-never-returned",
+    JWT_SECRET,
+    APP_ORIGIN: "https://artifact.w3dev.app",
+    DB: {},
+    EMAIL: {},
     ARTIFACTS_BUCKET: {
+      async put(key: string, body: ReadableStream<Uint8Array>, options?: R2PutOptions) {
+        const metadata = options?.httpMetadata;
+        const contentType = metadata && !(metadata instanceof Headers) ? metadata.contentType : undefined;
+        uploads.push({ key, body: await new Response(body).text(), contentType });
+        return {};
+      },
       async get(key: string) {
-        lookedUp.push(key);
+        lookups.push(key);
         return {
-          body: new Response("artifact").body,
+          body: new Response("private artifact").body,
+          size: 16,
+          uploaded: new Date("2026-09-23T00:00:00.000Z"),
           httpEtag: '"fixture"',
-          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", "text/plain"); },
+          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", "application/json"); },
+        };
+      },
+      async list(options: R2ListOptions) {
+        return {
+          objects: [{
+            key: `${options.prefix}reports/today.json`,
+            size: 16,
+            uploaded: new Date("2026-09-23T00:00:00.000Z"),
+            httpEtag: '"fixture"',
+          }],
+          delimitedPrefixes: [],
+          truncated: false,
         };
       },
     },
-    ...overrides,
   };
-  return { env: env as never, lookedUp };
+  return { env: env as never, uploads, lookups };
 }
 
 function request(path: string, init?: RequestInit): Request {
-  return new Request(`https://artifacts.example.com${path}`, init);
+  return new Request(`https://artifact.w3dev.app${path}`, init);
 }
 
-describe("publisher auth routes", () => {
-  it("returns the server-authorized identity and prevents caching", async () => {
+describe("team-scoped JWT authentication and private artifact routes", () => {
+  it("returns the locally verified user/team identity without caching", async () => {
     const { env } = makeEnv();
+    const token = await accessToken();
     const response = await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token.token}` },
     }), env);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Pragma")).toBe("no-cache");
     const identity = await response.json() as Record<string, unknown>;
-    expect(identity.publisherId).toBe("publisher-device-01");
-    expect(identity.team).toBe("w3dev");
-    expect(identity.permissions).toEqual(["artifacts:publish"]);
-    expect(identity.expiresAt).toBe(expiresAt);
-    expect(identity.tokenId).toBe("pub_fixture_01");
+    expect(identity).toEqual({
+      userId: "user-123",
+      email: "publisher@example.test",
+      name: "Publisher",
+      teamId: "team-abc123",
+      team: "w3dev",
+      permissions: [PUBLISH_PERMISSION, READ_PERMISSION],
+      expiresAt: token.expiresAt,
+      tokenId: "api_12345678-1234-4234-9234-123456789abc",
+    });
   });
 
-  it("returns no-store 401 for missing, malformed, expired, or revoked credentials", async () => {
+  it("rejects missing, modified, and expired JWTs with no-store 401 responses", async () => {
     const { env } = makeEnv();
     const missing = await worker.fetch(request("/__api/v1/auth/me"), env);
     expect(missing.status).toBe(401);
     expect(missing.headers.get("Cache-Control")).toBe("no-store");
 
-    const malformed = await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: "Bearer not-a-publisher-token" },
+    const issued = await accessToken();
+    const [header, payload, signature] = issued.token.split(".");
+    const alteredSignature = `${signature[0] === "A" ? "B" : "A"}${signature.slice(1)}`;
+    const modified = await worker.fetch(request("/__api/v1/auth/me", {
+      headers: { Authorization: `Bearer ${header}.${payload}.${alteredSignature}` },
     }), env);
-    expect(malformed.status).toBe(401);
+    expect(modified.status).toBe(401);
 
-    const expiredEnv = makeEnv({
-      ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: JSON.stringify({
-        version: 1,
-        tokens: [{ ...record, expiresAt: "2020-01-01T00:00:00Z" }],
-      }),
-    }).env;
-    expect((await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: `Bearer ${token}` },
-    }), expiredEnv)).status).toBe(401);
-
-    const revokedEnv = makeEnv({
-      ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: JSON.stringify({
-        version: 1,
-        tokens: [{ ...record, revokedAt: "2026-09-22T00:00:00Z" }],
-      }),
-    }).env;
-    expect((await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: `Bearer ${token}` },
-    }), revokedEnv)).status).toBe(401);
+    const expired = await accessToken({}, Math.floor(Date.now() / 1000) - ACCESS_TOKEN_SECONDS - 1);
+    const expiredResponse = await worker.fetch(request("/__api/v1/auth/me", {
+      headers: { Authorization: `Bearer ${expired.token}` },
+    }), env);
+    expect(expiredResponse.status).toBe(401);
+    expect(expiredResponse.headers.get("Cache-Control")).toBe("no-store");
   });
 
-  it("returns a no-store service error when the operator registry is unavailable or malformed", async () => {
-    const { env } = makeEnv({ ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: "not-json" });
-    const response = await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: `Bearer ${token}` },
+  it("derives the R2 key from the JWT team ID and never passes Authorization to R2", async () => {
+    const { env, uploads } = makeEnv();
+    const token = await accessToken();
+    const response = await worker.fetch(request("/__api/v1/uploads?path=reports%2Ftoday.json", {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token.token}`,
+        "Content-Type": "text/html",
+        "X-Team": "attacker-team",
+      },
+      body: "{\"ok\":true}",
     }), env);
-    expect(response.status).toBe(503);
+
+    expect(response.status).toBe(201);
+    expect(uploads).toEqual([{
+      key: "uploads/team-abc123/artifacts/reports/today.json",
+      body: "{\"ok\":true}",
+      contentType: "application/json; charset=utf-8",
+    }]);
+    expect(await response.text()).not.toContain(token.token);
+  });
+
+  it("returns 403 for an authenticated read-only identity attempting to publish", async () => {
+    const { env, uploads } = makeEnv();
+    const token = await accessToken({ permissions: [READ_PERMISSION] });
+    const response = await worker.fetch(request("/__api/v1/uploads?path=reports%2Ftoday.json", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token.token}` },
+      body: "{}",
+    }), env);
+
+    expect(response.status).toBe(403);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
-    const error = await response.json() as { error: string };
-    expect(error.error).toBe("authentication_service_unavailable");
-
-    const uploadResponse = await worker.fetch(request("/__api/v1/uploads/credentials", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ team: "w3dev" }),
-    }), env);
-    expect(uploadResponse.status).toBe(503);
-    expect(uploadResponse.headers.get("Cache-Control")).toBe("no-store");
-
-    const leakedRecordEnv = makeEnv({
-      ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: JSON.stringify({
-        version: 1,
-        tokens: [{ ...record, token }],
-      }),
-    }).env;
-    const leakedRecordResponse = await worker.fetch(request("/__api/v1/auth/me", {
-      headers: { Authorization: `Bearer ${token}` },
-    }), leakedRecordEnv);
-    expect(leakedRecordResponse.status).toBe(503);
-    expect(await leakedRecordResponse.text()).not.toContain(token);
+    expect(uploads).toEqual([]);
   });
 
-  it("requires publish permission and rejects a requested team mismatch", async () => {
-    const deniedEnv = makeEnv({
-      ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY: JSON.stringify({
-        version: 1,
-        tokens: [{ ...record, permissions: [] }],
-      }),
-    }).env;
-    const noPermission = await worker.fetch(request("/__api/v1/uploads/credentials", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ team: "w3dev" }),
-    }), deniedEnv);
-    expect(noPermission.status).toBe(403);
-
-    const { env } = makeEnv();
-    const mismatch = await worker.fetch(request("/__api/v1/uploads/credentials", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ team: "other-team" }),
+  it("requires team-scoped read authorization and serves content with no-store protections", async () => {
+    const { env, lookups } = makeEnv();
+    const token = await accessToken();
+    const denied = await worker.fetch(request("/another-team/private.json", {
+      headers: { Authorization: `Bearer ${token.token}` },
     }), env);
-    expect(mismatch.status).toBe(403);
-    expect(mismatch.headers.get("Cache-Control")).toBe("no-store");
-  });
+    expect(denied.status).toBe(403);
+    expect(lookups).toEqual([]);
 
-  it("mints 15-minute credentials scoped to the authorized prefix and PutObject only", async () => {
-    const { env } = makeEnv();
-    const response = await worker.fetch(request("/__api/v1/uploads/credentials", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ team: "w3dev" }),
+    const response = await worker.fetch(request("/w3dev/reports/today.json", {
+      headers: { Authorization: `Bearer ${token.token}` },
     }), env);
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
-    const body = await response.json() as {
-      accessKeyId: string; secretAccessKey: string; sessionToken: string;
-      prefix: string; expiresAt: string;
-    };
-    expect(body.accessKeyId).toBe("parent-access-id");
-    expect(body.secretAccessKey).not.toBe("parent-secret-never-returned");
-    expect(body.prefix).toBe("teams/w3dev/artifacts/");
-    expect(Date.parse(body.expiresAt) - Date.now()).toBeGreaterThan(14 * 60 * 1000);
-
-    const jwtText = atob(body.sessionToken).slice("jwt/".length);
-    const [header, payload, signature] = jwtText.split(".");
-    expect(JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))).toMatchObject({
-      bucket: "artifacts-test",
-      actions: ["PutObject"],
-      paths: { prefixPaths: ["teams/w3dev/artifacts/"], objectPaths: [] },
-    });
-    expect(signature).toBeTruthy();
-    expect(header).toBeTruthy();
-  });
-
-  it("serves public artifact content without using the publisher Authorization header", async () => {
-    const { env, lookedUp } = makeEnv();
-    const response = await worker.fetch(request("/artifacts/w3dev/reports/today.json", {
-      headers: { Authorization: `Bearer ${token}` },
-    }), env);
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("artifact");
-    expect(lookedUp).toEqual(["teams/w3dev/artifacts/reports/today.json"]);
+    expect(await response.text()).toBe("private artifact");
+    expect(lookups).toEqual(["uploads/team-abc123/artifacts/reports/today.json"]);
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(response.headers.get("Content-Security-Policy")).toContain("sandbox");
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
-  it("rejects traversal in public artifact paths", async () => {
-    const { env, lookedUp } = makeEnv();
-    const response = await worker.fetch(request("/artifacts/w3dev/%2e%2e/private"), env);
-    expect(response.status).toBe(404);
-    expect(lookedUp).toEqual([]);
+  it("rejects traversal and provides team-bounded listing", async () => {
+    const { env, lookups } = makeEnv();
+    const token = await accessToken();
+    const traversal = await worker.fetch(request("/w3dev/%2e%2e/private", {
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+    expect(traversal.status).toBe(404);
+    expect(lookups).toEqual([]);
+
+    const listing = await worker.fetch(request("/__api/v1/artifacts", {
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+    expect(listing.status).toBe(200);
+    expect(await listing.json()).toMatchObject({
+      team: "w3dev",
+      objects: [{ path: "reports/today.json" }],
+      truncated: false,
+      cursor: null,
+    });
+  });
+
+  it("serves login, API-token, and device routes without embedding credentials", async () => {
+    const { env } = makeEnv();
+    const login = await worker.fetch(request("/auth/login"), env);
+    expect(login.status).toBe(200);
+    const loginHtml = await login.text();
+    expect(loginHtml).toContain("sign-up/email");
+    expect(loginHtml).toContain("sign-in/social");
+    expect(loginHtml).not.toContain(JWT_SECRET);
+    expect(login.headers.get("Cache-Control")).toBe("no-store");
+
+    const tokens = await worker.fetch(request("/settings/api-tokens"), env);
+    expect(tokens.status).toBe(302);
+    expect(tokens.headers.get("Location")).toContain("returnTo=%2Fsettings%2Fapi-tokens");
+
+    const device = await worker.fetch(request("/auth/device"), env);
+    expect(device.status).toBe(302);
+    expect(device.headers.get("Location")).toContain("returnTo=%2Fauth%2Fdevice");
+  });
+
+  it("escapes untrusted return paths before embedding them in an inline script", async () => {
+    const { env } = makeEnv();
+    const login = await worker.fetch(request("/auth/login?returnTo=%2F%3C%2Fscript%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"), env);
+    const html = await login.text();
+
+    expect(html).not.toContain("</script><script>alert(1)</script>");
+    expect(html).toContain("\\u003c/script\\u003e\\u003cscript\\u003ealert(1)");
   });
 });

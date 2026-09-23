@@ -1,10 +1,24 @@
-# Publisher authentication and operations
+# Accounts, team credentials, and artifact access
 
-V1 uses team-scoped publisher tokens. It does not add usernames, passwords, OAuth, or a public token-creation API.
+Artifact Sync uses Better Auth for web accounts and team-scoped API/device credentials for the CLI. It does not issue Cloudflare credentials to clients. The Worker uses D1 for accounts, sessions, teams, memberships, and refresh-token state, and uses its private R2 binding for all artifact operations.
 
-## Client configuration
+## Account and team model
 
-Publishing configuration remains separate from authentication at `~/.agents/artifacts/config.json`:
+Users can sign up with email/password or GitHub at `https://artifact.w3dev.app/auth/login`. Email/password accounts must verify their email before publishing access is provisioned. A verified new account receives a personal team and an `admin` membership. The membership schema supports users belonging to multiple teams, but invitations and joining an additional team are not part of v1.
+
+The API-token page is `https://artifact.w3dev.app/settings/api-tokens`. Each API token or authorized device is associated with exactly one user and one team. The server issues its team ID and permissions; the CLI's `team` setting is checked against that identity, never used as proof of access.
+
+## API and device credential lifetime
+
+The settings page displays a newly created `as_api_…` API token once. Store it as a secret. It is a refresh credential, not a Cloudflare key or an R2 key. `artifact-sync login --token-stdin` exchanges it for a signed access JWT and a rotating refresh credential. Interactive CLI login uses device authorization at `/auth/device`: approve the displayed short code in the browser and select the single team for that device. Device codes expire after 10 minutes and the CLI polls every 3 seconds by default.
+
+The Worker signs access JWTs with `JWT_SECRET`; the CLI receives a seven-day access token. Protected artifact requests verify that JWT locally in the Worker and do not query D1 for each file. Refresh credentials are stored server-side only as SHA-256 hashes, rotate on refresh, expire after 30 days without refresh, and have a 90-day absolute lifetime. Refresh and revocation use D1.
+
+Because access JWT verification is stateless, revoking an API/device token blocks future refreshes immediately but does not invalidate access JWTs already issued. Those JWTs can remain usable for up to seven days, including for upload/read requests. This is the deliberate v1 tradeoff for avoiding a database or other service lookup on every artifact operation; it is not instant revocation.
+
+## CLI and watched directory
+
+Publishing configuration remains at `~/.agents/artifacts/config.json`:
 
 ```json
 {
@@ -17,170 +31,109 @@ Publishing configuration remains separate from authentication at `~/.agents/arti
 }
 ```
 
-The directory containing this file is the watched artifact root. Keep `team` here; do not add `serverUrl` or a token to this file.
+The directory containing the selected publishing config is the artifact root. The daemon recursively reconciles existing files at startup and watches that root. New and modified files are queued after the debounce period and uploaded with the credential scoped to the configured team. A changed file is re-read before upload so a newer edit is not marked complete using stale bytes. The publishing config, auth config, symlinks, and `.artifact-sync` state are excluded. Deleting a local file does not delete an R2 object.
 
-Saved authentication is stored at `~/.config/artifact-sync/config.json` on macOS and Linux. Its shape is:
+The Worker receives the file bytes and relative path over the authenticated gateway request, then derives the key as:
+
+```text
+uploads/<authenticated-team-id>/artifacts/<relative-path>
+```
+
+The client cannot supply a team ID or full R2 key. The Worker's R2 binding keeps the bucket private; no temporary R2 credentials, account credentials, or parent R2 credentials are sent to the client. The Workbench serves objects through `https://artifact.w3dev.app/<team-slug>/<relative-path>` only to an authenticated browser session or a valid team-scoped JWT with `artifacts:read`. The Worker resolves the slug to its team ID and reads only that team's prefix.
+
+## CLI login and credential storage
+
+Interactive login starts browser/device authorization and never asks the publisher to type a long-lived secret into a terminal:
+
+```sh
+artifact-sync login --server https://artifact.w3dev.app
+```
+
+For a one-time API token exchange in a headless environment, read the token from a protected secret source into standard input. Do not put it in shell arguments:
+
+```sh
+secret-manager read artifact-sync/api-token | artifact-sync login \
+  --server https://artifact.w3dev.app --token-stdin
+```
+
+There is intentionally no `--token <secret>` option. Login validates the exchange with `GET /__api/v1/auth/me`, checks the configured publishing team if a publishing config exists, and only then atomically saves the new credential. A failed login leaves an existing credential unchanged. Login does not start the watcher, upload files, change the configured team, or rebind sync state.
+
+Saved authentication is separate from publishing configuration and has this shape at `~/.config/artifact-sync/config.json` on macOS and Linux:
 
 ```json
 {
   "version": 1,
   "serverUrl": "https://artifact.w3dev.app",
   "auth": {
-    "type": "publisher_token",
-    "token": "<publisher token, shown only as a schema example>",
-    "tokenId": "pub_<operator-issued-id>",
-    "expiresAt": "<server-issued expiry>"
+    "type": "team_token",
+    "accessToken": "<seven-day JWT; illustrative only>",
+    "refreshToken": "<rotating refresh credential; illustrative only>",
+    "tokenId": "api_<server-issued-id>",
+    "expiresAt": "<server-issued expiry>",
+    "cachedIdentity": {
+      "userId": "<server-issued user ID>",
+      "email": "<server-verified email>",
+      "name": "<server-issued display name>",
+      "teamId": "<server-issued team ID>",
+      "team": "w3dev",
+      "permissions": ["artifacts:publish", "artifacts:read"]
+    }
   }
 }
 ```
 
-The token and expiry above are placeholders, not usable credentials or defaults. The server origin is normalized and saved with the credential. Artifact-local settings never choose the destination for a saved token.
-
-Use `--auth-config PATH` or `ARTIFACT_SYNC_AUTH_CONFIG` to select a different auth file. This is distinct from publishing `--config PATH`. An auth file inside the watched artifact root is rejected.
-When running a daemon with a custom auth path, pass the same `--auth-config PATH` to the daemon and the CLI commands that manage that credential.
-
-### Login, identity, and logout
-
-Interactive login resolves and displays the destination, then prompts with terminal echo disabled:
-
-```sh
-artifact-sync login --server https://artifact.w3dev.app
-```
-
-For non-interactive login, provide the token on standard input from an approved secret manager or another protected source:
-
-```sh
-secret-manager read artifact-sync/publisher-token | artifact-sync login \
-  --server https://artifact.w3dev.app --token-stdin
-```
-
-There is intentionally no `--token` option. Login validates `GET /__api/v1/auth/me`, checks the configured publishing team when that file exists, and only then atomically saves the credential. It does not start the daemon, upload artifacts, change the team, or modify sync state. The token is never printed.
-
-`whoami` verifies the active token with the configured server each time; cached identity data is informational only:
-
-```sh
-artifact-sync whoami
-```
-
-It reports the normalized server origin, publisher ID, authorized team, permissions, expiry, and whether the credential came from the auth file or environment. A network outage is reported as unverified; a cached identity is not presented as freshly authenticated.
-
-Local logout removes the auth-file credential, preserves unrelated settings and sync state, and signals a running daemon to clear its publisher and temporary R2 credentials, cancel uploads best-effort, and retain pending work:
-
-```sh
-artifact-sync logout
-```
-
-Logout is not server-side revocation. If `ARTIFACTS_PUBLISH_TOKEN` remains set in the parent shell or service configuration, logout reports that it cannot remove that environment value; it takes precedence over the auth file.
-
-### Environment credentials and destinations
+The identity/expiry cache is informational; the gateway is authoritative. Artifact-local configuration never chooses the destination of a saved credential. Use `--auth-config PATH` or `ARTIFACT_SYNC_AUTH_CONFIG` to select another auth file; these are distinct from publishing `--config PATH`. A credential file located inside the watched artifact root is rejected.
 
 Credential precedence is:
 
-1. `ARTIFACTS_PUBLISH_TOKEN`, if set.
-2. The selected authentication configuration file.
+1. `ARTIFACTS_PUBLISH_TOKEN`, if explicitly configured.
+2. The selected auth configuration file.
 
-Environment credentials are never persisted implicitly. They require an explicit destination in `ARTIFACT_SYNC_SERVER_URL`; if it is missing, empty, or invalid, the CLI fails instead of falling back. If `ARTIFACT_SYNC_SERVER_URL` selects an origin different from a saved credential's origin, the saved credential is not reused. Run an explicit `login --server ...` to change destinations.
+An environment API token or access JWT is never written to disk implicitly. Environment credentials also require an explicit `ARTIFACT_SYNC_SERVER_URL`; there is no fallback to the auth file's server. A saved credential is bound to its normalized server origin. Changing `--server` requires a new explicit login. Production requires HTTPS and certificate verification. HTTP is accepted only for loopback development when `ARTIFACT_SYNC_ALLOW_INSECURE_HTTP=1` is set.
 
-Production servers must use HTTPS with normal certificate verification. HTTP is accepted only for loopback development when `ARTIFACT_SYNC_ALLOW_INSECURE_HTTP=1` is explicitly set.
+`artifact-sync whoami` validates the active credential against that server and displays its origin, user/publisher identity, team, permissions, expiry, and source (`auth file` or `environment`). An unreachable server is reported as unverified, not as a freshly verified cached identity. Authentication redirects are not followed; the publisher Authorization header is never sent to R2 or an artifact-content URL.
 
-### Local credential-file protection
+`artifact-sync logout` removes the locally stored credential while preserving unrelated settings and sync state, then notifies a running daemon to clear its in-memory tokens, cancel uploads best-effort, and leave pending work queued. Local logout is not server-side revocation. Revoke a credential from `/settings/api-tokens`; already-issued JWTs can remain valid until their seven-day expiry. If `ARTIFACTS_PUBLISH_TOKEN` is configured in the parent shell or service, logout cannot remove it and reports that it remains active.
 
-The application auth directory is created with mode `0700` and the auth file and atomic temporary files with mode `0600`. The client checks file ownership and permissions, rejects symlinked credential files and symlinked path components, and serializes updates with a lock. Credential replacement is an atomic rename in the protected directory; no credential-bearing backup is kept.
+On macOS/Linux the application auth directory is created with mode `0700`, and auth/temporary files with mode `0600` before secret bytes are written. The store validates ownership and permissions, rejects symlinked credential files/path components, locks updates, and atomically replaces the file inside the protected directory. It leaves no credential-bearing backups. V1 JSON storage is plaintext protected by filesystem access controls: it does not protect against another process running as the same user or a compromised account. The credential store is isolated from watcher/upload logic so a future OS keychain backend can replace it.
 
-V1 stores JSON plaintext protected by filesystem access controls. This does not protect credentials from another process running as the same user or from a compromised user account. No Cloudflare administrative or parent R2 credentials are stored on the client. Temporary R2 session credentials are memory-only and are never written to the auth file or sync state. The store boundary is separate from watcher/upload logic so an OS keychain backend can be added later.
+## Identity and storage implementation
 
-## Operator token provisioning
+Better Auth stores user, account, browser session, and email-verification records in D1 through Drizzle. Application tables store teams, memberships, hashed API refresh credentials, and hashed pending device codes. API-token management and credential refresh use the D1 binding. Access JWT verification uses only the Worker's `JWT_SECRET` and the signed claims (user, team ID/slug, permissions, token ID, issuer, audience, and expiry).
 
-Run the operator-only utility with Bun. Give every device a distinct publisher ID and issue one token per device. The utility uses 32 cryptographically random bytes, associates the token with one team, `artifacts:publish`, and a required expiration, and writes only the SHA-256 token hash and authorization metadata to the local registry. The raw token is printed once for delivery; transfer it to the publisher through an approved secret channel and do not put it in tickets, source control, shell arguments, or logs.
+The Worker requires `artifacts:publish` for upload and `artifacts:read` for list/read. The authenticated team ID is the sole prefix source. The gateway does not grant deletion or bucket administration to clients. Authentication, refresh, token, device, and artifact responses use `Cache-Control: no-store` (artifact bytes are private/no-store). Authorization headers are not logged or forwarded to storage.
 
-Issue:
+## Bun development and database migrations
 
-```sh
-bun run apps/gateway/tools/publisher-tokens.ts issue \
-  --registry operator/publisher-token-registry.json \
-  --team w3dev \
-  --publisher-id laptop-alex-01 \
-  --permission artifacts:publish \
-  --expires-at 2027-01-31T23:59:59Z
-```
-
-The expiry is an operator choice, not a default. The tool refuses to issue a second active token for the same publisher ID; use a distinct ID per device or rotate the existing device token.
-
-Rotate an existing token (the replacement inherits its team and permission):
+Use Bun for the Worker, Drizzle Kit, and Wrangler commands:
 
 ```sh
-bun run apps/gateway/tools/publisher-tokens.ts rotate \
-  --registry operator/publisher-token-registry.json \
-  --token-id pub_<existing-id> \
-  --expires-at 2027-01-31T23:59:59Z
-```
-
-Revoke by token ID:
-
-```sh
-bun run apps/gateway/tools/publisher-tokens.ts revoke \
-  --registry operator/publisher-token-registry.json \
-  --token-id pub_<existing-id>
-```
-
-The utility updates a local registry only. To activate issue, rotation, or revocation, upload the complete updated registry as the Worker secret from the repository root:
-
-```sh
-bunx wrangler secret put ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY \
-  --config apps/gateway/wrangler.jsonc \
-  < operator/publisher-token-registry.json
-
-bunx wrangler deployments list \
-  --name artifact-sync-gateway \
-  --config apps/gateway/wrangler.jsonc
-```
-
-`wrangler secret put` creates and deploys a Worker version immediately. Confirm the updated deployment is active before telling a publisher that rotation or revocation is effective. A local registry edit, successful command invocation, or queued deployment alone is not proof that the server is enforcing it.
-
-The daemon has no registry-management capability. Only an operator with Cloudflare administrative access can update the Worker secret. Someone merely running `artifact-sync` needs no Cloudflare account credentials.
-
-## Gateway authorization and temporary R2 sessions
-
-The Worker validates each token against the active registry on both `GET /__api/v1/auth/me` and `POST /__api/v1/uploads/credentials`. It enforces expiration, revocation, and `artifacts:publish`; the authorized team is read from registry metadata. A requested upload team must exactly match that team. The client-supplied team is never proof of authorization.
-
-Authentication and temporary-credential responses use `Cache-Control: no-store`. Missing, invalid, expired, or revoked credentials return 401; an authenticated publisher without the required permission or team returns 403. Registry/configuration failure returns a no-store service error, not a misleading invalid-token response. Authentication headers are not logged or forwarded to R2 or artifact-content URLs.
-
-Only the trusted Worker exchanges a validated publisher identity for temporary R2 credentials. Each session lasts 900 seconds (15 minutes), is restricted to `teams/<authorized-team>/artifacts/`, and permits `PutObject` only. No deletion, cross-team access, or bucket administration is delegated. The client caches these credentials in memory and refreshes them when they are within two minutes of expiry. A temporary R2 expiry is treated as a session-refresh condition, not proof that the publisher token is invalid.
-
-Revoking a publisher token prevents new gateway exchanges once the updated registry is active. It does not instantly revoke a previously issued R2 session: that scoped session can remain usable until its 15-minute expiry. A local logout cancels local in-flight work best-effort, but cannot revoke a session already issued to that client.
-
-## Bun Worker development
-
-Use Bun for the TypeScript app and operator utility:
-
-```sh
-bun install
+bun install --frozen-lockfile
 bun run test:gateway
 bun run check:gateway
-bunx wrangler types
+bunx wrangler types apps/gateway/worker-configuration.d.ts --config apps/gateway/wrangler.jsonc
 ```
 
-## Cloudflare deployment
+The schema source is `apps/gateway/src/db/schema.ts`; review generated SQL before applying a migration. Apply locally during development with `bun run --cwd apps/gateway db:migrate:local`. Apply production migrations explicitly before deploying code that requires them with `bun run --cwd apps/gateway db:migrate:remote`. The production D1 database must exist and its ID must replace the placeholder in `apps/gateway/wrangler.jsonc` first.
 
-The production gateway origin is `https://artifact.w3dev.app`. Its Wrangler custom domain sends all paths on that hostname to this Worker, so keep the hostname dedicated to artifact-sync. Production deploys run from pushes to `main` or a manual workflow dispatch on `main`; pull requests run verification only.
+## Cloudflare setup and deployment
 
-In the GitHub repository settings, configure:
+The production Worker is `artifact-sync-gateway` on the dedicated custom domain `artifact.w3dev.app`. Its R2 binding targets the private `artifact-sync` bucket. GitHub Actions deploys on pushes to `main` and manual dispatches from `main`; pull requests verify but do not deploy.
 
-- Secret `CLOUDFLARE_API_TOKEN`: a narrowly scoped API token for this Cloudflare account, with Worker deployment and the zone permissions required to provision the custom domain.
-- Variable `CLOUDFLARE_ACCOUNT_ID`: the account ID that owns the active `w3dev.app` zone and the `artifact-sync` R2 bucket.
+Before the first production deployment:
 
-Before the first deployment, confirm the zone is active in that account, `artifact.w3dev.app` is available, the `artifact-sync` bucket exists, and the Worker secrets `ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY`, `R2_PARENT_ACCESS_KEY_ID`, and `R2_PARENT_SECRET_ACCESS_KEY` are configured in Cloudflare. Use `wrangler secret put` with `--config apps/gateway/wrangler.jsonc` to configure them; enter secret values through Wrangler's prompt or the existing protected registry-file input. The workflow supplies the account ID as `R2_ACCOUNT_ID`; it does not upload or replace Worker secrets. Never put parent R2 credentials in GitHub Actions or client configuration.
+1. Create the D1 database named `artifact-sync-auth`, put its ID in `apps/gateway/wrangler.jsonc`, and apply the checked-in migration with `bun run --cwd apps/gateway db:migrate:remote`.
+2. Confirm the `artifact-sync` R2 bucket and active `w3dev.app` zone exist in the Cloudflare account. The worker custom domain requires `artifact.w3dev.app` to be available and routed to this Worker.
+3. Configure Worker secrets using Wrangler (the prompts read values without placing them in shell history): `BETTER_AUTH_SECRET`, `JWT_SECRET` (each a unique random secret of at least 32 bytes), `GITHUB_CLIENT_ID`, and `GITHUB_CLIENT_SECRET`. Set the GitHub OAuth callback URL to `https://artifact.w3dev.app/__api/auth/callback/github`.
+4. Enable Cloudflare Email sending and verify the `artifact.w3dev.app` sender domain used by `AUTH_EMAIL_FROM`, so signup verification and password-reset emails can be delivered.
+5. In GitHub repository settings, set secret `CLOUDFLARE_API_TOKEN` with the narrow Worker deployment/custom-domain permissions needed, and repository variable `CLOUDFLARE_ACCOUNT_ID` for the account owning the zone, Worker, D1 database, and R2 bucket.
 
-After deployment, verify the public route without sending a publisher token:
+The GitHub deployment workflow does not upload application secrets or credentials. No publisher-token registry, R2 parent secret, or client-side Cloudflare credential is used. Running artifact-sync requires no Cloudflare administrative access.
+
+After deployment, an unauthenticated probe should return 401 and no-store headers:
 
 ```sh
 curl -sS -D - -o /dev/null https://artifact.w3dev.app/__api/v1/auth/me
 ```
 
-The expected response is `401` with `Cache-Control: no-store`. To roll back a bad Worker version, set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in a protected operator environment, then run from the repository root:
-
-```sh
-bunx wrangler rollback --config apps/gateway/wrangler.jsonc
-```
-
-The GitHub deploy workflow uses Bun `1.4.2` and the Wrangler `4.137.0` version in `bun.lock`. The gateway remains a Cloudflare Worker; the Rust CLI and daemon run on publisher machines.
+That probe verifies the route is live, not that signup email delivery, GitHub OAuth, or authenticated artifact access works. Those require their configured provider/service and a real account. Local tests/builds are not deployment proof.

@@ -1,7 +1,6 @@
 use artifact_sync::auth::credentials::{CachedIdentity, SavedAuth, SecretString};
 use artifact_sync::auth::store::CredentialStore;
-use serde_json::Value;
-use std::os::unix::fs::PermissionsExt;
+use rusqlite::Connection;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,33 +9,68 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 
-const TOKEN: &str = "as_pub_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const SAVED_TOKEN: &str = "as_pub_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-const IDENTITY: &str = r#"{"publisherId":"publisher-device-01","team":"w3dev","permissions":["artifacts:publish"],"expiresAt":"2030-01-01T00:00:00Z","tokenId":"pub_fixture_01"}"#;
+const ACCESS_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcnRpZmFjdC1zeW5jIn0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const API_TOKEN: &str = "as_api_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const SAVED_REFRESH: &str = "as_rf_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const ROTATED_REFRESH: &str = "as_rf_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
 
+#[derive(Clone)]
 struct MockResponse {
     status: u16,
     body: String,
     location: Option<String>,
 }
 
-async fn mock_server(listener: TcpListener, responses: Vec<MockResponse>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+impl MockResponse {
+    fn json(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            location: None,
+        }
+    }
+
+    fn redirect(location: &str) -> Self {
+        Self {
+            status: 302,
+            body: "{}".into(),
+            location: Some(location.into()),
+        }
+    }
+}
+
+fn identity(team: &str) -> String {
+    format!(
+        r#"{{"userId":"user-123","email":"publisher@example.test","name":"Publisher","teamId":"team-123","team":"{team}","permissions":["artifacts:publish","artifacts:read"],"expiresAt":"2030-01-01T00:00:00Z","tokenId":"api_12345678-1234-4234-9234-123456789abc"}}"#
+    )
+}
+
+fn exchange(refresh_token: &str, team: &str) -> String {
+    format!(
+        r#"{{"accessToken":"{ACCESS_TOKEN}","refreshToken":"{refresh_token}","expiresAt":"2030-01-01T00:00:00Z","identity":{}}}"#,
+        identity(team)
+    )
+}
+
+async fn sequence_server(
+    listener: TcpListener,
+    responses: Vec<MockResponse>,
+) -> (UnboundedReceiver<String>, JoinHandle<()>) {
+    let (requests_tx, requests_rx) = unbounded_channel();
+    let task = tokio::spawn(async move {
         for response in responses {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request = read_request(&mut stream).await;
-            assert!(request.starts_with("GET /__api/v1/auth/me "));
-            assert!(request.lines().any(|line| {
-                line.eq_ignore_ascii_case(&format!("authorization: Bearer {TOKEN}"))
-            }));
+            let _ = requests_tx.send(summarize_request(&request));
             write_response(&mut stream, response).await;
         }
-    })
+    });
+    (requests_rx, task)
 }
 
 async fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
-    let mut chunk = [0u8; 1024];
+    let mut chunk = [0u8; 2048];
     loop {
         let read = stream.read(&mut chunk).await.unwrap();
         if read == 0 {
@@ -47,14 +81,27 @@ async fn read_request(stream: &mut TcpStream) -> String {
             break;
         }
     }
-    String::from_utf8(request).unwrap()
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+fn summarize_request(request: &str) -> String {
+    let first = request.lines().next().unwrap_or_default();
+    let authorization = request
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        .unwrap_or_default();
+    format!("{first}\n{authorization}")
 }
 
 async fn write_response(stream: &mut TcpStream, response: MockResponse) {
     let reason = match response.status {
         200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
         302 => "Found",
         401 => "Unauthorized",
+        403 => "Forbidden",
+        410 => "Gone",
         _ => "Test Response",
     };
     let mut headers = format!(
@@ -75,52 +122,51 @@ fn origin(listener: &TcpListener) -> String {
     format!("http://{}", listener.local_addr().unwrap())
 }
 
-fn private_auth(path: &Path, token: &str, origin: &str) {
+fn private_auth(path: &Path, origin: &str) {
+    let expires = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
     CredentialStore::new(path)
         .save_login(
             origin,
             &SavedAuth {
-                auth_type: "publisher_token".into(),
-                token: SecretString::new(token),
-                token_id: Some("pub_saved".into()),
-                expires_at: None,
-                cached_identity: Some(CachedIdentity {
-                    publisher_id: "saved-device".into(),
+                auth_type: "team_token".into(),
+                access_token: SecretString::new(ACCESS_TOKEN),
+                refresh_token: SecretString::new(SAVED_REFRESH),
+                token_id: "api_saved".into(),
+                expires_at: expires,
+                cached_identity: CachedIdentity {
+                    user_id: "user-123".into(),
+                    email: "cached-only@example.test".into(),
+                    name: "Cached User".into(),
+                    team_id: "team-123".into(),
                     team: "w3dev".into(),
-                    permissions: vec!["artifacts:publish".into()],
-                }),
+                    permissions: vec!["artifacts:publish".into(), "artifacts:read".into()],
+                },
             },
         )
         .unwrap();
 }
 
-fn command(auth_path: &Path, publishing_path: &Path, args: &[&str], input: Option<&str>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_artifact-sync"));
-    command
-        .env_clear()
-        .env("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP", "1")
-        .arg("--auth-config")
-        .arg(auth_path)
-        .arg("--config")
-        .arg(publishing_path)
-        .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.spawn().unwrap()
+fn publishing_config(root: &Path, team: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let path = root.join("config.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"team":"{team}","sync":{{"debounceMs":50,"maxConcurrentUploads":1,"auditIntervalSeconds":0}}}}"#),
+    )
+    .unwrap();
+    path
 }
 
-fn command_with_home(
+fn spawn_command(
     home: &Path,
     auth_path: &Path,
     publishing_path: &Path,
     args: &[&str],
     input: Option<&str>,
-    publisher_token: Option<&str>,
+    environment_token: Option<&str>,
+    server_origin: Option<&str>,
 ) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_artifact-sync"));
     command
@@ -140,71 +186,32 @@ fn command_with_home(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(token) = publisher_token {
+    if let Some(token) = environment_token {
         command.env("ARTIFACTS_PUBLISH_TOKEN", token);
+    }
+    if let Some(origin) = server_origin {
+        command.env("ARTIFACT_SYNC_SERVER_URL", origin);
     }
     command.spawn().unwrap()
 }
 
-fn daemon_with_environment_credential(
-    home: &Path,
-    auth_path: &Path,
-    publishing_path: &Path,
-    token: &str,
-    server: &str,
-) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_artifact-sync"))
-        .env_clear()
-        .env("HOME", home)
-        .env("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP", "1")
-        .env("ARTIFACTS_PUBLISH_TOKEN", token)
-        .env("ARTIFACT_SYNC_SERVER_URL", server)
-        .arg("--auth-config")
-        .arg(auth_path)
-        .arg("--config")
-        .arg(publishing_path)
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
-}
-
 async fn run_command(
-    auth_path: &Path,
-    publishing_path: &Path,
-    args: &[&str],
-    input: Option<&str>,
-) -> std::process::Output {
-    let mut child = command(auth_path, publishing_path, args, input);
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .await
-            .unwrap();
-    }
-    child.wait_with_output().await.unwrap()
-}
-
-async fn run_command_with_home(
     home: &Path,
     auth_path: &Path,
     publishing_path: &Path,
     args: &[&str],
     input: Option<&str>,
-    publisher_token: Option<&str>,
+    environment_token: Option<&str>,
+    server_origin: Option<&str>,
 ) -> std::process::Output {
-    let mut child = command_with_home(
+    let mut child = spawn_command(
         home,
         auth_path,
         publishing_path,
         args,
         input,
-        publisher_token,
+        environment_token,
+        server_origin,
     );
     if let Some(input) = input {
         child
@@ -218,56 +225,44 @@ async fn run_command_with_home(
     child.wait_with_output().await.unwrap()
 }
 
-fn daemon_mock_server(listener: TcpListener) -> (UnboundedReceiver<String>, JoinHandle<()>) {
-    let (requests_tx, requests_rx) = unbounded_channel();
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let request = read_request(&mut stream).await;
-            let path = request.lines().next().unwrap_or_default().to_string();
-            let response = MockResponse {
-                status: 200,
-                body: IDENTITY.into(),
-                location: None,
-            };
-            write_response(&mut stream, response).await;
-            if requests_tx.send(path).is_err() {
-                return;
-            }
+fn spawn_daemon(
+    home: &Path,
+    auth_path: &Path,
+    publishing_path: &Path,
+    environment_token: Option<&str>,
+    server_origin: Option<&str>,
+) -> Child {
+    spawn_command(
+        home,
+        auth_path,
+        publishing_path,
+        &["daemon"],
+        None,
+        environment_token,
+        server_origin,
+    )
+}
+
+async fn wait_for_daemon_ready(home: &Path) {
+    let socket_path = home.join(".config/artifact-sync/daemon.sock");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !socket_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-    });
-    (requests_rx, server)
+    })
+    .await
+    .expect("daemon control socket did not appear");
 }
 
-fn temporary_credentials_server(
-    listener: TcpListener,
-) -> (UnboundedReceiver<String>, JoinHandle<()>) {
-    let (requests_tx, requests_rx) = unbounded_channel();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_request(&mut stream).await;
-        let response = MockResponse {
-            status: 200,
-            body: "{\"accessKeyId\":\"temporary-id\",\"secretAccessKey\":\"temporary-secret\",\"sessionToken\":\"temporary-session\",\"endpoint\":\"https://attacker.example\",\"bucket\":\"artifacts\",\"prefix\":\"teams/w3dev/artifacts/\",\"expiresAt\":\"2030-01-01T00:00:00Z\"}".to_owned(),
-            location: None,
-        };
-        write_response(&mut stream, response).await;
-        let _ = requests_tx.send(request);
-    });
-    (requests_rx, server)
+fn state_database(home: &Path) -> std::path::PathBuf {
+    home.join(".local/state/artifact-sync/state.sqlite3")
 }
 
-fn pending_state(database_path: &Path) -> Option<(i64, i64)> {
-    let database = rusqlite::Connection::open(database_path).ok()?;
-    database
-        .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(attempts), 0) FROM pending",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok()
+fn pending_count(database_path: &Path) -> i64 {
+    Connection::open(database_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
+        .unwrap()
 }
 
 fn output_text(output: &std::process::Output) -> String {
@@ -279,452 +274,574 @@ fn output_text(output: &std::process::Output) -> String {
 }
 
 #[tokio::test]
-async fn stdin_login_saves_validated_credentials_for_a_fresh_whoami_process() {
+async fn stdin_api_token_login_rotates_saves_and_reuses_credentials_after_restart() {
     let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
     let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    let auth_path = temp.path().join(".config/artifact-sync/config.json");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = origin(&listener);
-    let mock = mock_server(
+    let server_origin = origin(&listener);
+    let (mut requests, server) = sequence_server(
         listener,
         vec![
-            MockResponse {
-                status: 200,
-                body: IDENTITY.into(),
-                location: None,
-            },
-            MockResponse {
-                status: 200,
-                body: IDENTITY.into(),
-                location: None,
-            },
+            MockResponse::json(200, exchange(ROTATED_REFRESH, "w3dev")),
+            MockResponse::json(200, identity("w3dev")),
+            MockResponse::json(200, identity("w3dev")),
         ],
     )
     .await;
 
-    let output = run_command(
+    let login = run_command(
+        &home,
         &auth_path,
         &publishing_path,
-        &["login", "--server", &server, "--token-stdin"],
-        Some(&format!("{TOKEN}\n")),
-    )
-    .await;
-    assert!(output.status.success(), "{}", output_text(&output));
-    let printed = output_text(&output);
-    assert!(printed.contains("publisher-device-01"));
-    assert!(printed.contains("w3dev"));
-    assert!(printed.contains(auth_path.to_str().unwrap()));
-    assert!(!printed.contains(TOKEN));
-    assert_eq!(
-        std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let saved: Value = serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
-    assert_eq!(saved["serverUrl"], server);
-    assert_eq!(saved["auth"]["token"], TOKEN);
-
-    let output = run_command(&auth_path, &publishing_path, &["whoami"], None).await;
-    assert!(output.status.success(), "{}", output_text(&output));
-    let printed = output_text(&output);
-    assert!(printed.contains("Server: "));
-    assert!(printed.contains("Publisher ID: publisher-device-01"));
-    assert!(printed.contains("Authorized team: w3dev"));
-    assert!(printed.contains("Credential source: auth file"));
-    assert!(!printed.contains(TOKEN));
-    mock.await.unwrap();
-}
-
-#[tokio::test]
-async fn invalid_login_does_not_replace_an_existing_credential() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    let auth_path = temp.path().join(".config/artifact-sync/config.json");
-    private_auth(&auth_path, SAVED_TOKEN, "https://saved.example");
-    let before = std::fs::read(&auth_path).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = origin(&listener);
-    let mock = mock_server(
-        listener,
-        vec![MockResponse {
-            status: 401,
-            body: r#"{"error":"invalid_or_expired_credentials"}"#.into(),
-            location: None,
-        }],
-    )
-    .await;
-
-    let output = run_command(
-        &auth_path,
-        &publishing_path,
-        &["login", "--server", &server, "--token-stdin"],
-        Some(&format!("{TOKEN}\n")),
-    )
-    .await;
-    assert!(!output.status.success());
-    let printed = output_text(&output);
-    assert!(printed.contains("invalid, expired, or revoked"));
-    assert!(!printed.contains(TOKEN));
-    assert_eq!(std::fs::read(&auth_path).unwrap(), before);
-    mock.await.unwrap();
-}
-
-#[tokio::test]
-async fn headless_login_without_stdin_credentials_fails_without_prompting() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let output = run_command(
-        &temp.path().join("auth/config.json"),
-        &root.join("config.json"),
-        &["login", "--server", "https://artifacts.example.com"],
+        &["login", "--server", &server_origin, "--token-stdin"],
+        Some(&format!("{API_TOKEN}\n")),
+        None,
         None,
     )
     .await;
-    assert!(!output.status.success());
-    assert!(output_text(&output).contains("--token-stdin"));
+    assert!(login.status.success(), "{}", output_text(&login));
+    let output = output_text(&login);
+    assert!(output.contains("publisher@example.test"));
+    assert!(output.contains("team w3dev"));
+    assert!(!output.contains(API_TOKEN));
+    assert!(!output.contains(ROTATED_REFRESH));
+
+    let saved = CredentialStore::new(&auth_path)
+        .load()
+        .unwrap()
+        .unwrap()
+        .auth
+        .unwrap();
+    assert_eq!(saved.access_token.expose(), ACCESS_TOKEN);
+    assert_eq!(saved.refresh_token.expose(), ROTATED_REFRESH);
+    assert_eq!(saved.cached_identity.team, "w3dev");
+
+    let whoami = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["whoami"],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(whoami.status.success(), "{}", output_text(&whoami));
+    let output = output_text(&whoami);
+    assert!(output.contains("Server: "));
+    assert!(output.contains("Authorized team: w3dev"));
+    assert!(output.contains("Credential source: auth file"));
+    assert!(!output.contains(API_TOKEN));
+    assert!(!output.contains(ROTATED_REFRESH));
+
+    let first = requests.recv().await.unwrap();
+    let second = requests.recv().await.unwrap();
+    let third = requests.recv().await.unwrap();
+    assert!(first.starts_with("POST /__api/v1/auth/refresh "));
+    assert!(second.starts_with("GET /__api/v1/auth/me "));
+    assert!(second.contains(ACCESS_TOKEN));
+    assert!(third.starts_with("GET /__api/v1/auth/me "));
+    assert!(third.contains(ACCESS_TOKEN));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_or_mismatched_login_preserves_existing_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = temp.path().join("artifacts");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = home.join(".config/artifact-sync/config.json");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_origin = origin(&listener);
+    private_auth(&auth_path, &server_origin);
+    let (mut requests, server) = sequence_server(
+        listener,
+        vec![MockResponse::json(
+            401,
+            r#"{"error":"invalid_or_expired_credentials"}"#,
+        )],
+    )
+    .await;
+
+    let invalid = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["login", "--server", &server_origin, "--token-stdin"],
+        Some(&format!("{API_TOKEN}\n")),
+        None,
+        None,
+    )
+    .await;
+    assert!(!invalid.status.success());
+    assert!(output_text(&invalid).contains("no credential was saved"));
+    assert!(!output_text(&invalid).contains(API_TOKEN));
+    let saved = CredentialStore::new(&auth_path)
+        .load()
+        .unwrap()
+        .unwrap()
+        .auth
+        .unwrap();
+    assert_eq!(saved.refresh_token.expose(), SAVED_REFRESH);
+    assert_eq!(
+        requests.recv().await.unwrap().split('\n').next().unwrap(),
+        "POST /__api/v1/auth/refresh HTTP/1.1"
+    );
+    server.await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mismatch_origin = origin(&listener);
+    let (mut requests, server) = sequence_server(
+        listener,
+        vec![
+            MockResponse::json(200, exchange(ROTATED_REFRESH, "other-team")),
+            MockResponse::json(200, identity("other-team")),
+        ],
+    )
+    .await;
+    let mismatch = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["login", "--server", &mismatch_origin, "--token-stdin"],
+        Some(&format!("{API_TOKEN}\n")),
+        None,
+        None,
+    )
+    .await;
+    assert!(!mismatch.status.success());
+    assert!(output_text(&mismatch).contains("publishing configuration selects 'w3dev'"));
+    assert_eq!(
+        CredentialStore::new(&auth_path)
+            .load()
+            .unwrap()
+            .unwrap()
+            .auth
+            .unwrap()
+            .refresh_token
+            .expose(),
+        SAVED_REFRESH
+    );
+    assert!(
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /__api/v1/auth/refresh ")
+    );
+    assert!(
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /__api/v1/auth/me ")
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn headless_login_requires_stdin_and_cross_origin_redirect_never_receives_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = temp.path().join("artifacts");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = home.join(".config/artifact-sync/config.json");
+    let no_input = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["login", "--server", "https://artifact.w3dev.app"],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(!no_input.status.success());
+    assert!(output_text(&no_input).contains("requires a terminal"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_origin = origin(&listener);
+    let (mut requests, server) = sequence_server(
+        listener,
+        vec![MockResponse::redirect("https://attacker.example/collect")],
+    )
+    .await;
+    let redirected = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["login", "--server", &server_origin, "--token-stdin"],
+        Some(&format!("{API_TOKEN}\n")),
+        None,
+        None,
+    )
+    .await;
+    assert!(!redirected.status.success());
+    assert!(output_text(&redirected).contains("redirected the request"));
+    assert!(!auth_path.exists());
+    let request = requests.recv().await.unwrap();
+    assert!(request.starts_with("POST /__api/v1/auth/refresh "));
+    assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    assert!(!request.contains(API_TOKEN));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_file_path_inside_artifact_root_is_rejected_before_network_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = temp.path().join("artifacts");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = root.join("private-auth.json");
+    let result = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &[
+            "login",
+            "--server",
+            "https://artifact.w3dev.app",
+            "--token-stdin",
+        ],
+        Some(&format!("{API_TOKEN}\n")),
+        None,
+        None,
+    )
+    .await;
+    assert!(!result.status.success());
+    assert!(output_text(&result).contains("outside the watched artifact root"));
+    assert!(!auth_path.exists());
 }
 
 #[tokio::test]
 async fn offline_whoami_does_not_claim_cached_identity_is_verified() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    let auth_path = temp.path().join("auth/config.json");
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = origin(&reserved);
-    drop(reserved);
-    private_auth(&auth_path, SAVED_TOKEN, &server);
-
-    let output = run_command(&auth_path, &publishing_path, &["whoami"], None).await;
-    assert!(!output.status.success());
-    let printed = output_text(&output);
-    assert!(printed.contains("authentication server is unreachable"));
-    assert!(printed.contains("credential was not verified"));
-    assert!(!printed.contains("Publisher ID: saved-device"));
-    assert!(!printed.contains(SAVED_TOKEN));
-}
-
-#[tokio::test]
-async fn login_does_not_follow_a_cross_origin_redirect_with_the_publisher_token() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    let auth_path = temp.path().join("auth/config.json");
-    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target_origin = origin(&target);
-    let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let source_origin = origin(&source);
-    let mock = mock_server(
-        source,
-        vec![MockResponse {
-            status: 302,
-            body: String::new(),
-            location: Some(format!("{target_origin}/__api/v1/auth/me")),
-        }],
-    )
-    .await;
-
-    let output = run_command(
-        &auth_path,
-        &publishing_path,
-        &["login", "--server", &source_origin, "--token-stdin"],
-        Some(&format!("{TOKEN}\n")),
-    )
-    .await;
-    assert!(!output.status.success());
-    assert!(output_text(&output).contains("redirected"));
-    assert!(!output_text(&output).contains(TOKEN));
-    mock.await.unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(250), target.accept())
-            .await
-            .is_err()
-    );
-    assert!(!auth_path.exists());
-}
-
-#[tokio::test]
-async fn team_mismatch_and_changed_auth_path_inside_artifacts_fail_before_saving() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    std::fs::write(&publishing_path, r#"{"team":"other-team"}"#).unwrap();
-    let auth_path = temp.path().join("auth/config.json");
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = origin(&listener);
-    let mock = mock_server(
-        listener,
-        vec![MockResponse {
-            status: 200,
-            body: IDENTITY.into(),
-            location: None,
-        }],
-    )
-    .await;
-    let output = run_command(
-        &auth_path,
-        &publishing_path,
-        &["login", "--server", &server, "--token-stdin"],
-        Some(&format!("{TOKEN}\n")),
-    )
-    .await;
-    assert!(!output.status.success());
-    assert!(output_text(&output).contains("publishing configuration selects 'other-team'"));
-    assert!(!auth_path.exists());
-    mock.await.unwrap();
-
-    let inside_path = root.join(".config/auth.json");
-    let output = run_command(&inside_path, &publishing_path, &["whoami"], None).await;
-    assert!(!output.status.success());
-    assert!(output_text(&output).contains("outside the watched artifact root"));
-}
-
-#[tokio::test]
-async fn logout_notifies_running_daemon_pauses_uploads_and_preserves_pending_work() {
-    let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
     let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    std::fs::write(
-        &publishing_path,
-        r#"{"team":"w3dev","sync":{"debounceMs":50,"maxConcurrentUploads":1,"auditIntervalSeconds":0}}"#,
-    )
-    .unwrap();
+    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = origin(&listener);
-    private_auth(&auth_path, TOKEN, &server);
-    let (mut requests, server_task) = daemon_mock_server(listener);
+    let server_origin = origin(&listener);
+    drop(listener);
+    private_auth(&auth_path, &server_origin);
 
-    let mut daemon =
-        command_with_home(&home, &auth_path, &publishing_path, &["daemon"], None, None);
-    let initial_request = tokio::time::timeout(std::time::Duration::from_secs(3), requests.recv())
-        .await
-        .expect("daemon did not validate its credential")
-        .expect("mock server stopped");
-    assert!(initial_request.starts_with("GET /__api/v1/auth/me "));
-    let socket_path = home.join(".config/artifact-sync/daemon.sock");
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !socket_path.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("daemon control socket did not appear");
-
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1200), requests.recv())
-            .await
-            .is_err(),
-        "the idle daemon must not periodically call the auth server"
-    );
-
-    let output =
-        run_command_with_home(&home, &auth_path, &publishing_path, &["logout"], None, None).await;
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert!(output_text(&output).contains("running daemon was notified"));
-    assert!(output_text(&output).contains("does not revoke the token on the server"));
-    let saved: Value = serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
-    assert!(saved.get("auth").is_none());
-
-    std::fs::write(root.join("queued-after-logout.txt"), "must remain pending").unwrap();
-    let database_path = home.join(".local/state/artifact-sync/state.sqlite3");
-    let queued = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if database_path.exists() {
-                let database = rusqlite::Connection::open(&database_path).unwrap();
-                let pending: i64 = database
-                    .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
-                    .unwrap();
-                if pending == 1 {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_ok();
-    if !queued {
-        let status = daemon.try_wait().unwrap();
-        let database_exists = database_path.exists();
-        let pending_count = if database_exists {
-            rusqlite::Connection::open(&database_path)
-                .and_then(|database| {
-                    database.query_row("SELECT COUNT(*) FROM pending", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                })
-                .ok()
-        } else {
-            None
-        };
-        let files = std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        daemon.start_kill().unwrap();
-        let output = daemon.wait_with_output().await.unwrap();
-        server_task.abort();
-        panic!(
-            "artifact change was not kept in the durable pending queue; daemon status: {status:?}; database: {database_exists}; pending: {pending_count:?}; files: {files:?}; stdout: {}; stderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(500), requests.recv())
-            .await
-            .is_err(),
-        "logout must stop further credential exchanges and uploads"
-    );
-
-    daemon.start_kill().unwrap();
-    let _ = daemon.wait().await;
-    server_task.abort();
+    let whoami = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["whoami"],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(!whoami.status.success());
+    let output = output_text(&whoami);
+    assert!(output.contains("authentication server is unreachable"));
+    assert!(!output.contains("cached-only@example.test"));
+    assert!(!output.contains("Cached User"));
 }
 
 #[tokio::test]
-async fn logout_reports_an_environment_token_it_cannot_remove() {
+async fn logout_preserves_other_settings_and_reports_environment_credential() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
     let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
+    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
-    private_auth(&auth_path, SAVED_TOKEN, "https://saved.example");
+    private_auth(&auth_path, "https://artifact.w3dev.app");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+    raw["customSetting"] = serde_json::Value::String("keep-me".into());
+    std::fs::write(&auth_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let output = run_command_with_home(
+    let logout = run_command(
         &home,
         &auth_path,
         &publishing_path,
         &["logout"],
         None,
-        Some("as_pub_environment_secret"),
+        Some(API_TOKEN),
+        Some("https://artifact.w3dev.app"),
     )
     .await;
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert!(
-        output_text(&output)
-            .contains("logout cannot remove it from the parent shell or service configuration")
-    );
-    assert!(!output_text(&output).contains("as_pub_environment_secret"));
-    let saved: Value = serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
-    assert!(saved.get("auth").is_none());
+    assert!(logout.status.success(), "{}", output_text(&logout));
+    let output = output_text(&logout);
+    assert!(output.contains("not server-side revocation"));
+    assert!(output.contains("remains active"));
+    assert!(!output.contains(API_TOKEN));
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+    assert!(after.get("auth").is_none());
+    assert_eq!(after["customSetting"], "keep-me");
 }
 
 #[tokio::test]
-async fn offline_startup_keeps_work_and_recovers_when_the_gateway_returns() {
+async fn environment_api_token_is_not_persisted_and_idle_daemon_does_not_poll_auth() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
     let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("offline-work.txt"),
-        "pending until the server returns",
-    )
-    .unwrap();
-    let publishing_path = root.join("config.json");
-    std::fs::write(&publishing_path, r#"{"team":"w3dev"}"#).unwrap();
+    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_origin = origin(&reserved);
-    let server_address = reserved.local_addr().unwrap();
-    drop(reserved);
-    private_auth(&auth_path, TOKEN, &server_origin);
-
-    let mut daemon =
-        command_with_home(&home, &auth_path, &publishing_path, &["daemon"], None, None);
-    let database_path = home.join(".local/state/artifact-sync/state.sqlite3");
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_origin = origin(&listener);
+    let (requests_tx, mut requests_rx) = unbounded_channel();
+    let server = tokio::spawn(async move {
         loop {
-            if pending_state(&database_path)
-                .is_some_and(|(count, attempts)| count == 1 && attempts >= 1)
-            {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut stream).await;
+            let summary = summarize_request(&request);
+            let response = if summary.starts_with("POST /__api/v1/auth/refresh ") {
+                MockResponse::json(200, exchange(API_TOKEN, "w3dev"))
+            } else if summary.starts_with("GET /__api/v1/auth/me ") {
+                MockResponse::json(200, identity("w3dev"))
+            } else {
+                MockResponse::json(404, "{}")
+            };
+            if requests_tx.send(summary).is_err() {
+                return;
+            }
+            write_response(&mut stream, response).await;
+        }
+    });
+
+    let mut daemon = spawn_daemon(
+        &home,
+        &auth_path,
+        &publishing_path,
+        Some(API_TOKEN),
+        Some(&server_origin),
+    );
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.starts_with("POST /__api/v1/auth/refresh "));
+    assert!(!first.to_ascii_lowercase().contains("authorization:"));
+    assert!(second.starts_with("GET /__api/v1/auth/me "));
+    assert!(second.contains(ACCESS_TOKEN));
+    assert!(!auth_path.exists());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), requests_rx.recv())
+            .await
+            .is_err()
+    );
+
+    daemon.start_kill().unwrap();
+    let _ = daemon.wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn offline_startup_keeps_new_files_pending_and_recovers_with_rotated_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = temp.path().join("artifacts");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = home.join(".config/artifact-sync/config.json");
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let server_origin = format!("http://{address}");
+    private_auth(&auth_path, &server_origin);
+    let mut daemon = spawn_daemon(&home, &auth_path, &publishing_path, None, None);
+    wait_for_daemon_ready(&home).await;
+
+    let artifact = root.join("first.json");
+    std::fs::write(&artifact, "{\"ok\":true}").unwrap();
+    let database = state_database(&home);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if database.exists() && pending_count(&database) == 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("offline upload failure was not retained with backoff");
+    .unwrap();
 
-    let listener = TcpListener::bind(server_address).await.unwrap();
-    let (mut requests, server_task) = temporary_credentials_server(listener);
-    let request = tokio::time::timeout(std::time::Duration::from_secs(4), requests.recv())
-        .await
-        .expect("daemon did not retry after connectivity returned")
-        .expect("temporary credential server stopped");
-    assert!(request.starts_with("POST /__api/v1/uploads/credentials "));
-    assert!(
-        request
-            .lines()
-            .any(|line| { line.eq_ignore_ascii_case(&format!("authorization: Bearer {TOKEN}")) })
-    );
-    assert_eq!(pending_state(&database_path).unwrap().0, 1);
+    let listener = TcpListener::bind(address).await.unwrap();
+    let (requests_tx, mut requests_rx) = unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut me_requests = 0;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut stream).await;
+            let summary = summarize_request(&request);
+            let response = if summary.starts_with("POST /__api/v1/auth/refresh ") {
+                MockResponse::json(200, exchange(ROTATED_REFRESH, "w3dev"))
+            } else if summary.starts_with("GET /__api/v1/auth/me ") {
+                me_requests += 1;
+                if me_requests == 1 {
+                    MockResponse::json(401, "{}")
+                } else {
+                    MockResponse::json(200, identity("w3dev"))
+                }
+            } else if summary.starts_with("PUT /__api/v1/uploads?") {
+                MockResponse::json(201, "{}")
+            } else {
+                MockResponse::json(404, "{}")
+            };
+            if requests_tx.send(summary).is_err() {
+                return;
+            }
+            write_response(&mut stream, response).await;
+        }
+    });
 
-    daemon.start_kill().unwrap();
-    let _ = daemon.wait().await;
-    server_task.await.unwrap();
-}
-
-#[tokio::test]
-async fn daemon_starts_with_environment_credentials_without_persisting_them() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = temp.path().join("artifacts");
-    std::fs::create_dir(&root).unwrap();
-    let publishing_path = root.join("config.json");
-    std::fs::write(&publishing_path, r#"{"team":"w3dev"}"#).unwrap();
-    let auth_path = home.join(".config/artifact-sync/config.json");
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_origin = origin(&listener);
-    let (mut requests, server_task) = daemon_mock_server(listener);
-
-    let mut daemon = daemon_with_environment_credential(
-        &home,
-        &auth_path,
-        &publishing_path,
-        TOKEN,
-        &server_origin,
-    );
-    let request = tokio::time::timeout(std::time::Duration::from_secs(3), requests.recv())
-        .await
-        .expect("daemon did not validate its environment credential")
-        .expect("mock server stopped");
-    assert!(request.starts_with("GET /__api/v1/auth/me "));
-    let socket_path = home.join(".config/artifact-sync/daemon.sock");
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !socket_path.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let saw_upload = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            match requests_rx.recv().await {
+                Some(request) if request.starts_with("PUT /__api/v1/uploads?") => break true,
+                Some(_) => {}
+                None => break false,
+            }
         }
     })
     .await
-    .expect("daemon control socket did not appear");
-    assert!(auth_path.parent().unwrap().is_dir());
-    assert!(
-        !auth_path.exists(),
-        "environment credentials must stay in memory"
+    .unwrap();
+    assert!(saw_upload);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pending_count(&database) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("successful gateway upload did not clear pending work");
+    assert_eq!(pending_count(&database), 0);
+    assert_eq!(
+        CredentialStore::new(&auth_path)
+            .load()
+            .unwrap()
+            .unwrap()
+            .auth
+            .unwrap()
+            .refresh_token
+            .expose(),
+        ROTATED_REFRESH
     );
 
     daemon.start_kill().unwrap();
     let _ = daemon.wait().await;
-    server_task.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = temp.path().join("artifacts");
+    let publishing_path = publishing_config(&root, "w3dev");
+    let auth_path = home.join(".config/artifact-sync/config.json");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_origin = origin(&listener);
+    private_auth(&auth_path, &server_origin);
+    let (requests_tx, mut requests_rx) = unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        let _ = requests_tx.send(summarize_request(&request));
+        write_response(&mut stream, MockResponse::json(200, identity("w3dev"))).await;
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        let _ = requests_tx.send(summarize_request(&request));
+        let mut byte = [0u8; 1];
+        let upload_closed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut byte))
+                .await
+                .is_ok_and(|result| result.is_ok_and(|read| read == 0));
+        let _ = requests_tx.send(if upload_closed {
+            "UPLOAD_CANCELLED".into()
+        } else {
+            "UPLOAD_NOT_CANCELLED".into()
+        });
+    });
+
+    let mut daemon = spawn_daemon(&home, &auth_path, &publishing_path, None, None);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .starts_with("GET /__api/v1/auth/me ")
+    );
+    wait_for_daemon_ready(&home).await;
+    let artifact = root.join("in-flight.json");
+    std::fs::write(&artifact, "{\"pending\":true}").unwrap();
+    let upload_request =
+        tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(upload_request.starts_with("PUT /__api/v1/uploads?"));
+
+    let logout = run_command(
+        &home,
+        &auth_path,
+        &publishing_path,
+        &["logout"],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(logout.status.success(), "{}", output_text(&logout));
+    assert!(output_text(&logout).contains("running daemon was notified"));
+    let database = state_database(&home);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if pending_count(&database) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let later = root.join("after-logout.json");
+    std::fs::write(&later, "{\"still\":\"queued\"}").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if pending_count(&database) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let upload_state = tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
+        .await
+        .expect("server did not observe logout cancellation");
+    assert_eq!(upload_state.as_deref(), Some("UPLOAD_CANCELLED"));
+
+    daemon.start_kill().unwrap();
+    let _ = daemon.wait().await;
+    server.abort();
 }

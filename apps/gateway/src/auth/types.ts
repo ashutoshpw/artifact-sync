@@ -1,30 +1,22 @@
 export const PUBLISH_PERMISSION = "artifacts:publish";
-
-export interface PublisherTokenRecord {
-  tokenId: string;
-  tokenHash: string;
-  publisherId: string;
-  team: string;
-  permissions: string[];
-  expiresAt: string;
-  revokedAt?: string;
-}
-
-export interface PublisherRegistry {
-  version: 1;
-  tokens: PublisherTokenRecord[];
-}
+export const READ_PERMISSION = "artifacts:read";
+export const ACCESS_TOKEN_SECONDS = 7 * 24 * 60 * 60;
+export const REFRESH_IDLE_SECONDS = 30 * 24 * 60 * 60;
+export const REFRESH_MAX_SECONDS = 90 * 24 * 60 * 60;
 
 export interface PublisherIdentity {
-  publisherId: string;
+  userId: string;
+  email: string;
+  name: string;
+  teamId: string;
   team: string;
   permissions: string[];
   expiresAt: string;
   tokenId: string;
 }
-
-export type GatewayEnv = Env;
 
 export interface AuthContext {
   identity: PublisherIdentity;
 }
+
+export type GatewayEnv = Env;

@@ -1,4 +1,4 @@
-use super::credentials::{PublisherIdentity, SecretString, TemporaryUploadCredentials};
+use super::credentials::{DeviceAuthorization, PublisherIdentity, SecretString, TokenExchange};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Serialize;
 use thiserror::Error;
@@ -6,10 +6,12 @@ use url::Url;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AuthClientError {
-    #[error("publisher credential was rejected (401)")]
+    #[error("team credential was rejected (401)")]
     InvalidCredential,
-    #[error("publisher is authenticated but lacks permission or team access (403)")]
+    #[error("authenticated user lacks permission or team access (403)")]
     Forbidden,
+    #[error("device authorization expired before approval")]
+    DeviceExpired,
     #[error("authentication server redirected the request; credentials were not forwarded")]
     Redirect,
     #[error("authentication server is unreachable; retry when connectivity returns")]
@@ -18,6 +20,8 @@ pub enum AuthClientError {
     UnexpectedResponse,
     #[error("authentication server returned malformed identity data")]
     MalformedResponse,
+    #[error("device verification URL did not match the selected server origin")]
+    UnsafeDeviceUrl,
 }
 
 #[derive(Clone)]
@@ -30,7 +34,7 @@ impl AuthClient {
     pub fn new(origin: String) -> Result<Self, AuthClientError> {
         let http = Client::builder()
             .redirect(Policy::none())
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|_| AuthClientError::Unavailable)?;
         Ok(Self { origin, http })
@@ -40,58 +44,152 @@ impl AuthClient {
         &self.origin
     }
 
-    pub async fn whoami(&self, token: &SecretString) -> Result<PublisherIdentity, AuthClientError> {
+    pub async fn whoami(
+        &self,
+        access_token: &SecretString,
+    ) -> Result<PublisherIdentity, AuthClientError> {
         let response = self
             .http
             .get(format!("{}/__api/v1/auth/me", self.origin))
-            .bearer_auth(token.expose())
+            .bearer_auth(access_token.expose())
             .send()
             .await
             .map_err(|_| AuthClientError::Unavailable)?;
-        check_status(&response)?;
+        check_status(&response, &[StatusCode::OK])?;
         response
             .json()
             .await
             .map_err(|_| AuthClientError::MalformedResponse)
     }
 
-    pub async fn temporary_credentials(
+    pub async fn refresh(
         &self,
-        token: &SecretString,
-        team: &str,
-    ) -> Result<TemporaryUploadCredentials, AuthClientError> {
+        refresh_token: &SecretString,
+        rotate: bool,
+    ) -> Result<TokenExchange, AuthClientError> {
         #[derive(Serialize)]
-        struct Request<'a> {
-            team: &'a str,
+        #[serde(rename_all = "camelCase")]
+        struct RefreshRequest<'a> {
+            refresh_token: &'a str,
+            rotate: bool,
         }
 
         let response = self
             .http
-            .post(format!("{}/__api/v1/uploads/credentials", self.origin))
-            .bearer_auth(token.expose())
-            .json(&Request { team })
+            .post(format!("{}/__api/v1/auth/refresh", self.origin))
+            .json(&RefreshRequest {
+                refresh_token: refresh_token.expose(),
+                rotate,
+            })
             .send()
             .await
             .map_err(|_| AuthClientError::Unavailable)?;
-        check_status(&response)?;
+        check_status(&response, &[StatusCode::OK])?;
         response
             .json()
             .await
             .map_err(|_| AuthClientError::MalformedResponse)
     }
+
+    pub async fn start_device(&self) -> Result<DeviceAuthorization, AuthClientError> {
+        let response = self
+            .http
+            .post(format!("{}/__api/v1/device/start", self.origin))
+            .send()
+            .await
+            .map_err(|_| AuthClientError::Unavailable)?;
+        check_status(&response, &[StatusCode::CREATED])?;
+        let authorization: DeviceAuthorization = response
+            .json()
+            .await
+            .map_err(|_| AuthClientError::MalformedResponse)?;
+        validate_device_verification_url(&self.origin, &authorization.verification_url)?;
+        Ok(authorization)
+    }
+
+    pub async fn poll_device(
+        &self,
+        device_code: &SecretString,
+    ) -> Result<Option<TokenExchange>, AuthClientError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PollRequest<'a> {
+            device_code: &'a str,
+        }
+
+        let response = self
+            .http
+            .post(format!("{}/__api/v1/device/poll", self.origin))
+            .json(&PollRequest {
+                device_code: device_code.expose(),
+            })
+            .send()
+            .await
+            .map_err(|_| AuthClientError::Unavailable)?;
+        if response.status() == StatusCode::ACCEPTED {
+            return Ok(None);
+        }
+        check_status(&response, &[StatusCode::OK])?;
+        response
+            .json()
+            .await
+            .map(Some)
+            .map_err(|_| AuthClientError::MalformedResponse)
+    }
+
+    pub async fn upload(
+        &self,
+        access_token: &SecretString,
+        relative_path: &str,
+        body: Vec<u8>,
+    ) -> Result<(), AuthClientError> {
+        let response = self
+            .http
+            .put(format!("{}/__api/v1/uploads", self.origin))
+            .bearer_auth(access_token.expose())
+            .query(&[("path", relative_path)])
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| AuthClientError::Unavailable)?;
+        check_status(&response, &[StatusCode::CREATED])
+    }
 }
 
-fn check_status(response: &reqwest::Response) -> Result<(), AuthClientError> {
+fn check_status(
+    response: &reqwest::Response,
+    accepted: &[StatusCode],
+) -> Result<(), AuthClientError> {
     let status = response.status();
     if status.is_redirection() {
         return Err(AuthClientError::Redirect);
     }
+    if accepted.contains(&status) {
+        return Ok(());
+    }
     match status {
-        StatusCode::OK => Ok(()),
         StatusCode::UNAUTHORIZED => Err(AuthClientError::InvalidCredential),
         StatusCode::FORBIDDEN => Err(AuthClientError::Forbidden),
+        StatusCode::GONE => Err(AuthClientError::DeviceExpired),
         _ => Err(AuthClientError::UnexpectedResponse),
     }
+}
+
+pub fn validate_device_verification_url(origin: &str, value: &str) -> Result<(), AuthClientError> {
+    let parsed = Url::parse(value).map_err(|_| AuthClientError::UnsafeDeviceUrl)?;
+    let normalized_origin =
+        normalize_server_origin(origin).map_err(|_| AuthClientError::UnsafeDeviceUrl)?;
+    let result_origin = parsed.origin().ascii_serialization();
+    if parsed.username().len() > 0
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/auth/device"
+        || result_origin != normalized_origin
+    {
+        return Err(AuthClientError::UnsafeDeviceUrl);
+    }
+    Ok(())
 }
 
 pub fn normalize_server_origin(value: &str) -> Result<String, String> {
@@ -176,5 +274,30 @@ mod tests {
         unsafe {
             std::env::remove_var("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP");
         }
+    }
+
+    #[test]
+    fn rejects_cross_origin_and_non_device_verification_redirects() {
+        assert!(
+            validate_device_verification_url(
+                "https://artifact.w3dev.app",
+                "https://attacker.example/auth/device?code=AAAA2222"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_device_verification_url(
+                "https://artifact.w3dev.app",
+                "https://artifact.w3dev.app/redirect?to=https://attacker.example"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_device_verification_url(
+                "https://artifact.w3dev.app",
+                "https://artifact.w3dev.app/auth/device?code=AAAA2222"
+            )
+            .is_ok()
+        );
     }
 }

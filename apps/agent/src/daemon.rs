@@ -1,5 +1,7 @@
-use crate::auth::client::{AuthClient, AuthClientError};
-use crate::auth::commands::{resolve_active_credential, validate_auth_path};
+use crate::auth::client::AuthClientError;
+use crate::auth::commands::{
+    resolve_active_credential, validate_active_credential, validate_auth_path,
+};
 use crate::auth::credentials::ActiveCredential;
 use crate::auth::store::CredentialStore;
 use crate::config::{PublishingConfig, load_publishing_config};
@@ -66,18 +68,11 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
     }
 
     let state = Arc::new(SyncState::open_default()?);
-    state.reconcile(&root)?;
     let store = Arc::new(CredentialStore::new(auth_path.clone()));
-    let active = resolve_active_credential(&store)
-        .map_err(|error| DaemonError::Message(error.to_string()))?
-        .ok_or_else(|| DaemonError::Message("publisher credentials are missing; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN and ARTIFACT_SYNC_SERVER_URL".into()))?;
 
-    let mut manager = authenticate_for_daemon(&active, &config).await?;
-    if manager.is_none() {
-        warn!("authentication server is unreachable; pending changes will be retained and retried");
-        manager = Some(make_upload_manager(&active, &config)?);
-    }
-
+    // Watch before reconciling or contacting the gateway. Authentication can
+    // take seconds (or fail offline); changes during that window must remain
+    // observable and be queued once the event loop starts.
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = events_tx.send(event);
@@ -88,6 +83,21 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
         .ok_or_else(|| DaemonError::Message("authentication config has no parent".into()))?;
     let _auth_parent_handle = crate::auth::store::open_private_directory(auth_parent)?;
     watcher.watch(auth_parent, RecursiveMode::NonRecursive)?;
+    state.reconcile(&root)?;
+
+    let mut active = resolve_active_credential(&store)
+        .map_err(|error| DaemonError::Message(error.to_string()))?
+        .ok_or_else(|| DaemonError::Message("team credentials are missing; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN and ARTIFACT_SYNC_SERVER_URL".into()))?;
+
+    let mut manager = authenticate_for_daemon(&mut active, &store, &config).await?;
+    let mut auth_paused = false;
+    let mut auth_retry_delay = Duration::from_secs(1);
+    let mut auth_retry_at = Instant::now() + auth_retry_delay;
+    if manager.is_none() {
+        warn!(
+            "authentication server is unreachable; pending changes are retained while authentication retries with backoff"
+        );
+    }
 
     let (control_listener, _socket_guard) = bind_control_socket().await?;
     let mut jobs = JoinSet::<JobResult>::new();
@@ -178,7 +188,14 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                     auth_reload_sleep
                         .as_mut()
                         .reset(Instant::now() + Duration::from_secs(24 * 60 * 60));
-                    reload_auth(&store, &config, &mut manager, &mut cancellation).await;
+                    reload_auth(
+                        &store,
+                        &config,
+                        &mut manager,
+                        &mut cancellation,
+                        &mut auth_paused,
+                    )
+                    .await;
                     stream.write_all(b"OK\n").await?;
                 }
             }
@@ -201,15 +218,15 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                         AuthClientError::InvalidCredential | AuthClientError::Forbidden,
                     )) => {
                         cancellation.cancel();
+                        auth_paused = true;
                         if let Some(current) = manager.take() {
                             current.clear_cached_credentials().await;
                         }
                         error!(
-                            "publisher credential was rejected; publishing is paused. Run artifact-sync whoami, then login again or ask an operator to restore permission."
+                            "team credential was rejected or lacks permission; publishing is paused. Run artifact-sync whoami, then login again or revoke/recreate the team API token in Settings."
                         );
                     }
-                    Err(UploadError::Auth(AuthClientError::Unavailable))
-                    | Err(UploadError::Network) => {
+                    Err(UploadError::Auth(AuthClientError::Unavailable)) => {
                         retry_item(&state, &item)?;
                         warn!(path = %item.relative_path.display(), "upload server is unreachable; queued work will retry with backoff");
                     }
@@ -219,7 +236,7 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                     }
                     Err(other) => {
                         retry_item(&state, &item)?;
-                        warn!(path = %item.relative_path.display(), error = %other, "R2 upload failed; queued work will retry");
+                        warn!(path = %item.relative_path.display(), error = %other, "gateway upload failed; queued work will retry");
                     }
                 }
             }
@@ -234,9 +251,55 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
             }
             LoopEvent::AuthReload => {
                 auth_reload_armed = false;
-                reload_auth(&store, &config, &mut manager, &mut cancellation).await;
+                reload_auth(
+                    &store,
+                    &config,
+                    &mut manager,
+                    &mut cancellation,
+                    &mut auth_paused,
+                )
+                .await;
             }
-            LoopEvent::Retry => {}
+            LoopEvent::Retry => {
+                if manager.is_none() && !auth_paused && Instant::now() >= auth_retry_at {
+                    match resolve_active_credential(&store) {
+                        Ok(Some(mut active)) => {
+                            match authenticate_for_daemon(&mut active, &store, &config).await {
+                                Ok(Some(next)) => {
+                                    manager = Some(next);
+                                    auth_retry_delay = Duration::from_secs(1);
+                                    info!(
+                                        source = active.source.label(),
+                                        "team credentials are verified; queued uploads resumed"
+                                    );
+                                }
+                                Ok(None) => {
+                                    auth_retry_at = Instant::now() + auth_retry_delay;
+                                    auth_retry_delay =
+                                        (auth_retry_delay * 2).min(Duration::from_secs(300));
+                                    warn!(
+                                        "gateway is still unreachable; queued uploads remain pending"
+                                    );
+                                }
+                                Err(error) => {
+                                    auth_paused = true;
+                                    error!(error = %error, "team credentials are definitively invalid; publishing is paused until credentials change");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            auth_paused = true;
+                            warn!(
+                                "team credentials were removed; queued uploads remain pending until login"
+                            );
+                        }
+                        Err(error) => {
+                            auth_paused = true;
+                            error!(error = %error, "could not load team credentials; publishing is paused until the credential file changes");
+                        }
+                    }
+                }
+            }
             LoopEvent::Debounce => {
                 debug!(paths = changed_paths.len(), "debounced filesystem changes");
                 debounce_armed = false;
@@ -270,16 +333,15 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
 }
 
 async fn authenticate_for_daemon(
-    active: &ActiveCredential,
+    active: &mut ActiveCredential,
+    store: &CredentialStore,
     config: &PublishingConfig,
 ) -> Result<Option<Arc<UploadManager>>, DaemonError> {
-    let client = AuthClient::new(active.server_origin.clone())
-        .map_err(|error| DaemonError::Message(error.to_string()))?;
-    match client.whoami(&active.token).await {
+    match validate_active_credential(active, store).await {
         Ok(identity) => {
             if identity.team != config.team {
                 return Err(DaemonError::Message(format!(
-                    "publisher is authorized for team '{}' but publishing config selects '{}'",
+                    "credential is authorized for team '{}' but publishing config selects '{}'",
                     identity.team, config.team
                 )));
             }
@@ -289,17 +351,17 @@ async fn authenticate_for_daemon(
                 .any(|permission| permission == PUBLISH_PERMISSION)
             {
                 return Err(DaemonError::Message(
-                    "publisher credential lacks artifacts:publish permission".into(),
+                    "credential lacks artifacts:publish permission".into(),
                 ));
             }
-            Ok(Some(make_upload_manager(active, config)?))
+            Ok(Some(make_upload_manager(active, &identity, config, store)?))
         }
         Err(AuthClientError::Unavailable) => Ok(None),
         Err(AuthClientError::InvalidCredential) => Err(DaemonError::Message(
-            "publisher credential is invalid, expired, or revoked; run artifact-sync login".into(),
+            "team credential is invalid, expired, or revoked; run artifact-sync login".into(),
         )),
         Err(AuthClientError::Forbidden) => Err(DaemonError::Message(
-            "publisher is authenticated but lacks publishing permission".into(),
+            "authenticated account lacks publishing permission for the configured team".into(),
         )),
         Err(error) => Err(DaemonError::Message(format!(
             "authentication could not be validated: {error}"
@@ -309,14 +371,18 @@ async fn authenticate_for_daemon(
 
 fn make_upload_manager(
     active: &ActiveCredential,
+    identity: &crate::auth::credentials::PublisherIdentity,
     config: &PublishingConfig,
+    store: &CredentialStore,
 ) -> Result<Arc<UploadManager>, DaemonError> {
-    let client = AuthClient::new(active.server_origin.clone())
+    let client = crate::auth::client::AuthClient::new(active.server_origin.clone())
         .map_err(|error| DaemonError::Message(error.to_string()))?;
     Ok(Arc::new(UploadManager::new(
         client,
-        active.token.clone(),
+        active,
         config.team.clone(),
+        identity.expires_at,
+        store,
     )))
 }
 
@@ -325,38 +391,40 @@ async fn reload_auth(
     config: &PublishingConfig,
     manager: &mut Option<Arc<UploadManager>>,
     cancellation: &mut CancellationToken,
+    auth_paused: &mut bool,
 ) {
     invalidate_current_manager(manager, cancellation).await;
+    *auth_paused = false;
 
-    let active = match resolve_active_credential(store) {
+    let mut active = match resolve_active_credential(store) {
         Ok(Some(active)) => active,
         Ok(None) => {
-            warn!(
-                "publisher credentials were removed; uploads are paused and queued work is preserved"
-            );
+            *auth_paused = true;
+            warn!("team credentials were removed; uploads are paused and queued work is preserved");
             return;
         }
         Err(error) => {
-            warn!(error = %error, "could not load publisher credentials; uploads are paused");
+            *auth_paused = true;
+            warn!(error = %error, "could not load team credentials; uploads are paused");
             return;
         }
     };
-    match authenticate_for_daemon(&active, config).await {
+    match authenticate_for_daemon(&mut active, store, config).await {
         Ok(Some(next)) => {
             *manager = Some(next);
             info!(
                 source = active.source.label(),
-                "publisher credentials changed and were verified"
+                "team credentials changed and were verified"
             );
         }
         Ok(None) => {
-            *manager = make_upload_manager(&active, config).ok();
             warn!(
                 "new credential destination is unreachable; changes remain queued until connectivity returns"
             );
         }
         Err(error) => {
-            warn!(error = %error, "new publisher credential could not be verified; publishing is paused")
+            *auth_paused = true;
+            warn!(error = %error, "new team credential could not be verified; publishing is paused")
         }
     }
 }

@@ -1,6 +1,7 @@
 use super::client::{AuthClient, AuthClientError, normalize_server_origin};
 use super::credentials::{
-    ActiveCredential, CachedIdentity, CredentialSource, SavedAuth, SecretString, is_publisher_token,
+    ActiveCredential, CachedIdentity, CredentialSource, PublisherIdentity, SavedAuth, SecretString,
+    TokenExchange, is_access_token, is_refresh_credential,
 };
 use super::store::{CredentialStore, StoreError};
 use crate::config::{
@@ -8,6 +9,7 @@ use crate::config::{
 };
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -21,9 +23,9 @@ pub enum CommandError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("{0}")]
+    #[error(transparent)]
     Auth(#[from] AuthClientError),
-    #[error("could not read publisher token from standard input")]
+    #[error("could not read the API token from standard input")]
     TokenInput,
 }
 
@@ -49,36 +51,41 @@ pub async fn login(
     validate_auth_path(&auth_path, &publishing_path)?;
     let origin = normalize_server_origin(server).map_err(CommandError::Message)?;
     println!("Destination server: {origin}");
-    let token = read_publisher_token(token_stdin)?;
     let client = AuthClient::new(origin.clone())?;
-    let identity = client.whoami(&token).await.map_err(auth_command_error)?;
+    let exchange = if token_stdin {
+        let token = read_api_token()?;
+        client
+            .refresh(&token, true)
+            .await
+            .map_err(auth_command_error)?
+    } else {
+        complete_device_login(&client).await?
+    };
+    let identity = client
+        .whoami(&exchange.access_token)
+        .await
+        .map_err(auth_command_error)?;
+    if identity != exchange.identity {
+        return Err(CommandError::Message(
+            "gateway returned inconsistent identity data; no credential was saved".into(),
+        ));
+    }
 
     if publishing_path.exists() {
         let publishing = load_publishing_config(&publishing_path)?;
         if identity.team != publishing.team {
             return Err(CommandError::Message(format!(
-                "publisher is authorized for team '{}' but publishing configuration selects '{}'; no credential was saved",
+                "credential is authorized for team '{}' but publishing configuration selects '{}'; no credential was saved",
                 identity.team, publishing.team
             )));
         }
     }
 
-    let auth = SavedAuth {
-        auth_type: "publisher_token".into(),
-        token,
-        token_id: Some(identity.token_id.clone()),
-        expires_at: Some(identity.expires_at),
-        cached_identity: Some(CachedIdentity {
-            publisher_id: identity.publisher_id.clone(),
-            team: identity.team.clone(),
-            permissions: identity.permissions.clone(),
-        }),
-    };
+    let auth = saved_auth_for_upload(&exchange);
     CredentialStore::new(&auth_path).save_login(&origin, &auth)?;
-
     println!(
-        "Authenticated publisher {} for team {}.",
-        identity.publisher_id, identity.team
+        "Authenticated {} ({}) for team {}.",
+        identity.name, identity.email, identity.team
     );
     println!(
         "Saved authentication configuration: {}",
@@ -86,19 +93,75 @@ pub async fn login(
     );
     if std::env::var_os("ARTIFACTS_PUBLISH_TOKEN").is_some() {
         println!(
-            "Note: ARTIFACTS_PUBLISH_TOKEN is set and will take precedence over this saved credential."
+            "Note: ARTIFACTS_PUBLISH_TOKEN is set and takes precedence over this saved login."
         );
     }
     Ok(())
 }
 
+async fn complete_device_login(client: &AuthClient) -> Result<TokenExchange, CommandError> {
+    if !std::io::stdin().is_terminal() {
+        return Err(CommandError::Message(
+            "login requires a terminal for browser device approval; use `--token-stdin` to read a team API token from standard input".into(),
+        ));
+    }
+    let authorization = client.start_device().await.map_err(auth_command_error)?;
+    let grouped_code = format!(
+        "{}-{}",
+        &authorization.user_code[..4],
+        &authorization.user_code[4..]
+    );
+    println!(
+        "Open this URL to approve the device: {}",
+        authorization.verification_url
+    );
+    println!("Device code: {grouped_code}");
+    open_browser_best_effort(&authorization.verification_url);
+    println!("Waiting for approval. Keep this terminal open; press Ctrl-C to cancel.");
+
+    loop {
+        if chrono::Utc::now() >= authorization.expires_at {
+            return Err(CommandError::Auth(AuthClientError::DeviceExpired));
+        }
+        match client
+            .poll_device(&authorization.device_code)
+            .await
+            .map_err(auth_command_error)?
+        {
+            Some(exchange) => return Ok(exchange),
+            None => {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    authorization.interval_seconds.clamp(1, 30),
+                ))
+                .await
+            }
+        }
+    }
+}
+
+fn open_browser_best_effort(url: &str) {
+    #[cfg(target_os = "macos")]
+    let command = "open";
+    #[cfg(target_os = "linux")]
+    let command = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let command = return;
+
+    let _ = Command::new(command)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 pub async fn whoami(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), CommandError> {
     validate_auth_path(&auth_path, &publishing_path)?;
     let store = CredentialStore::new(auth_path);
-    let active = resolve_active_credential(&store)?
-        .ok_or_else(|| CommandError::Message("no publisher credential is configured; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN with ARTIFACT_SYNC_SERVER_URL".into()))?;
-    let identity = AuthClient::new(active.server_origin.clone())?
-        .whoami(&active.token)
+    let mut active = resolve_active_credential(&store)?.ok_or_else(|| {
+        CommandError::Message("no team credential is configured; run `artifact-sync login`".into())
+    })?;
+    let identity = validate_active_credential(&mut active, &store)
         .await
         .map_err(auth_command_error)?;
     println!("Server: {}", active.server_origin);
@@ -111,12 +174,12 @@ pub async fn logout(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), 
     validate_auth_path(&auth_path, &publishing_path)?;
     let removed = CredentialStore::new(auth_path.clone()).logout()?;
     if removed {
-        println!("Removed the locally stored publisher credential.");
+        println!("Removed the locally stored team credential.");
     } else {
-        println!("No locally stored publisher credential was present.");
+        println!("No locally stored team credential was present.");
     }
     println!(
-        "Local logout does not revoke the token on the server. Ask an operator to revoke and deploy the updated token registry."
+        "Local logout is not server-side revocation. Revoke this device in Settings → API tokens to stop future refreshes; an already-issued access JWT can remain valid for up to seven days."
     );
 
     match notify_daemon_auth_changed().await {
@@ -142,8 +205,15 @@ pub fn resolve_active_credential(
     if let Some(token) = env_token {
         if token.is_empty() {
             return Err(CommandError::Message(
-                "ARTIFACTS_PUBLISH_TOKEN is set but empty; remove it or provide a publisher token"
+                "ARTIFACTS_PUBLISH_TOKEN is set but empty; remove it or configure a team API token"
                     .into(),
+            ));
+        }
+        let is_api_token = token.starts_with("as_api_") && is_refresh_credential(&token);
+        let is_jwt = is_access_token(&token);
+        if !is_api_token && !is_jwt {
+            return Err(CommandError::Message(
+                "ARTIFACTS_PUBLISH_TOKEN must be a team API token or access JWT; rotating refresh and device secrets belong in the auth file".into(),
             ));
         }
         let server = env_server.filter(|value| !value.is_empty()).ok_or_else(|| {
@@ -153,7 +223,8 @@ pub fn resolve_active_credential(
         })?;
         let origin = normalize_server_origin(&server).map_err(CommandError::Message)?;
         return Ok(Some(ActiveCredential {
-            token: SecretString::new(token),
+            access_token: SecretString::new(token.clone()),
+            refresh_token: is_api_token.then(|| SecretString::new(token)),
             server_origin: origin,
             source: CredentialSource::Environment,
             cached_auth: None,
@@ -180,11 +251,76 @@ pub fn resolve_active_credential(
         }
     }
     Ok(Some(ActiveCredential {
-        token: auth.token.clone(),
+        access_token: auth.access_token.clone(),
+        refresh_token: Some(auth.refresh_token.clone()),
         server_origin: saved_origin,
         source: CredentialSource::AuthFile,
         cached_auth: Some(auth),
     }))
+}
+
+pub async fn validate_active_credential(
+    active: &mut ActiveCredential,
+    store: &CredentialStore,
+) -> Result<PublisherIdentity, AuthClientError> {
+    let client = AuthClient::new(active.server_origin.clone())?;
+
+    if active.source == CredentialSource::Environment
+        && is_refresh_credential(active.access_token.expose())
+    {
+        let exchange = client.refresh(&active.access_token, false).await?;
+        let identity = client.whoami(&exchange.access_token).await?;
+        if identity != exchange.identity {
+            return Err(AuthClientError::MalformedResponse);
+        }
+        active.access_token = exchange.access_token;
+        active.refresh_token = Some(exchange.refresh_token);
+        return Ok(identity);
+    }
+
+    match client.whoami(&active.access_token).await {
+        Ok(identity) => Ok(identity),
+        Err(AuthClientError::InvalidCredential) => {
+            let refresh = active
+                .refresh_token
+                .as_ref()
+                .ok_or(AuthClientError::InvalidCredential)?;
+            let exchange = client.refresh(refresh, true).await?;
+            let identity = client.whoami(&exchange.access_token).await?;
+            if identity != exchange.identity {
+                return Err(AuthClientError::MalformedResponse);
+            }
+            active.access_token = exchange.access_token.clone();
+            active.refresh_token = Some(exchange.refresh_token.clone());
+            if active.source == CredentialSource::AuthFile {
+                let auth = saved_auth_for_upload(&exchange);
+                store
+                    .save_login(&active.server_origin, &auth)
+                    .map_err(|_| AuthClientError::UnexpectedResponse)?;
+                active.cached_auth = Some(auth);
+            }
+            Ok(identity)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn saved_auth_for_upload(exchange: &TokenExchange) -> SavedAuth {
+    SavedAuth {
+        auth_type: "team_token".into(),
+        access_token: exchange.access_token.clone(),
+        refresh_token: exchange.refresh_token.clone(),
+        token_id: exchange.identity.token_id.clone(),
+        expires_at: exchange.expires_at,
+        cached_identity: CachedIdentity {
+            user_id: exchange.identity.user_id.clone(),
+            email: exchange.identity.email.clone(),
+            name: exchange.identity.name.clone(),
+            team_id: exchange.identity.team_id.clone(),
+            team: exchange.identity.team.clone(),
+            permissions: exchange.identity.permissions.clone(),
+        },
+    }
 }
 
 fn optional_environment_value(name: &str) -> Result<Option<String>, CommandError> {
@@ -197,8 +333,9 @@ fn optional_environment_value(name: &str) -> Result<Option<String>, CommandError
         .transpose()
 }
 
-pub fn print_identity(identity: &super::credentials::PublisherIdentity) {
-    println!("Publisher ID: {}", identity.publisher_id);
+pub fn print_identity(identity: &PublisherIdentity) {
+    println!("User: {} ({})", identity.name, identity.email);
+    println!("User ID: {}", identity.user_id);
     println!("Authorized team: {}", identity.team);
     println!(
         "Permissions: {}",
@@ -211,42 +348,27 @@ pub fn print_identity(identity: &super::credentials::PublisherIdentity) {
     println!("Expires: {}", identity.expires_at.to_rfc3339());
 }
 
-fn read_publisher_token(token_stdin: bool) -> Result<SecretString, CommandError> {
-    let value = if token_stdin {
-        let mut input = Zeroizing::new(String::new());
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .map_err(|_| CommandError::TokenInput)?;
-        input.trim().to_owned()
-    } else {
-        if !std::io::stdin().is_terminal() {
-            return Err(CommandError::Message("login needs an interactive terminal or `--token-stdin`; secrets are not accepted as command arguments".into()));
-        }
-        rpassword::prompt_password("Publisher token: ").map_err(|_| CommandError::TokenInput)?
-    };
-    let mut value = Zeroizing::new(value);
-    if value.is_empty() {
-        return Err(CommandError::Message(if token_stdin {
-            "no publisher token was supplied on standard input".into()
-        } else {
-            "no publisher token was entered".into()
-        }));
-    }
-    if !is_publisher_token(&value) {
+fn read_api_token() -> Result<SecretString, CommandError> {
+    let mut input = Zeroizing::new(String::new());
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|_| CommandError::TokenInput)?;
+    let token = input.trim();
+    if !is_refresh_credential(token) {
         return Err(CommandError::Message(
-            "publisher token has an invalid format".into(),
+            "no valid team API token was supplied on standard input".into(),
         ));
     }
-    Ok(SecretString::new(std::mem::take(&mut *value)))
+    Ok(SecretString::new(token.to_string()))
 }
 
 fn auth_command_error(error: AuthClientError) -> CommandError {
     match error {
         AuthClientError::InvalidCredential => CommandError::Message(
-            "publisher credential is invalid, expired, or revoked; no credential was saved".into(),
+            "team credential is invalid, expired, or revoked; no credential was saved".into(),
         ),
         AuthClientError::Forbidden => CommandError::Message(
-            "publisher is authenticated but lacks permission for this operation".into(),
+            "authenticated account lacks permission for this team operation".into(),
         ),
         AuthClientError::Unavailable => CommandError::Message(
             "authentication server is unreachable; the credential was not verified".into(),
@@ -289,35 +411,44 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    const SAVED_TOKEN: &str = "as_pub_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const SAVED_ACCESS: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcnRpZmFjdC1zeW5jIn0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SAVED_REFRESH: &str = "as_rf_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
     fn lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    #[test]
-    fn environment_token_requires_an_explicit_destination_and_wins() {
-        let _guard = lock().lock().unwrap();
-        unsafe {
-            std::env::set_var("ARTIFACTS_PUBLISH_TOKEN", "as_pub_environment-token");
+    fn saved_auth() -> SavedAuth {
+        SavedAuth {
+            auth_type: "team_token".into(),
+            access_token: SecretString::new(SAVED_ACCESS),
+            refresh_token: SecretString::new(SAVED_REFRESH),
+            token_id: "api_saved".into(),
+            expires_at: chrono::Utc::now(),
+            cached_identity: CachedIdentity {
+                user_id: "user-1".into(),
+                email: "user@example.test".into(),
+                name: "User".into(),
+                team_id: "team-1".into(),
+                team: "w3dev".into(),
+                permissions: vec!["artifacts:publish".into(), "artifacts:read".into()],
+            },
         }
+    }
+
+    #[test]
+    fn environment_api_token_requires_an_explicit_destination_and_wins_without_persistence() {
+        let _guard = lock().lock().unwrap();
+        let env_token = format!("as_api_{}", "A".repeat(43));
         unsafe {
+            std::env::set_var("ARTIFACTS_PUBLISH_TOKEN", &env_token);
             std::env::remove_var("ARTIFACT_SYNC_SERVER_URL");
         }
         let temp = tempfile::tempdir().unwrap();
         let store = CredentialStore::new(temp.path().join("private/config.json"));
         store
-            .save_login(
-                "https://saved.example",
-                &SavedAuth {
-                    auth_type: "publisher_token".into(),
-                    token: SecretString::new(SAVED_TOKEN),
-                    token_id: None,
-                    expires_at: None,
-                    cached_identity: None,
-                },
-            )
+            .save_login("https://saved.example", &saved_auth())
             .unwrap();
         assert!(
             resolve_active_credential(&store)
@@ -328,44 +459,37 @@ mod tests {
         unsafe {
             std::env::set_var("ARTIFACT_SYNC_SERVER_URL", "https://env.example");
         }
-        let credential = resolve_active_credential(&store).unwrap().unwrap();
-        assert_eq!(credential.source, CredentialSource::Environment);
-        assert_eq!(credential.server_origin, "https://env.example");
-        assert_eq!(credential.token.expose(), "as_pub_environment-token");
+        let active = resolve_active_credential(&store).unwrap().unwrap();
+        assert_eq!(active.source, CredentialSource::Environment);
+        assert_eq!(active.server_origin, "https://env.example");
+        assert_eq!(active.access_token.expose(), env_token);
         assert_eq!(
-            store.load().unwrap().unwrap().auth.unwrap().token.expose(),
-            SAVED_TOKEN,
-            "environment credentials must not replace or persist over the saved login"
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .auth
+                .unwrap()
+                .access_token
+                .expose(),
+            SAVED_ACCESS
         );
         unsafe {
             std::env::remove_var("ARTIFACTS_PUBLISH_TOKEN");
-        }
-        unsafe {
             std::env::remove_var("ARTIFACT_SYNC_SERVER_URL");
         }
     }
 
     #[test]
-    fn empty_environment_override_does_not_fall_back_to_a_saved_login() {
+    fn empty_environment_override_does_not_fall_back_and_destination_changes_require_login() {
         let _guard = lock().lock().unwrap();
         unsafe {
             std::env::set_var("ARTIFACTS_PUBLISH_TOKEN", "");
-            std::env::set_var("ARTIFACT_SYNC_SERVER_URL", "https://env.example");
         }
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("private/config.json");
-        let store = CredentialStore::new(&path);
+        let store = CredentialStore::new(temp.path().join("private/config.json"));
         store
-            .save_login(
-                "https://saved.example",
-                &SavedAuth {
-                    auth_type: "publisher_token".into(),
-                    token: SecretString::new(SAVED_TOKEN),
-                    token_id: None,
-                    expires_at: None,
-                    cached_identity: None,
-                },
-            )
+            .save_login("https://saved.example", &saved_auth())
             .unwrap();
         assert!(
             resolve_active_credential(&store)
@@ -375,31 +499,8 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("ARTIFACTS_PUBLISH_TOKEN");
-            std::env::remove_var("ARTIFACT_SYNC_SERVER_URL");
-        }
-    }
-
-    #[test]
-    fn environment_selected_destination_cannot_reuse_a_saved_credential() {
-        let _guard = lock().lock().unwrap();
-        unsafe {
-            std::env::remove_var("ARTIFACTS_PUBLISH_TOKEN");
             std::env::set_var("ARTIFACT_SYNC_SERVER_URL", "https://different.example");
         }
-        let temp = tempfile::tempdir().unwrap();
-        let store = CredentialStore::new(temp.path().join("private/config.json"));
-        store
-            .save_login(
-                "https://saved.example",
-                &SavedAuth {
-                    auth_type: "publisher_token".into(),
-                    token: SecretString::new(SAVED_TOKEN),
-                    token_id: None,
-                    expires_at: None,
-                    cached_identity: None,
-                },
-            )
-            .unwrap();
         assert!(
             resolve_active_credential(&store)
                 .unwrap_err()

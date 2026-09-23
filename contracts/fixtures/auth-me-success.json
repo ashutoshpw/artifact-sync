@@ -1,7 +1,10 @@
 {
-  "publisherId": "publisher-device-01",
+  "userId": "user_01HZX8M7Q1",
+  "email": "publisher@example.test",
+  "name": "Artifact Publisher",
+  "teamId": "team_01HZX8M7Q2",
   "team": "w3dev",
-  "permissions": ["artifacts:publish"],
+  "permissions": ["artifacts:publish", "artifacts:read"],
   "expiresAt": "2030-01-01T00:00:00Z",
-  "tokenId": "pub_fixture_01"
+  "tokenId": "api_12345678-1234-4234-9234-123456789abc"
 }

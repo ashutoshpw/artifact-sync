@@ -1,14 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Artifact Sync publisher identity response",
+  "title": "Artifact Sync authenticated user and team identity response",
   "type": "object",
-  "required": ["publisherId", "team", "permissions", "expiresAt", "tokenId"],
+  "required": ["userId", "email", "name", "teamId", "team", "permissions", "expiresAt", "tokenId"],
   "properties": {
-    "publisherId": { "type": "string", "minLength": 1 },
-    "team": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
-    "permissions": { "type": "array", "items": { "enum": ["artifacts:publish"] }, "uniqueItems": true },
+    "userId": { "type": "string", "minLength": 1 },
+    "email": { "type": "string", "format": "email" },
+    "name": { "type": "string", "minLength": 1 },
+    "teamId": { "type": "string", "minLength": 1 },
+    "team": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "permissions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "enum": ["artifacts:publish", "artifacts:read"] },
+      "uniqueItems": true
+    },
     "expiresAt": { "type": "string", "format": "date-time" },
-    "tokenId": { "type": "string" }
+    "tokenId": { "type": "string", "pattern": "^api_[0-9a-f-]{36}$" }
   },
   "additionalProperties": false
 }

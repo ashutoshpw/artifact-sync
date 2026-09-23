@@ -1,16 +1,53 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub fn is_publisher_token(value: &str) -> bool {
-    let Some(secret) = value.strip_prefix("as_pub_") else {
+pub fn is_refresh_credential(value: &str) -> bool {
+    ["as_api_", "as_dev_", "as_rf_"].iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|secret| {
+            secret.len() == 43
+                && secret
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        })
+    })
+}
+
+pub fn is_access_token(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(header) = parts.next() else {
         return false;
     };
-    secret.len() == 43
-        && secret
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    let Some(payload) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || value.len() > 8192 {
+        return false;
+    }
+    let Ok(header) = URL_SAFE_NO_PAD.decode(header) else {
+        return false;
+    };
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
+        return false;
+    };
+    let Ok(header): Result<serde_json::Value, _> = serde_json::from_slice(&header) else {
+        return false;
+    };
+    let Ok(payload): Result<serde_json::Value, _> = serde_json::from_slice(&payload) else {
+        return false;
+    };
+    header.get("alg").and_then(serde_json::Value::as_str) == Some("HS256")
+        && header.get("typ").and_then(serde_json::Value::as_str) == Some("JWT")
+        && payload.is_object()
+        && signature.len() == 32
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -20,6 +57,7 @@ impl SecretString {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -52,7 +90,10 @@ impl<'de> Deserialize<'de> for SecretString {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CachedIdentity {
-    pub publisher_id: String,
+    pub user_id: String,
+    pub email: String,
+    pub name: String,
+    pub team_id: String,
     pub team: String,
     pub permissions: Vec<String>,
 }
@@ -62,20 +103,19 @@ pub struct CachedIdentity {
 pub struct SavedAuth {
     #[serde(rename = "type")]
     pub auth_type: String,
-    pub token: SecretString,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_identity: Option<CachedIdentity>,
+    pub access_token: SecretString,
+    pub refresh_token: SecretString,
+    pub token_id: String,
+    pub expires_at: DateTime<Utc>,
+    pub cached_identity: CachedIdentity,
 }
 
 impl fmt::Debug for SavedAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SavedAuth")
             .field("auth_type", &self.auth_type)
-            .field("token", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
             .field("token_id", &self.token_id)
             .field("expires_at", &self.expires_at)
             .field("cached_identity", &self.cached_identity)
@@ -122,7 +162,10 @@ impl CredentialSource {
 
 #[derive(Clone)]
 pub struct ActiveCredential {
-    pub token: SecretString,
+    /// Environment credentials may be a refresh secret before initial exchange;
+    /// file credentials are the current short-lived access JWT.
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     pub server_origin: String,
     pub source: CredentialSource,
     pub cached_auth: Option<SavedAuth>,
@@ -131,7 +174,11 @@ pub struct ActiveCredential {
 impl fmt::Debug for ActiveCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActiveCredential")
-            .field("token", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("server_origin", &self.server_origin)
             .field("source", &self.source)
             .finish()
@@ -141,7 +188,10 @@ impl fmt::Debug for ActiveCredential {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublisherIdentity {
-    pub publisher_id: String,
+    pub user_id: String,
+    pub email: String,
+    pub name: String,
+    pub team_id: String,
     pub team: String,
     pub permissions: Vec<String>,
     pub expires_at: DateTime<Utc>,
@@ -150,26 +200,30 @@ pub struct PublisherIdentity {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TemporaryUploadCredentials {
-    pub access_key_id: SecretString,
-    pub secret_access_key: SecretString,
-    pub session_token: SecretString,
-    pub endpoint: String,
-    pub bucket: String,
-    pub prefix: String,
+pub struct TokenExchange {
+    pub access_token: SecretString,
+    pub refresh_token: SecretString,
     pub expires_at: DateTime<Utc>,
+    pub identity: PublisherIdentity,
 }
 
-impl fmt::Debug for TemporaryUploadCredentials {
+impl fmt::Debug for TokenExchange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TemporaryUploadCredentials")
-            .field("access_key_id", &"[REDACTED]")
-            .field("secret_access_key", &"[REDACTED]")
-            .field("session_token", &"[REDACTED]")
-            .field("endpoint", &self.endpoint)
-            .field("bucket", &self.bucket)
-            .field("prefix", &self.prefix)
+        f.debug_struct("TokenExchange")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
+            .field("identity", &self.identity)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceAuthorization {
+    pub device_code: SecretString,
+    pub user_code: String,
+    pub verification_url: String,
+    pub interval_seconds: u64,
+    pub expires_at: DateTime<Utc>,
 }

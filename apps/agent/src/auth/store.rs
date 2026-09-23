@@ -1,4 +1,4 @@
-use super::credentials::{AuthFile, SavedAuth, is_publisher_token};
+use super::credentials::{AuthFile, SavedAuth, is_access_token, is_refresh_credential};
 use serde_json::{Map, Value};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -25,6 +25,7 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 
+#[derive(Clone)]
 pub struct CredentialStore {
     path: PathBuf,
 }
@@ -50,26 +51,28 @@ impl CredentialStore {
         if config
             .auth
             .as_ref()
-            .is_some_and(|auth| auth.auth_type != "publisher_token")
+            .is_some_and(|auth| auth.auth_type != "team_token")
         {
             return Err(StoreError::Malformed("unsupported auth type".into()));
         }
-        if config
-            .auth
-            .as_ref()
-            .is_some_and(|auth| !is_publisher_token(auth.token.expose()))
-        {
+        if config.auth.as_ref().is_some_and(|auth| {
+            !is_access_token(auth.access_token.expose())
+                || !is_refresh_credential(auth.refresh_token.expose())
+        }) {
             return Err(StoreError::Malformed(
-                "publisher token has an invalid format".into(),
+                "access or refresh credential has an invalid format".into(),
             ));
         }
         Ok(Some(config))
     }
 
     pub fn save_login(&self, server_origin: &str, auth: &SavedAuth) -> Result<(), StoreError> {
-        if !is_publisher_token(auth.token.expose()) {
+        if auth.auth_type != "team_token"
+            || !is_access_token(auth.access_token.expose())
+            || !is_refresh_credential(auth.refresh_token.expose())
+        {
             return Err(StoreError::Malformed(
-                "publisher token has an invalid format".into(),
+                "access or refresh credential has an invalid format".into(),
             ));
         }
         self.with_lock(|parent| {
@@ -357,19 +360,24 @@ mod tests {
     use chrono::Utc;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    const VALID_TOKEN: &str = "as_pub_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_ACCESS_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcnRpZmFjdC1zeW5jIn0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_REFRESH_TOKEN: &str = "as_rf_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    fn sample_auth(token: &str) -> SavedAuth {
+    fn sample_auth(access_token: &str) -> SavedAuth {
         SavedAuth {
-            auth_type: "publisher_token".into(),
-            token: SecretString::new(token),
-            token_id: Some("pub_test".into()),
-            expires_at: Some(Utc::now()),
-            cached_identity: Some(CachedIdentity {
-                publisher_id: "device".into(),
+            auth_type: "team_token".into(),
+            access_token: SecretString::new(access_token),
+            refresh_token: SecretString::new(VALID_REFRESH_TOKEN),
+            token_id: "api_test".into(),
+            expires_at: Utc::now(),
+            cached_identity: CachedIdentity {
+                user_id: "user_test".into(),
+                email: "user@example.test".into(),
+                name: "Test User".into(),
+                team_id: "team_test".into(),
                 team: "w3dev".into(),
                 permissions: vec!["artifacts:publish".into()],
-            }),
+            },
         }
     }
 
@@ -380,7 +388,10 @@ mod tests {
         let path = directory.join("config.json");
         let store = CredentialStore::new(&path);
         store
-            .save_login("https://artifacts.example.com", &sample_auth(VALID_TOKEN))
+            .save_login(
+                "https://artifacts.example.com",
+                &sample_auth(VALID_ACCESS_TOKEN),
+            )
             .unwrap();
         assert_eq!(
             fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
@@ -430,8 +441,10 @@ mod tests {
         let replacement = directory.join("replacement.json");
         symlink(&target, &replacement).unwrap();
         assert!(matches!(
-            CredentialStore::new(replacement)
-                .save_login("https://artifacts.example.com", &sample_auth(VALID_TOKEN)),
+            CredentialStore::new(replacement).save_login(
+                "https://artifacts.example.com",
+                &sample_auth(VALID_ACCESS_TOKEN)
+            ),
             Err(StoreError::Unsafe(_))
         ));
     }
@@ -463,7 +476,7 @@ mod tests {
 
         assert!(matches!(
             CredentialStore::new(private.join("new.json"))
-                .save_login("https://a.example", &sample_auth("as_pub_short")),
+                .save_login("https://a.example", &sample_auth("invalid.access.token")),
             Err(StoreError::Malformed(_))
         ));
 
@@ -486,7 +499,10 @@ mod tests {
                     let store = CredentialStore::new(path);
                     if index % 2 == 0 {
                         store
-                            .save_login("https://artifacts.example.com", &sample_auth(VALID_TOKEN))
+                            .save_login(
+                                "https://artifacts.example.com",
+                                &sample_auth(VALID_ACCESS_TOKEN),
+                            )
                             .unwrap();
                     } else {
                         let _ = store.logout().unwrap();

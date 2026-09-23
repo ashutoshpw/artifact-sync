@@ -5,13 +5,21 @@
   "scripts": {
     "dev": "bunx wrangler dev",
     "deploy": "bunx wrangler deploy",
+    "db:generate": "bunx drizzle-kit generate",
+    "db:migrate:local": "bunx wrangler d1 migrations apply artifact-sync-auth --local",
+    "db:migrate:remote": "bunx wrangler d1 migrations apply artifact-sync-auth --remote",
     "test": "bun test",
     "check": "bunx tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
     "@types/node": "^24.5.2",
+    "drizzle-kit": "^0.31.11",
     "typescript": "^5.9.3",
     "wrangler": "^4.137.0"
+  },
+  "dependencies": {
+    "better-auth": "^1.7.5",
+    "drizzle-orm": "^0.45.3"
   }
 }
