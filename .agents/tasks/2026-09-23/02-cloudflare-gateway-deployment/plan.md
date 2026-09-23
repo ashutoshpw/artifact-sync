@@ -19,7 +19,7 @@ The deployment workflow and application are implemented locally. Finish Cloudfla
 - [x] Run gateway tests, typecheck, Wrangler dry-run, and workflow validation.
 - [x] Confirm publisher-token ID/expiry choice: `w3dev-workstation`, 90 days.
 - [x] Issue the publisher token and save only hash/metadata to the ignored local registry.
-- [ ] Configure all three runtime secrets on Worker `artifact-sync-gateway` (R2 parent keys and token registry); do not add R2 credentials to GitHub Actions.
+- [x] Configure all three runtime secrets on Worker `artifact-sync-gateway` (user-confirmed; deployment must still validate them); do not add R2 credentials to GitHub Actions.
 - [ ] Push the verified main commit and confirm the GitHub deployment workflow succeeds.
 - [ ] Verify `/__api/v1/auth/me` returns `401` with `Cache-Control: no-store` without credentials.
 - [ ] Use the raw token over stdin for `artifact-sync login`; verify `whoami` reports the authorized identity/team and test a safe sample upload.
