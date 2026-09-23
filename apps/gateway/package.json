@@ -1,0 +1,17 @@
+{
+  "name": "@artifact-sync/gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bunx wrangler dev",
+    "deploy": "bunx wrangler deploy",
+    "test": "bun test",
+    "check": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.137.0"
+  }
+}

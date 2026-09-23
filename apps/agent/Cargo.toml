@@ -1,0 +1,37 @@
+[package]
+name = "artifact-sync"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "artifact-sync"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+hex.workspace = true
+hmac.workspace = true
+libc.workspace = true
+notify.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,7 @@
+{
+  "publisherId": "publisher-device-01",
+  "team": "w3dev",
+  "permissions": ["artifacts:publish"],
+  "expiresAt": "2030-01-01T00:00:00Z",
+  "tokenId": "pub_fixture_01"
+}

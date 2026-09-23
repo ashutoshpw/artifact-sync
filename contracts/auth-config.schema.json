@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Artifact Sync authentication configuration",
+  "type": "object",
+  "required": ["version", "serverUrl"],
+  "properties": {
+    "version": { "const": 1 },
+    "serverUrl": { "type": "string", "format": "uri", "pattern": "^https?://" },
+    "auth": {
+      "type": "object",
+      "required": ["type", "token"],
+      "properties": {
+        "type": { "const": "publisher_token" },
+        "token": { "type": "string", "pattern": "^as_pub_[A-Za-z0-9_-]{43}$" },
+        "tokenId": { "type": "string" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "cachedIdentity": {
+          "type": "object",
+          "required": ["publisherId", "team", "permissions"],
+          "properties": {
+            "publisherId": { "type": "string" },
+            "team": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
+            "permissions": { "type": "array", "items": { "enum": ["artifacts:publish"] }, "uniqueItems": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

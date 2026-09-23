@@ -1,0 +1,10 @@
+{
+  "name": "artifact-sync",
+  "private": true,
+  "packageManager": "bun@1.4.2",
+  "workspaces": ["apps/gateway"],
+  "scripts": {
+    "test:gateway": "bun test apps/gateway/test",
+    "check:gateway": "bunx tsc --noEmit -p apps/gateway/tsconfig.json"
+  }
+}
