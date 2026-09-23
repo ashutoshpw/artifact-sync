@@ -26,7 +26,7 @@ cargo build --release -p artifact-sync
 Authenticate and inspect the active server-side identity:
 
 ```sh
-artifact-sync login --server https://artifacts.example.com
+artifact-sync login --server https://artifact.w3dev.app
 artifact-sync whoami
 artifact-sync daemon
 ```

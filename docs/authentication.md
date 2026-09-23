@@ -24,7 +24,7 @@ Saved authentication is stored at `~/.config/artifact-sync/config.json` on macOS
 ```json
 {
   "version": 1,
-  "serverUrl": "https://artifacts.example.com",
+  "serverUrl": "https://artifact.w3dev.app",
   "auth": {
     "type": "publisher_token",
     "token": "<publisher token, shown only as a schema example>",
@@ -44,14 +44,14 @@ When running a daemon with a custom auth path, pass the same `--auth-config PATH
 Interactive login resolves and displays the destination, then prompts with terminal echo disabled:
 
 ```sh
-artifact-sync login --server https://artifacts.example.com
+artifact-sync login --server https://artifact.w3dev.app
 ```
 
 For non-interactive login, provide the token on standard input from an approved secret manager or another protected source:
 
 ```sh
 secret-manager read artifact-sync/publisher-token | artifact-sync login \
-  --server https://artifacts.example.com --token-stdin
+  --server https://artifact.w3dev.app --token-stdin
 ```
 
 There is intentionally no `--token` option. Login validates `GET /__api/v1/auth/me`, checks the configured publishing team when that file exists, and only then atomically saves the credential. It does not start the daemon, upload artifacts, change the team, or modify sync state. The token is never printed.
@@ -160,4 +160,27 @@ bun run check:gateway
 bunx wrangler types
 ```
 
-Configure `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and an artifact-serving route/domain in `apps/gateway/wrangler.jsonc`. Set `ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY`, `R2_PARENT_ACCESS_KEY_ID`, and `R2_PARENT_SECRET_ACCESS_KEY` as Worker secrets; never add parent R2 credentials to client configuration.
+## Cloudflare deployment
+
+The production gateway origin is `https://artifact.w3dev.app`. Its Wrangler custom domain sends all paths on that hostname to this Worker, so keep the hostname dedicated to artifact-sync. Production deploys run from pushes to `main` or a manual workflow dispatch on `main`; pull requests run verification only.
+
+In the GitHub repository settings, configure:
+
+- Secret `CLOUDFLARE_API_TOKEN`: a narrowly scoped API token for this Cloudflare account, with Worker deployment and the zone permissions required to provision the custom domain.
+- Variable `CLOUDFLARE_ACCOUNT_ID`: the account ID that owns the active `w3dev.app` zone and the `artifact-sync` R2 bucket.
+
+Before the first deployment, confirm the zone is active in that account, `artifact.w3dev.app` is available, the `artifact-sync` bucket exists, and the Worker secrets `ARTIFACT_SYNC_PUBLISHER_TOKEN_REGISTRY`, `R2_PARENT_ACCESS_KEY_ID`, and `R2_PARENT_SECRET_ACCESS_KEY` are configured in Cloudflare. Use `wrangler secret put` with `--config apps/gateway/wrangler.jsonc` to configure them; enter secret values through Wrangler's prompt or the existing protected registry-file input. The workflow supplies the account ID as `R2_ACCOUNT_ID`; it does not upload or replace Worker secrets. Never put parent R2 credentials in GitHub Actions or client configuration.
+
+After deployment, verify the public route without sending a publisher token:
+
+```sh
+curl -sS -D - -o /dev/null https://artifact.w3dev.app/__api/v1/auth/me
+```
+
+The expected response is `401` with `Cache-Control: no-store`. To roll back a bad Worker version, set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in a protected operator environment, then run from the repository root:
+
+```sh
+bunx wrangler rollback --config apps/gateway/wrangler.jsonc
+```
+
+The GitHub deploy workflow uses Bun `1.4.2` and the Wrangler `4.137.0` version in `bun.lock`. The gateway remains a Cloudflare Worker; the Rust CLI and daemon run on publisher machines.
