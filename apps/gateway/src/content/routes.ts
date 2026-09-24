@@ -7,6 +7,18 @@ import { getWebIdentity } from "../auth/web-session.ts";
 import { createDatabase } from "../db/client.ts";
 import { teamMemberships, teamSlugs, teams } from "../db/schema.ts";
 const MAX_PATH_LENGTH = 1024;
+const ARTIFACT_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "sandbox allow-scripts",
+].join("; ");
 
 export async function uploadArtifact(request: Request, env: GatewayEnv): Promise<Response> {
   const context = await authenticate(request, env);
@@ -95,7 +107,7 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
     headers.set("ETag", object.httpEtag);
     headers.set("Cache-Control", "private, no-store");
     headers.set("X-Content-Type-Options", "nosniff");
-    headers.set("Content-Security-Policy", "default-src 'none'; sandbox; base-uri 'none'; form-action 'none'");
+    headers.set("Content-Security-Policy", ARTIFACT_CONTENT_SECURITY_POLICY);
     headers.set("Referrer-Policy", "no-referrer");
     return new Response(object.body, { headers });
   } catch {

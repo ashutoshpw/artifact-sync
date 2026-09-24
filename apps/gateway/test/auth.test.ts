@@ -165,7 +165,18 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(await response.text()).toBe("private artifact");
     expect(lookups).toEqual(["uploads/team-abc123/artifacts/reports/today.json"]);
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
-    expect(response.headers.get("Content-Security-Policy")).toContain("sandbox");
+    const contentSecurityPolicy = response.headers.get("Content-Security-Policy") ?? "";
+    expect(contentSecurityPolicy).toContain("default-src 'none'");
+    expect(contentSecurityPolicy).toContain("script-src 'self' 'unsafe-inline'");
+    expect(contentSecurityPolicy).toContain("style-src 'self' 'unsafe-inline'");
+    expect(contentSecurityPolicy).toContain("img-src 'self' data: blob:");
+    expect(contentSecurityPolicy).toContain("font-src 'self' data:");
+    expect(contentSecurityPolicy).toContain("object-src 'none'");
+    expect(contentSecurityPolicy).toContain("base-uri 'none'");
+    expect(contentSecurityPolicy).toContain("form-action 'none'");
+    expect(contentSecurityPolicy).toContain("frame-ancestors 'none'");
+    expect(contentSecurityPolicy).toContain("sandbox allow-scripts");
+    expect(contentSecurityPolicy).not.toContain("allow-same-origin");
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
