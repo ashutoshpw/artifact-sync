@@ -93,6 +93,12 @@ fn summarize_request(request: &str) -> String {
     format!("{first}\n{authorization}")
 }
 
+async fn write_mock_bytes(stream: &mut TcpStream, bytes: &[u8]) {
+    if let Err(error) = stream.write_all(bytes).await {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+}
+
 async fn write_response(stream: &mut TcpStream, response: MockResponse) {
     let reason = match response.status {
         200 => "OK",
@@ -114,8 +120,8 @@ async fn write_response(stream: &mut TcpStream, response: MockResponse) {
         headers.push_str(&format!("Location: {location}\r\n"));
     }
     headers.push_str("\r\n");
-    stream.write_all(headers.as_bytes()).await.unwrap();
-    stream.write_all(response.body.as_bytes()).await.unwrap();
+    write_mock_bytes(stream, headers.as_bytes()).await;
+    write_mock_bytes(stream, response.body.as_bytes()).await;
 }
 
 fn origin(listener: &TcpListener) -> String {

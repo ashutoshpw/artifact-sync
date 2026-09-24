@@ -91,10 +91,26 @@ impl AuthClient {
             .map_err(|_| AuthClientError::MalformedResponse)
     }
 
-    pub async fn start_device(&self) -> Result<DeviceAuthorization, AuthClientError> {
+    pub async fn start_device(
+        &self,
+        device_name: &str,
+    ) -> Result<DeviceAuthorization, AuthClientError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct DeviceStartRequest<'a> {
+            device_name: &'a str,
+            platform: &'static str,
+            client_version: &'static str,
+        }
+
         let response = self
             .http
             .post(format!("{}/__api/v1/device/start", self.origin))
+            .json(&DeviceStartRequest {
+                device_name,
+                platform: std::env::consts::OS,
+                client_version: env!("CARGO_PKG_VERSION"),
+            })
             .send()
             .await
             .map_err(|_| AuthClientError::Unavailable)?;
@@ -181,7 +197,7 @@ pub fn validate_device_verification_url(origin: &str, value: &str) -> Result<(),
     let normalized_origin =
         normalize_server_origin(origin).map_err(|_| AuthClientError::UnsafeDeviceUrl)?;
     let result_origin = parsed.origin().ascii_serialization();
-    if parsed.username().len() > 0
+    if !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.fragment().is_some()
         || parsed.path() != "/auth/device"

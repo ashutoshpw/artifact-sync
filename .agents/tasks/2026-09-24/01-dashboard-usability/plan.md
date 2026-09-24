@@ -31,11 +31,11 @@ Make browser sessions reliable, replace the fragmented authentication/settings p
 - Ground empty/loading/error states in real data and never present nonexistent deployment activity.
 
 ## Steps
-- [ ] Add Hono JSX/SSR routing and shared response/security middleware without changing Worker bindings.
+- [x] Add Hono JSX/SSR routing and shared response/security middleware without changing Worker bindings.
 - [ ] Preserve Better Auth responses and cookies, add web sign-out, define GitHub email-verification behavior, and test session persistence.
-- [ ] Redesign login as GitHub/email choice first, with email/password revealed only after selection.
-- [ ] Add explicit roles, team-wide credential authorization, slug aliases, and the 30-day per-team cooldown.
-- [ ] Capture device name/platform/client version during CLI authorization and expose authorized device metadata.
+- [x] Redesign login as GitHub/email choice first, with email/password revealed only after selection.
+- [x] Add explicit roles, team-wide credential authorization, slug aliases, and the 30-day per-team cooldown.
+- [x] Capture device name/platform/client version during CLI authorization and expose authorized device metadata.
 - [ ] Build shared shell, design tokens, team switcher, account menu, and reusable states.
 - [ ] Implement validated sidebar and horizontal top-nav variants, responsive mobile navigation, and the environment-to-user-preference precedence contract.
 - [ ] Add overview, artifact browser, team settings, API-token, device, account, and focused device-approval surfaces.

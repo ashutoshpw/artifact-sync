@@ -1,12 +1,11 @@
 import { and, eq } from "drizzle-orm";
 import { authenticate, authError, noStoreHeaders } from "../auth/middleware.ts";
+import { isValidTeamSlug } from "../auth/team-slug.ts";
 import { PUBLISH_PERMISSION, READ_PERMISSION } from "../auth/types.ts";
 import type { GatewayEnv, PublisherIdentity } from "../auth/types.ts";
 import { getWebIdentity } from "../auth/web-session.ts";
 import { createDatabase } from "../db/client.ts";
-import { teamMemberships, teams } from "../db/schema.ts";
-
-const TEAM_SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
+import { teamMemberships, teamSlugs, teams } from "../db/schema.ts";
 const MAX_PATH_LENGTH = 1024;
 
 export async function uploadArtifact(request: Request, env: GatewayEnv): Promise<Response> {
@@ -60,14 +59,34 @@ export async function listArtifacts(request: Request, env: GatewayEnv): Promise<
 }
 
 export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug: string): Promise<Response> {
-  if (!TEAM_SLUG.test(teamSlug)) return new Response("Not found", { status: 404 });
-  const pathname = new URL(request.url).pathname;
-  const rawRelative = pathname.slice(teamSlug.length + 2);
+  if (!isValidTeamSlug(teamSlug)) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+  const requestUrl = new URL(request.url);
+  const rawRelative = requestUrl.pathname.slice(teamSlug.length + 2);
   const relativePath = safeRelativePath(rawRelative.split("/").map(decodePathPart).join("/"));
-  if (!relativePath) return new Response("Not found", { status: 404 });
+  if (!relativePath) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
 
-  const access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION);
-  if (access instanceof Response) return access;
+  let access: { teamId: string; team: string } | Response;
+  if (request.headers.has("Authorization")) {
+    access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION);
+    if (access instanceof Response) {
+      const scope = await lookupTeamSlugScope(env, teamSlug);
+      if (scope instanceof Response) return access.status === 401 || access.status === 403 ? access : scope;
+      if (!scope) return access;
+      access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION, scope.teamId);
+      if (access instanceof Response) return access;
+    }
+  } else {
+    const scope = await lookupTeamSlugScope(env, teamSlug);
+    if (scope instanceof Response) return scope;
+    if (!scope) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+    if (!scope.isCurrent) {
+      requestUrl.pathname = `/${scope.currentSlug}${rawRelative ? `/${rawRelative}` : ""}`;
+      return Response.redirect(requestUrl, 308);
+    }
+    access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION, scope.teamId);
+    if (access instanceof Response) return access;
+  }
+
   try {
     const object = await env.ARTIFACTS_BUCKET.get(`uploads/${access.teamId}/artifacts/${relativePath}`);
     if (!object) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
@@ -84,17 +103,36 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   }
 }
 
+async function lookupTeamSlugScope(
+  env: GatewayEnv,
+  teamSlug: string,
+): Promise<{ teamId: string; currentSlug: string; isCurrent: boolean } | Response | undefined> {
+  try {
+    const db = createDatabase(env.DB);
+    const [scope] = await db.select({ teamId: teamSlugs.teamId, currentSlug: teams.slug, isCurrent: teamSlugs.isCurrent })
+      .from(teamSlugs)
+      .innerJoin(teams, eq(teamSlugs.teamId, teams.id))
+      .where(eq(teamSlugs.slug, teamSlug))
+      .limit(1);
+    return scope;
+  } catch {
+    return authError(503, "identity_service_unavailable");
+  }
+}
+
 async function resolveTeamAccess(
   request: Request,
   env: GatewayEnv,
   requestedTeam: string | null,
   permission: string,
+  expectedTeamId?: string,
 ): Promise<{ teamId: string; team: string } | Response> {
   if (request.headers.has("Authorization")) {
     const context = await authenticate(request, env);
     if (context instanceof Response) return context;
     if (!context.identity.permissions.includes(permission)) return authError(403, "artifact_permission_required");
-    if (requestedTeam && requestedTeam !== context.identity.team) return authError(403, "team_access_required");
+    if (expectedTeamId && expectedTeamId !== context.identity.teamId) return authError(403, "team_access_required");
+    if (!expectedTeamId && requestedTeam && requestedTeam !== context.identity.team) return authError(403, "team_access_required");
     return { teamId: context.identity.teamId, team: context.identity.team };
   }
 
@@ -106,10 +144,12 @@ async function resolveTeamAccess(
     .innerJoin(teams, eq(teamMemberships.teamId, teams.id))
     .where(eq(teamMemberships.userId, identity.id));
   const memberships = await query;
-  const selected = requestedTeam
-    ? memberships.find((membership) => membership.team === requestedTeam)
-    : memberships.length === 1 ? memberships[0] : undefined;
-  if (!selected) return authError(requestedTeam ? 403 : 400, requestedTeam ? "team_access_required" : "team_selection_required");
+  const selected = expectedTeamId
+    ? memberships.find((membership) => membership.teamId === expectedTeamId)
+    : requestedTeam
+      ? memberships.find((membership) => membership.team === requestedTeam)
+      : memberships.length === 1 ? memberships[0] : undefined;
+  if (!selected) return authError(requestedTeam || expectedTeamId ? 403 : 400, requestedTeam || expectedTeamId ? "team_access_required" : "team_selection_required");
   return selected;
 }
 

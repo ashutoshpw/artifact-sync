@@ -10,7 +10,8 @@ import {
   handleRevokeApiToken,
   handleTeams,
 } from "./auth/routes.ts";
-import { noStoreHeaders, withNoStore } from "./auth/middleware.ts";
+import { authError, noStoreHeaders, withNoStore } from "./auth/middleware.ts";
+import { handleTeam, handleTeamApiTokens, handleTeamDevices } from "./auth/team-routes.ts";
 import type { GatewayEnv } from "./auth/types.ts";
 import { getWebIdentity } from "./auth/web-session.ts";
 import { listArtifacts, serveArtifact, uploadArtifact } from "./content/routes.ts";
@@ -53,6 +54,10 @@ app.get("/auth/device", async (c) => {
 app.get("/__api/v1/auth/me", (c) => handleAuthMe(c.req.raw, c.env));
 app.post("/__api/v1/auth/refresh", (c) => handleRefresh(c.req.raw, c.env));
 app.get("/__api/v1/teams", (c) => handleTeams(c.req.raw, c.env));
+app.get("/__api/v1/teams/:teamId", (c) => handleTeam(c.req.raw, c.env, c.req.param("teamId")));
+app.patch("/__api/v1/teams/:teamId", (c) => handleTeam(c.req.raw, c.env, c.req.param("teamId")));
+app.get("/__api/v1/teams/:teamId/api-tokens", (c) => handleTeamApiTokens(c.req.raw, c.env, c.req.param("teamId")));
+app.get("/__api/v1/teams/:teamId/devices", (c) => handleTeamDevices(c.req.raw, c.env, c.req.param("teamId")));
 app.get("/__api/v1/api-tokens", (c) => handleApiTokens(c.req.raw, c.env));
 app.post("/__api/v1/api-tokens", (c) => handleApiTokens(c.req.raw, c.env));
 app.delete("/__api/v1/api-tokens/:tokenId", (c) => handleRevokeApiToken(c.req.raw, c.env, c.req.param("tokenId")));
@@ -76,6 +81,11 @@ app.get("*", async (c) => {
 });
 
 app.notFound((c) => c.text("Not found", 404, Object.fromEntries(noStoreHeaders())));
+
+app.onError((error) => {
+  console.error("gateway request failed", error);
+  return authError(503, "gateway_service_unavailable");
+});
 
 function loginRedirect(path: string, requestUrl: string): Response {
   const returnTo = `${path}${new URL(requestUrl).search}`;

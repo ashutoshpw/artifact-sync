@@ -1,7 +1,7 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { createDatabase } from "../db/client.ts";
-import { account, session, teamMemberships, teams, user, verification } from "../db/schema.ts";
+import { account, session, teamMemberships, teamSlugs, teams, user, verification } from "../db/schema.ts";
 import type { GatewayEnv } from "./types.ts";
 
 type BetterAuthUser = Pick<typeof user.$inferSelect, "id" | "name" | "emailVerified">;
@@ -91,8 +91,16 @@ async function ensurePersonalTeam(
     db.insert(teamMemberships).values({
       teamId,
       userId: accountUser.id,
-      role: "admin",
+      role: "owner",
       createdAt: now,
+    }).onConflictDoNothing(),
+    db.insert(teamSlugs).values({
+      slug: teamSlug,
+      teamId,
+      isCurrent: true,
+      createdAt: now,
+      changedAt: null,
+      changedByUserId: null,
     }).onConflictDoNothing(),
   ]);
 }

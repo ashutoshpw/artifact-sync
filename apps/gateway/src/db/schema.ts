@@ -84,12 +84,30 @@ export const teams = sqliteTable("teams", {
 export const teamMemberships = sqliteTable("team_memberships", {
   teamId: text("team_id").notNull().references(() => teams.id, { onDelete: "cascade" }),
   userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
-  role: text("role", { enum: ["admin", "member"] }).notNull(),
+  role: text("role", { enum: ["owner", "admin", "member"] }).notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   primaryKey({ columns: [table.teamId, table.userId] }),
   index("team_memberships_user_idx").on(table.userId),
 ]);
+
+export const teamSlugs = sqliteTable("team_slugs", {
+  slug: text("slug").primaryKey(),
+  teamId: text("team_id").notNull().references(() => teams.id, { onDelete: "cascade" }),
+  isCurrent: integer("is_current", { mode: "boolean" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  changedAt: integer("changed_at", { mode: "timestamp_ms" }),
+  changedByUserId: text("changed_by_user_id").references(() => user.id, { onDelete: "set null" }),
+}, (table) => [
+  index("team_slugs_team_idx").on(table.teamId),
+  uniqueIndex("team_slugs_current_unique").on(table.teamId).where(sql`${table.isCurrent} = 1`),
+]);
+
+export const teamSlugChangeLocks = sqliteTable("team_slug_change_locks", {
+  teamId: text("team_id").primaryKey().references(() => teams.id, { onDelete: "cascade" }),
+  lastChangedAt: integer("last_changed_at", { mode: "timestamp_ms" }).notNull(),
+  claimId: text("claim_id"),
+});
 
 export const apiTokens = sqliteTable("api_tokens", {
   id: text("id").primaryKey(),
@@ -118,6 +136,12 @@ export const deviceAuthorizations = sqliteTable("device_authorizations", {
   userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
   teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
   apiTokenId: text("api_token_id").references(() => apiTokens.id, { onDelete: "cascade" }),
+  deviceName: text("device_name"),
+  platform: text("platform"),
+  clientVersion: text("client_version"),
+  claimId: text("claim_id"),
+  claimedAt: integer("claimed_at", { mode: "timestamp_ms" }),
+  deliveredAt: integer("delivered_at", { mode: "timestamp_ms" }),
 }, (table) => [
   uniqueIndex("device_authorizations_api_token_idx").on(table.apiTokenId),
   index("device_authorizations_expiry_idx").on(table.expiresAt),
@@ -125,6 +149,7 @@ export const deviceAuthorizations = sqliteTable("device_authorizations", {
 
 export const teamRelations = relations(teams, ({ many }) => ({
   memberships: many(teamMemberships),
+  slugs: many(teamSlugs),
   apiTokens: many(apiTokens),
 }));
 

@@ -105,7 +105,10 @@ async fn complete_device_login(client: &AuthClient) -> Result<TokenExchange, Com
             "login requires a terminal for browser device approval; use `--token-stdin` to read a team API token from standard input".into(),
         ));
     }
-    let authorization = client.start_device().await.map_err(auth_command_error)?;
+    let authorization = client
+        .start_device(&device_name())
+        .await
+        .map_err(auth_command_error)?;
     let grouped_code = format!(
         "{}-{}",
         &authorization.user_code[..4],
@@ -136,6 +139,23 @@ async fn complete_device_login(client: &AuthClient) -> Result<TokenExchange, Com
                 .await
             }
         }
+    }
+}
+
+fn device_name() -> String {
+    let candidate = std::env::var("ARTIFACT_SYNC_DEVICE_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "Artifact Sync CLI".into());
+    let normalized: String = candidate
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect();
+    if normalized.trim().is_empty() {
+        "Artifact Sync CLI".into()
+    } else {
+        normalized.trim().into()
     }
 }
 
@@ -434,6 +454,26 @@ mod tests {
                 team: "w3dev".into(),
                 permissions: vec!["artifacts:publish".into(), "artifacts:read".into()],
             },
+        }
+    }
+
+    #[test]
+    fn device_name_uses_safe_explicit_metadata_with_a_fallback() {
+        let _guard = lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("ARTIFACT_SYNC_DEVICE_NAME", "Studio\n Workstation");
+            std::env::set_var("HOSTNAME", "ignored-host");
+        }
+        assert_eq!(device_name(), "Studio Workstation");
+
+        unsafe {
+            std::env::set_var("ARTIFACT_SYNC_DEVICE_NAME", "   ");
+            std::env::remove_var("HOSTNAME");
+            std::env::remove_var("COMPUTERNAME");
+        }
+        assert_eq!(device_name(), "Artifact Sync CLI");
+        unsafe {
+            std::env::remove_var("ARTIFACT_SYNC_DEVICE_NAME");
         }
     }
 

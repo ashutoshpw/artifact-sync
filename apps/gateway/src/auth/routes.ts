@@ -1,15 +1,18 @@
-import { and, desc, eq, gt } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lte, or } from "drizzle-orm";
 import { createDatabase } from "../db/client.ts";
 import { apiTokens, deviceAuthorizations, teamMemberships, teams, user } from "../db/schema.ts";
 import { authenticate, authError, noStoreHeaders } from "./middleware.ts";
 import { issueTokenResponse, createRefreshCredential, deviceCredentialPrefix, hashCredential, insertApiToken, newApiTokenId, refreshCredential } from "./token-service.ts";
+import { requireBrowserIdentity } from "./identity.ts";
+import { safePermissions } from "./permissions.ts";
+import { canManageApiToken } from "./team-routes.ts";
 import { PUBLISH_PERMISSION, READ_PERMISSION, REFRESH_MAX_SECONDS } from "./types.ts";
 import type { GatewayEnv } from "./types.ts";
-import { getWebIdentity } from "./web-session.ts";
 
 const DEVICE_CODE_PATTERN = /^as_dev_[A-Za-z0-9_-]{43}$/;
 const USER_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{8}$/;
 const HUMAN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const DEVICE_CLAIM_TIMEOUT_MS = 2 * 60 * 1000;
 
 export async function handleAuthMe(request: Request, env: GatewayEnv): Promise<Response> {
   const context = await authenticate(request, env);
@@ -31,7 +34,7 @@ export async function handleRefresh(request: Request, env: GatewayEnv): Promise<
 }
 
 export async function handleTeams(request: Request, env: GatewayEnv): Promise<Response> {
-  const identity = await browserIdentity(request, env);
+  const identity = await requireBrowserIdentity(request, env);
   if (identity instanceof Response) return identity;
   try {
     const db = createDatabase(env.DB);
@@ -47,7 +50,7 @@ export async function handleTeams(request: Request, env: GatewayEnv): Promise<Re
 }
 
 export async function handleApiTokens(request: Request, env: GatewayEnv): Promise<Response> {
-  const identity = await browserIdentity(request, env);
+  const identity = await requireBrowserIdentity(request, env);
   if (identity instanceof Response) return identity;
   const db = createDatabase(env.DB);
 
@@ -124,14 +127,19 @@ export async function handleApiTokens(request: Request, env: GatewayEnv): Promis
 }
 
 export async function handleRevokeApiToken(request: Request, env: GatewayEnv, tokenId: string): Promise<Response> {
-  const identity = await browserIdentity(request, env);
+  const identity = await requireBrowserIdentity(request, env);
   if (identity instanceof Response) return identity;
   if (!/^api_[0-9a-f-]{36}$/i.test(tokenId)) return authError(404, "token_not_found");
   try {
     const db = createDatabase(env.DB);
+    const [token] = await db.select({ userId: apiTokens.userId, teamId: apiTokens.teamId })
+      .from(apiTokens)
+      .where(eq(apiTokens.id, tokenId))
+      .limit(1);
+    if (!token || !await canManageApiToken(db, identity, token)) return authError(404, "token_not_found");
     const changed = await db.update(apiTokens)
       .set({ revokedAt: new Date() })
-      .where(and(eq(apiTokens.id, tokenId), eq(apiTokens.userId, identity.id)))
+      .where(and(eq(apiTokens.id, tokenId), isNull(apiTokens.revokedAt)))
       .returning({ id: apiTokens.id });
     if (!changed.length) return authError(404, "token_not_found");
     return new Response(null, { status: 204, headers: noStoreHeaders() });
@@ -142,6 +150,14 @@ export async function handleRevokeApiToken(request: Request, env: GatewayEnv, to
 
 export async function handleDeviceStart(request: Request, env: GatewayEnv): Promise<Response> {
   if (request.method !== "POST") return authError(400, "invalid_request");
+  const body = await readJson(request);
+  if (body !== null && !isObject(body)) return authError(400, "invalid_request");
+  const deviceName = optionalMetadataString(body?.deviceName, 80);
+  const platform = optionalMetadataString(body?.platform, 32);
+  const clientVersion = optionalMetadataString(body?.clientVersion, 32);
+  if (deviceName === undefined || platform === undefined || clientVersion === undefined) {
+    return authError(400, "invalid_device_metadata");
+  }
   try {
     const db = createDatabase(env.DB);
     const deviceCode = await createRefreshCredential(deviceCredentialPrefix());
@@ -158,6 +174,9 @@ export async function handleDeviceStart(request: Request, env: GatewayEnv): Prom
       userId: null,
       teamId: null,
       apiTokenId: null,
+      deviceName,
+      platform,
+      clientVersion,
     });
     const verificationUrl = new URL("/auth/device", env.APP_ORIGIN);
     verificationUrl.searchParams.set("code", userCode);
@@ -174,7 +193,7 @@ export async function handleDeviceStart(request: Request, env: GatewayEnv): Prom
 }
 
 export async function handleDeviceApprove(request: Request, env: GatewayEnv): Promise<Response> {
-  const identity = await browserIdentity(request, env);
+  const identity = await requireBrowserIdentity(request, env);
   if (identity instanceof Response) return identity;
   const body = await readJson(request);
   if (!isObject(body) || typeof body.userCode !== "string" || typeof body.teamId !== "string") {
@@ -224,19 +243,37 @@ export async function handleDevicePoll(request: Request, env: GatewayEnv): Promi
     }
     if (device.status === "denied") return authError(403, "device_request_denied");
     if (!device.userId || !device.teamId) return authError(401, "invalid_device_code");
+    if (device.deliveredAt) return authError(401, "device_code_already_used_or_revoked");
+
+    const now = new Date();
+    const claimId = crypto.randomUUID();
+    const claimCutoff = new Date(now.getTime() - DEVICE_CLAIM_TIMEOUT_MS);
+    const [claimed] = await db.update(deviceAuthorizations)
+      .set({ claimId, claimedAt: now })
+      .where(and(
+        eq(deviceAuthorizations.id, device.id),
+        isNull(deviceAuthorizations.deliveredAt),
+        or(
+          isNull(deviceAuthorizations.claimId),
+          isNull(deviceAuthorizations.claimedAt),
+          lte(deviceAuthorizations.claimedAt, claimCutoff),
+        ),
+      ))
+      .returning({ id: deviceAuthorizations.id });
+    if (!claimed) return Response.json({ error: "authorization_pending" }, { status: 202, headers: noStoreHeaders() });
 
     const tokenId = device.apiTokenId ?? `api_${device.id.slice("device_".length)}`;
-    if (device.status === "approved") {
+    if (device.status === "approved" || !device.apiTokenId) {
       await insertApiToken(env, {
         id: tokenId,
         userId: device.userId,
         teamId: device.teamId,
-        name: "artifact-sync device",
+        name: device.deviceName || "artifact-sync device",
         refreshCredential: body.deviceCode,
       });
       await db.update(deviceAuthorizations)
         .set({ status: "completed", apiTokenId: tokenId })
-        .where(and(eq(deviceAuthorizations.id, device.id), eq(deviceAuthorizations.status, "approved")));
+        .where(and(eq(deviceAuthorizations.id, device.id), eq(deviceAuthorizations.claimId, claimId)));
     }
 
     const [active] = await db.select({ token: apiTokens, owner: user, team: teams })
@@ -248,38 +285,38 @@ export async function handleDevicePoll(request: Request, env: GatewayEnv): Promi
         eq(apiTokens.refreshTokenHash, codeHash),
         eq(apiTokens.userId, device.userId),
         eq(apiTokens.teamId, device.teamId),
-        gt(apiTokens.expiresAt, new Date()),
-        gt(apiTokens.idleExpiresAt, new Date()),
+        gt(apiTokens.expiresAt, now),
+        gt(apiTokens.idleExpiresAt, now),
       ))
       .limit(1);
     if (!active || active.token.revokedAt) return authError(401, "device_code_already_used_or_revoked");
+
+    const delivered = await env.DB.prepare(`
+      UPDATE device_authorizations
+      SET delivered_at = ?
+      WHERE id = ? AND claim_id = ? AND delivered_at IS NULL AND status = 'completed'
+        AND EXISTS (
+          SELECT 1 FROM api_tokens
+          WHERE id = ? AND refresh_token_hash = ? AND revoked_at IS NULL
+            AND expires_at > ? AND idle_expires_at > ?
+        )
+      RETURNING id
+    `).bind(
+      now.getTime(),
+      device.id,
+      claimId,
+      tokenId,
+      codeHash,
+      now.getTime(),
+      now.getTime(),
+    ).first<{ id: string }>();
+    if (!delivered) return authError(401, "device_code_already_used_or_revoked");
 
     return Response.json(await issueTokenResponse(env, active.token, active.owner, active.team, body.deviceCode), {
       headers: noStoreHeaders(),
     });
   } catch {
     return authError(503, "device_authorization_unavailable");
-  }
-}
-
-export async function browserIdentity(request: Request, env: GatewayEnv) {
-  try {
-    const identity = await getWebIdentity(request, env);
-    if (!identity) return authError(401, "web_session_required");
-    return identity;
-  } catch {
-    return authError(503, "identity_service_unavailable");
-  }
-}
-
-export function safePermissions(value: string): string[] {
-  try {
-    const permissions: unknown = JSON.parse(value);
-    return Array.isArray(permissions) && permissions.every((permission) => permission === PUBLISH_PERMISSION || permission === READ_PERMISSION)
-      ? permissions
-      : [];
-  } catch {
-    return [];
   }
 }
 
@@ -297,6 +334,14 @@ async function readJson(request: Request): Promise<unknown> {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalMetadataString(value: unknown, maximumLength: number): string | null | undefined {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maximumLength) return undefined;
+  return normalized;
 }
 
 async function createUserCode(): Promise<string> {

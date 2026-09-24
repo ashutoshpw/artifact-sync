@@ -1,7 +1,7 @@
 import { JwtConfigurationError, verifyAccessToken } from "./jwt.ts";
 import type { AuthContext, GatewayEnv } from "./types.ts";
 
-export function authError(status: 400 | 401 | 403 | 404 | 409 | 410 | 503, error: string): Response {
+export function authError(status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503, error: string): Response {
   return Response.json({ error }, {
     status,
     headers: { "Cache-Control": "no-store", Pragma: "no-cache" },
