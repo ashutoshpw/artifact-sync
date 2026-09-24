@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { renderToString } from "hono/jsx/dom/server";
 import { ArtifactsPage, DashboardDocument, DeviceApprovalPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
-import type { DashboardSession } from "../src/web/dashboard-service.ts";
+import { listRecentArtifacts, type DashboardSession } from "../src/web/dashboard-service.ts";
 
 const team = {
   id: "team-1",
@@ -33,6 +33,8 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('action="/auth/logout"');
     expect(html).toContain('href="/dashboard/team-1/artifacts"');
     expect(html).toContain("Workspace content");
+    const footer = html.slice(html.indexOf('class="sidebar-foot"'), html.indexOf("</aside>"));
+    expect(footer).toContain('class="account-menu sidebar-account"');
   });
 
   it("renders the top navigation variant with equivalent resource links", async () => {
@@ -46,6 +48,8 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('class="top-navigation"');
     expect(html).toContain('href="/dashboard/team-1/settings/devices"');
     expect(html).toContain('aria-current="page"');
+    expect(html).toContain('class="account-menu"');
+    expect(html).not.toContain("sidebar-account");
     expect(html).not.toContain('<aside class="sidebar"');
   });
 
@@ -98,18 +102,69 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("No artifacts found");
   });
 
-  it("derives the overview artifact URL from the current request origin", async () => {
+  it("prioritizes recent artifacts and drops the base URL panel on the overview", async () => {
     const html = await renderToString(
       <OverviewPage
         session={session("sidebar")}
-        origin="http://127.0.0.1:8787"
-        artifacts={[]}
+        artifacts={[
+          { path: "reports/today.json", size: 16, uploadedAt: "2026-09-24T12:00:00.000Z" },
+          { path: "notes.md", size: 32, uploadedAt: "2026-09-24T09:00:00.000Z" },
+        ]}
         counts={{ tokens: 2, devices: 1 }}
       />,
     );
 
-    expect(html).toContain("http://127.0.0.1:8787/w3dev/");
-    expect(html).not.toContain("Private artifact base URL</p><code>https://artifact.w3dev.app");
+    expect(html).not.toContain("Private artifact base URL");
+    expect(html).not.toContain("8+");
+    expect(html).toContain("View all artifacts");
+    expect(html.indexOf("Recent artifacts")).toBeGreaterThan(html.indexOf("Team overview"));
+    expect(html.indexOf('aria-label="Workspace summary"')).toBeGreaterThan(html.indexOf("Recent artifacts"));
+  });
+
+  it("sorts recent artifacts by upload time across R2 pages", async () => {
+    const buckets: Record<string, { objects: Array<{ key: string; size: number; uploaded: Date; httpEtag: string }>; truncated: boolean; cursor?: string }> = {
+      start: {
+        objects: [
+          { key: "uploads/team-1/artifacts/zeta.txt", size: 1, uploaded: new Date("2026-09-20T10:00:00.000Z"), httpEtag: '"a"' },
+          { key: "uploads/team-1/artifacts/alpha.txt", size: 1, uploaded: new Date("2026-09-24T10:00:00.000Z"), httpEtag: '"b"' },
+        ],
+        truncated: true,
+        cursor: "page-2",
+      },
+      "page-2": {
+        objects: [
+          { key: "uploads/team-1/artifacts/middle.txt", size: 1, uploaded: new Date("2026-09-22T10:00:00.000Z"), httpEtag: '"c"' },
+        ],
+        truncated: false,
+      },
+    };
+    const env = { ARTIFACTS_BUCKET: { list: async ({ cursor }: { cursor?: string }) => buckets[cursor ?? "start"] } };
+
+    const result = await listRecentArtifacts(env as never, "team-1");
+    if (result instanceof Response) throw new Error("expected recent artifacts");
+    expect(result.objects.map((object) => object.path)).toEqual(["alpha.txt", "middle.txt", "zeta.txt"]);
+    expect(result.scanned).toBe(3);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("caps the recent artifact scan and reports truncation", async () => {
+    const env = {
+      ARTIFACTS_BUCKET: {
+        list: async () => ({
+          objects: [
+            { key: "uploads/team-1/artifacts/a.txt", size: 1, uploaded: new Date("2026-09-24T10:00:00.000Z"), httpEtag: '"a"' },
+            { key: "uploads/team-1/artifacts/b.txt", size: 1, uploaded: new Date("2026-09-24T09:00:00.000Z"), httpEtag: '"b"' },
+          ],
+          truncated: true,
+          cursor: "more",
+        }),
+      },
+    };
+
+    const result = await listRecentArtifacts(env as never, "team-1", 8, 2);
+    if (result instanceof Response) throw new Error("expected recent artifacts");
+    expect(result.scanned).toBe(2);
+    expect(result.truncated).toBe(true);
   });
 
   it("shows one-time token material and team-wide credential scope", async () => {
@@ -143,6 +198,7 @@ describe("dashboard server rendering", () => {
     const settingsHtml = await renderToString(
       <GeneralSettingsPage
         session={session("sidebar")}
+        origin="http://127.0.0.1:8787"
         settings={{
           canChangeSlug: false,
           nextAvailableAt: "2026-10-24T10:00:00.000Z",
@@ -155,6 +211,8 @@ describe("dashboard server rendering", () => {
     );
     expect(settingsHtml).toContain("old-w3dev");
     expect(settingsHtml).toContain("Next change available");
+    expect(settingsHtml).toContain("http://127.0.0.1:8787/w3dev/");
+    expect(settingsHtml).toContain('data-copy-target="artifact-base-url"');
 
     const approvalHtml = await renderToString(<DeviceApprovalPage session={session("sidebar")} code="ABCD2345" />);
     expect(approvalHtml).toContain("ABCD2345");

@@ -14,6 +14,7 @@ import {
   listDashboardArtifacts,
   listDashboardDevices,
   listDashboardTokens,
+  listRecentArtifacts,
   requireDashboardSession,
   type DashboardSession,
 } from "./dashboard-service.ts";
@@ -43,14 +44,14 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   app.get("/dashboard/:teamId", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const [artifacts, counts] = await Promise.all([
-      listDashboardArtifacts(c.env, session.team.id, null, null, 8),
+    const [recent, counts] = await Promise.all([
+      listRecentArtifacts(c.env, session.team.id),
       dashboardCounts(c.env, session.identity, session.team),
     ]);
-    if (artifacts instanceof Response) {
-      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} counts={counts} origin={new URL(c.req.url).origin} storageError={actionMessage("artifact_storage_unavailable")} />);
+    if (recent instanceof Response) {
+      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} counts={counts} storageError={actionMessage("artifact_storage_unavailable")} />);
     }
-    return dashboardHtml(c, <OverviewPage session={session} artifacts={artifacts.objects} counts={counts} origin={new URL(c.req.url).origin} />);
+    return dashboardHtml(c, <OverviewPage session={session} artifacts={recent.objects} counts={counts} />);
   });
 
   app.get("/dashboard/:teamId/artifacts", async (c) => {
@@ -67,7 +68,7 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
     const settings = await dashboardSettings(c.env, session.team);
-    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} feedback={queryFeedback(c)} />);
+    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} origin={new URL(c.req.url).origin} feedback={queryFeedback(c)} />);
   });
 
   app.post("/dashboard/:teamId/settings/general", async (c) => {
@@ -84,11 +85,11 @@ export function registerDashboardRoutes(app: DashboardApp): void {
       if (refreshed instanceof Response) return refreshed;
       if (!refreshed.team) return c.text("Not found", 404);
       const settings = await dashboardSettings(c.env, refreshed.team);
-      return dashboardHtml(c, <GeneralSettingsPage session={refreshed} settings={settings} feedback={{ notice: "Team slug updated. Existing artifact URLs now redirect to the new slug." }} />);
+      return dashboardHtml(c, <GeneralSettingsPage session={refreshed} settings={settings} origin={new URL(c.req.url).origin} feedback={{ notice: "Team slug updated. Existing artifact URLs now redirect to the new slug." }} />);
     }
     const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
     const settings = await dashboardSettings(c.env, session.team);
-    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} feedback={{ error: actionMessage(String(payload.error ?? "invalid_request"), String(payload.nextAvailableAt ?? "")) }} />, response.status as ContentfulStatusCode);
+    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} origin={new URL(c.req.url).origin} feedback={{ error: actionMessage(String(payload.error ?? "invalid_request"), String(payload.nextAvailableAt ?? "")) }} />, response.status as ContentfulStatusCode);
   });
 
   app.get("/dashboard/:teamId/settings/api-tokens", async (c) => {

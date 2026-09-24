@@ -127,7 +127,7 @@ export async function listDashboardArtifacts(
     const result = await env.ARTIFACTS_BUCKET.list({
       prefix: base,
       cursor: cursor ?? undefined,
-      limit: Math.min(Math.max(limit, 1), 100),
+      limit: Math.min(Math.max(limit, 1), 1000),
     });
     return {
       prefix,
@@ -142,6 +142,43 @@ export async function listDashboardArtifacts(
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
+}
+
+const RECENT_ARTIFACT_PAGE_SIZE = 1000;
+const RECENT_ARTIFACT_MAX_PAGES = 5;
+
+export interface RecentArtifacts {
+  objects: DashboardArtifact[];
+  scanned: number;
+  truncated: boolean;
+}
+
+export async function listRecentArtifacts(
+  env: GatewayEnv,
+  teamId: string,
+  limit = 8,
+  maxScan = 1000,
+): Promise<RecentArtifacts | Response> {
+  const scanLimit = Math.max(maxScan, 1);
+  const pageSize = Math.min(RECENT_ARTIFACT_PAGE_SIZE, scanLimit);
+  const scanned: DashboardArtifact[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < RECENT_ARTIFACT_MAX_PAGES && scanned.length < scanLimit; page += 1) {
+    const result = await listDashboardArtifacts(env, teamId, null, cursor, pageSize);
+    if (result instanceof Response) return result;
+    scanned.push(...result.objects);
+    cursor = result.nextCursor;
+    if (!cursor) break;
+  }
+  scanned.sort((left, right) => {
+    const delta = Date.parse(right.uploadedAt) - Date.parse(left.uploadedAt);
+    return Number.isNaN(delta) || delta === 0 ? left.path.localeCompare(right.path) : delta;
+  });
+  return {
+    objects: scanned.slice(0, Math.max(limit, 1)),
+    scanned: scanned.length,
+    truncated: cursor !== null,
+  };
 }
 
 export async function listDashboardTokens(

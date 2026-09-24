@@ -88,7 +88,7 @@ export function DashboardDocument({ session, title, active, children, bodyClass 
 
           {session.layout === "topnav" && team ? <TopNavigation active={active} items={items} /> : null}
           <div class="dashboard-body">
-            {session.layout === "sidebar" && team ? <Sidebar active={active} items={items} /> : null}
+            {session.layout === "sidebar" && team ? <Sidebar session={session} active={active} items={items} /> : null}
             <main class="dashboard-main" id="main-content">{children}</main>
           </div>
 
@@ -126,9 +126,9 @@ function TeamSwitcher({ session }: { session: DashboardSession }) {
   );
 }
 
-function AccountMenu({ session }: { session: DashboardSession }) {
+function AccountMenu({ session, variant = "header" }: { session: DashboardSession; variant?: "header" | "sidebar" }) {
   return (
-    <details class="account-menu">
+    <details class={`account-menu${variant === "sidebar" ? " sidebar-account" : ""}`}>
       <summary aria-label="Account menu">
         <span class="avatar">{initial(session.identity.name)}</span>
         <span class="account-copy"><strong>{session.identity.name}</strong><small>{session.identity.email}</small></span>
@@ -146,7 +146,7 @@ function AccountMenu({ session }: { session: DashboardSession }) {
   );
 }
 
-function Sidebar({ active, items }: { active: DashboardSection; items: ReturnType<typeof navigation> }) {
+function Sidebar({ session, active, items }: { session: DashboardSession; active: DashboardSection; items: ReturnType<typeof navigation> }) {
   return (
     <aside class="sidebar" aria-label="Dashboard navigation">
       <nav>
@@ -158,8 +158,7 @@ function Sidebar({ active, items }: { active: DashboardSection; items: ReturnTyp
         ))}
       </nav>
       <div class="sidebar-foot">
-        <p>Team-scoped publishing</p>
-        <span>Private R2 storage</span>
+        <AccountMenu session={session} variant="sidebar" />
       </div>
     </aside>
   );
@@ -210,17 +209,14 @@ export function OverviewPage({
   session,
   artifacts,
   counts,
-  origin,
   storageError,
 }: {
   session: DashboardSession;
   artifacts: DashboardArtifact[];
   counts: { tokens: number; devices: number };
-  origin: string;
   storageError?: string | null;
 }) {
   const team = session.team!;
-  const baseUrl = `${origin}/${team.slug}`;
   return (
     <DashboardDocument session={session} title={`${team.name} overview`} active="overview">
       <PageHeader
@@ -235,22 +231,6 @@ export function OverviewPage({
         }
       />
 
-      <section class="metric-grid" aria-label="Workspace summary">
-        <Metric label="Published artifacts" value={artifacts.length === 8 ? "8+" : String(artifacts.length)} detail="Latest objects" />
-        <Metric label="Connected devices" value={String(counts.devices)} detail={counts.devices === 1 ? "Active record" : "Active records"} />
-        <Metric label="API credentials" value={String(counts.tokens)} detail="Team-scoped" />
-        <Metric label="Your role" value={team.role} detail="Access level" />
-      </section>
-
-      <section class="endpoint-panel">
-        <div>
-          <p class="section-label">Private artifact base URL</p>
-          <code>{baseUrl}/&lt;path&gt;</code>
-        </div>
-        <button class="button secondary" type="button" data-copy-target="artifact-base-url">Copy base URL</button>
-        <span id="artifact-base-url" hidden>{baseUrl}/</span>
-      </section>
-
       <section class="content-section">
         <div class="section-heading">
           <div><h2>Recent artifacts</h2><p>Latest files published under this team.</p></div>
@@ -258,6 +238,12 @@ export function OverviewPage({
         </div>
         <Feedback error={storageError} />
         {artifacts.length ? <ArtifactTable teamSlug={team.slug} objects={artifacts} /> : <EmptyState title="No artifacts published yet" body="Connect a device or run the Artifact Sync daemon to publish the first file." actionHref="/auth/device" actionLabel="Connect a device" />}
+      </section>
+
+      <section class="metric-grid" aria-label="Workspace summary">
+        <Metric label="Connected devices" value={String(counts.devices)} detail={counts.devices === 1 ? "Active record" : "Active records"} />
+        <Metric label="API credentials" value={String(counts.tokens)} detail="Team-scoped" />
+        <Metric label="Your role" value={team.role} detail="Access level" />
       </section>
     </DashboardDocument>
   );
@@ -328,9 +314,10 @@ function fileKind(path: string): string {
   return /^[a-z0-9]{1,5}$/u.test(extension) ? extension : "file";
 }
 
-export function GeneralSettingsPage({ session, settings, feedback }: { session: DashboardSession; settings: DashboardSettings; feedback?: ActionFeedback }) {
+export function GeneralSettingsPage({ session, settings, origin, feedback }: { session: DashboardSession; settings: DashboardSettings; origin: string; feedback?: ActionFeedback }) {
   const team = session.team!;
   const canChange = team.role === "owner" && settings.canChangeSlug;
+  const baseUrl = `${origin}/${team.slug}`;
   return (
     <DashboardDocument session={session} title={`${team.name} settings`} active="general">
       <PageHeader eyebrow="Settings" title="Team settings" description="Control the public team slug used by private artifact URLs." />
@@ -339,7 +326,15 @@ export function GeneralSettingsPage({ session, settings, feedback }: { session: 
         <div class="settings-main">
           <section class="settings-section">
             <div class="section-heading"><div><h2>Team URL</h2><p>Old URLs redirect permanently to the current slug.</p></div><span class={`role-badge role-${team.role}`}>{team.role}</span></div>
-            <div class="slug-value"><span>artifact.w3dev.app/</span><code>{team.slug}</code></div>
+            <div class="slug-value"><span>{origin}/</span><code>{team.slug}</code></div>
+            <div class="base-url-row">
+              <span>
+                <span class="section-label">Artifact base URL</span>
+                <code>{baseUrl}/&lt;path&gt;</code>
+              </span>
+              <button class="button secondary" type="button" data-copy-target="artifact-base-url">Copy base URL</button>
+              <span id="artifact-base-url" hidden>{baseUrl}/</span>
+            </div>
             {team.role === "owner" ? (
               <form class="slug-form" method="post" action={`/dashboard/${team.id}/settings/general`} data-slug-form>
                 <div class="field"><label for="slug">New team slug</label><input id="slug" name="slug" value={team.slug} minlength={1} maxlength={63} pattern="[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?" required disabled={!canChange} /><p>Use lowercase letters, numbers, and hyphens. A team can change its slug once every 30 days.</p></div>
