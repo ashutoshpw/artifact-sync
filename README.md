@@ -33,6 +33,8 @@ artifact-sync daemon
 
 For headless login, pass a team API token on standard input with `--token-stdin`; there is intentionally no `--token` argument. See [accounts and artifact access](docs/authentication.md) for account setup, team-scoped credentials, credential storage, environment overrides, logout, and revocation.
 
+## Service mode
+
 To run the watcher under the current user's service manager instead of keeping a terminal open:
 
 ```sh

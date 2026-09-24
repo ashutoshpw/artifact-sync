@@ -1,0 +1,129 @@
+name: Publish artifact-sync CLI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-sync-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify CLI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.85
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Run Rust tests
+        run: cargo test --workspace --locked
+      - name: Run Rust lints
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test npm launcher
+        run: npm test --prefix packages/artifact-sync
+
+  build:
+    name: Build ${{ matrix.target }}
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            native: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.85
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build release binary
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo build --release --locked -p artifact-sync --target ${{ matrix.target }}
+      - name: Smoke test native binary
+        if: matrix.native
+        run: |
+          chmod +x target/${{ matrix.target }}/release/artifact-sync
+          target/${{ matrix.target }}/release/artifact-sync --version
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/artifact-sync
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish npm package
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.repository == 'ashutoshpw/artifact-sync' &&
+      github.ref == 'refs/heads/main'
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+      - name: Stage npm package
+        run: node scripts/prepare-npm-package.mjs --source-dir dist/artifacts --output-dir dist/npm/artifact-sync
+      - name: Inspect package contents
+        run: npm pack --dry-run --json ./dist/npm/artifact-sync
+      - name: Smoke test packed package
+        env:
+          PACKAGE_DIR: ./dist/npm/artifact-sync
+        run: |
+          rm -rf "$RUNNER_TEMP/artifact-sync-npm-test"
+          mkdir -p "$RUNNER_TEMP/artifact-sync-npm-test"
+          rm -f dist/artifact-sync-*.tgz
+          npm pack "$PACKAGE_DIR" --pack-destination dist --ignore-scripts
+          TARBALL=$(printf '%s\n' ./dist/artifact-sync-*.tgz)
+          npm install --prefix "$RUNNER_TEMP/artifact-sync-npm-test" --ignore-scripts "$TARBALL"
+          "$RUNNER_TEMP/artifact-sync-npm-test/node_modules/.bin/artifact-sync" --version
+      - name: Publish if version is new
+        env:
+          PACKAGE_DIR: ./dist/npm/artifact-sync
+        run: |
+          PACKAGE_NAME=$(node -p "require('./dist/npm/artifact-sync/package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./dist/npm/artifact-sync/package.json').version")
+          if npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version >/dev/null 2>&1; then
+            echo "::notice::$PACKAGE_NAME@$PACKAGE_VERSION is already published; skipping."
+            exit 0
+          fi
+          npm publish "$PACKAGE_DIR" --ignore-scripts --provenance --access public
