@@ -17,7 +17,7 @@
     {
       "binding": "DB",
       "database_name": "artifact-db",
-      "database_id": "replace-with-d1-database-id",
+      "database_id": "76b048e9-a3af-4bc4-8191-3c5635ad23cf",
       "migrations_dir": "drizzle"
     }
   ],
