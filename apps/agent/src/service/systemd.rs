@@ -28,6 +28,8 @@ pub(super) fn render_definition(settings: &ServiceSettings) -> Result<String, Se
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
 
+    // User services already run without CAP_SYS_MODULE. Asking an unprivileged
+    // systemd user manager to drop that capability can fail with 218/CAPABILITIES.
     Ok(format!(
         "# {SERVICE_MARKER}\n\
          [Unit]\n\
@@ -46,7 +48,6 @@ pub(super) fn render_definition(settings: &ServiceSettings) -> Result<String, Se
          PrivateTmp=true\n\
          ProtectSystem=full\n\
          ProtectKernelTunables=true\n\
-         ProtectKernelModules=true\n\
          ProtectControlGroups=true\n\
          RestrictSUIDSGID=true\n\
          StandardOutput=journal\n\
@@ -225,6 +226,7 @@ mod tests {
         assert!(rendered.contains(SERVICE_MARKER));
         assert!(rendered.contains("--auth-file-only"));
         assert!(rendered.contains("RestartSec=30s"));
+        assert!(!rendered.contains("ProtectKernelModules="));
         assert!(!rendered.contains("ARTIFACTS_PUBLISH_TOKEN"));
         assert!(!rendered.contains("ARTIFACT_SYNC_SERVER_URL"));
         assert!(!rendered.contains("as_api_"));
