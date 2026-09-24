@@ -37,7 +37,7 @@ Optional publishing settings live at `~/.agents/artifacts/config.json`:
 }
 ```
 
-The directory containing that file is watched. If the file is absent, the daemon creates and watches `~/.agents/artifacts/`, uses default sync settings, and takes the team from the server-validated credential. When present, the file's team must match the credential. The local `config.json` is not uploaded and cannot select the server destination.
+The directory containing that file is the artifact root. Every immediate child directory is one artifact, named by its exact lowercase URL-safe folder name; files and nested folders inside it stay together. Empty folders, invalid slug names, and loose files directly under the root are not uploaded. If the config is absent, the daemon creates and watches `~/.agents/artifacts/` with default sync settings and takes the team from the server-validated credential. When present, its team must match the credential. The local `config.json` is not uploaded and cannot select the server destination.
 
 ## Service mode
 

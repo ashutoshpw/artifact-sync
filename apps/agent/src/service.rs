@@ -629,7 +629,22 @@ fn count_publishable_files(root: &Path, publishing_config: &Path) -> Result<usiz
         return Ok(0);
     }
     let mut count = 0;
-    count_files_recursive(root, root, publishing_config, &mut count)?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() || path == publishing_config {
+            continue;
+        }
+        let slug = entry.file_name();
+        if !slug
+            .to_str()
+            .is_some_and(crate::state::is_valid_artifact_slug)
+        {
+            continue;
+        }
+        count_files_recursive(root, &path, publishing_config, &mut count)?;
+    }
     Ok(count)
 }
 
@@ -755,7 +770,11 @@ mod tests {
         let temp = tempfile::TempDir::new_in(dirs::home_dir().unwrap()).unwrap();
         let root = temp.path().join("artifacts");
         fs::create_dir_all(root.join(".artifact-sync")).unwrap();
-        fs::write(root.join("report.json"), "{} ").unwrap();
+        fs::create_dir_all(root.join("valid/nested")).unwrap();
+        fs::create_dir_all(root.join("BadSlug")).unwrap();
+        fs::write(root.join("loose-report.json"), "ignored").unwrap();
+        fs::write(root.join("valid/nested/report.json"), "{} ").unwrap();
+        fs::write(root.join("BadSlug/private.txt"), "ignored").unwrap();
         fs::write(root.join("config.json"), "{}").unwrap();
         fs::write(root.join(".artifact-sync/state"), "local").unwrap();
         let publishing = root.join("config.json");

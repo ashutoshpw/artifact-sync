@@ -48,13 +48,15 @@ function makeEnv() {
       },
       async list(options: R2ListOptions) {
         return {
-          objects: [{
-            key: `${options.prefix}reports/today.json`,
+          objects: [options.delimiter ? `${options.prefix}legacy.txt` : `${options.prefix}today.json`].map((key) => ({
+            key,
             size: 16,
             uploaded: new Date("2026-09-23T00:00:00.000Z"),
             httpEtag: '"fixture"',
-          }],
-          delimitedPrefixes: [],
+          })),
+          delimitedPrefixes: options.delimiter
+            ? [`${options.prefix}reports/`, `${options.prefix}notes/`]
+            : [],
           truncated: false,
         };
       },
@@ -116,7 +118,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
   it("derives the R2 key from the JWT team ID and never passes Authorization to R2", async () => {
     const { env, uploads } = makeEnv();
     const token = await accessToken();
-    const response = await worker.fetch(request("/__api/v1/uploads?path=reports%2Ftoday.json", {
+    const response = await worker.fetch(request("/__api/v1/uploads?artifact=reports&path=today.json", {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token.token}`,
@@ -138,7 +140,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
   it("returns 403 for an authenticated read-only identity attempting to publish", async () => {
     const { env, uploads } = makeEnv();
     const token = await accessToken({ permissions: [READ_PERMISSION] });
-    const response = await worker.fetch(request("/__api/v1/uploads?path=reports%2Ftoday.json", {
+    const response = await worker.fetch(request("/__api/v1/uploads?artifact=reports&path=today.json", {
       method: "PUT",
       headers: { Authorization: `Bearer ${token.token}` },
       body: "{}",
@@ -152,7 +154,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
   it("requires team-scoped read authorization and serves content with no-store protections", async () => {
     const { env, lookups } = makeEnv();
     const token = await accessToken();
-    const denied = await worker.fetch(request("/another-team/private.json", {
+    const denied = await worker.fetch(request("/another-team/reports/private.json", {
       headers: { Authorization: `Bearer ${token.token}` },
     }), env);
     expect(denied.status).toBe(403);
@@ -180,6 +182,16 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
+  it("rejects flat root-level content paths", async () => {
+    const { env, lookups } = makeEnv();
+    const token = await accessToken();
+    const response = await worker.fetch(request("/w3dev/today.json", {
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+    expect(response.status).toBe(404);
+    expect(lookups).toEqual([]);
+  });
+
   it("rejects traversal and provides team-bounded listing", async () => {
     const { env, lookups } = makeEnv();
     const token = await accessToken();
@@ -193,12 +205,44 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
       headers: { Authorization: `Bearer ${token.token}` },
     }), env);
     expect(listing.status).toBe(200);
+    expect(listing.headers.get("Cache-Control")).toBe("no-store");
     expect(await listing.json()).toMatchObject({
       team: "w3dev",
-      objects: [{ path: "reports/today.json" }],
+      artifacts: [{ slug: "reports" }, { slug: "notes" }],
       truncated: false,
       cursor: null,
     });
+
+    const files = await worker.fetch(request("/__api/v1/artifacts/reports/files", {
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+    expect(files.status).toBe(200);
+    expect(files.headers.get("Cache-Control")).toBe("no-store");
+    expect(await files.json()).toMatchObject({
+      team: "w3dev",
+      artifact: "reports",
+      files: [{ path: "today.json" }],
+    });
+  });
+
+  it("validates artifact slugs and keeps the full upload key server-derived", async () => {
+    const { env, uploads } = makeEnv();
+    const token = await accessToken();
+    const invalidSlug = await worker.fetch(request("/__api/v1/uploads?artifact=Bad_Name&path=today.json", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token.token}` },
+      body: "{}",
+    }), env);
+    expect(invalidSlug.status).toBe(400);
+    expect(uploads).toEqual([]);
+
+    const invalidPath = await worker.fetch(request("/__api/v1/uploads?artifact=reports&path=..%2Fsecret", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token.token}` },
+      body: "{}",
+    }), env);
+    expect(invalidPath.status).toBe(400);
+    expect(uploads).toEqual([]);
   });
 
   it("serves provider-first login and protects protected routes", async () => {

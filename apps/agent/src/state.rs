@@ -14,6 +14,8 @@ pub enum StateError {
     Sql(#[from] rusqlite::Error),
     #[error("artifact path is outside the watched root")]
     OutsideRoot,
+    #[error("artifact path must be a valid artifact slug followed by a file path")]
+    InvalidArtifactPath,
     #[error("sync state is unsafe: {0}")]
     Unsafe(String),
 }
@@ -23,6 +25,12 @@ pub struct PendingItem {
     pub relative_path: PathBuf,
     pub content_hash: String,
     pub attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFilePath {
+    pub slug: String,
+    pub path: String,
 }
 
 pub struct SyncState {
@@ -127,6 +135,9 @@ impl SyncState {
             return Ok(None);
         }
         let relative = normalized_relative_path(root, path)?;
+        if split_artifact_relative_path(&relative).is_none() {
+            return Ok(None);
+        }
         let bytes = fs::read(path)?;
         let hash = hex::encode(Sha256::digest(bytes));
         let connection = self.connection.lock().expect("state mutex poisoned");
@@ -213,10 +224,26 @@ impl SyncState {
     }
 
     pub fn reconcile(&self, root: &Path) -> Result<(), StateError> {
-        walk_files(root, &mut |path| {
+        walk_artifacts(root, &mut |path| {
             let _ = self.observe_file(root, path)?;
             Ok(())
-        })
+        })?;
+        self.prune_unscoped_pending()
+    }
+
+    fn prune_unscoped_pending(&self) -> Result<(), StateError> {
+        let connection = self.connection.lock().expect("state mutex poisoned");
+        let pending_paths = {
+            let mut statement = connection.prepare("SELECT path FROM pending")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for path in pending_paths {
+            if split_artifact_relative_path(&path).is_none() {
+                connection.execute("DELETE FROM pending WHERE path = ?1", params![path])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -275,6 +302,43 @@ pub fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, Stat
     Ok(parts.join("/"))
 }
 
+pub fn artifact_file_path(root: &Path, path: &Path) -> Result<ArtifactFilePath, StateError> {
+    let relative = normalized_relative_path(root, path)?;
+    split_artifact_relative_path(&relative).ok_or(StateError::InvalidArtifactPath)
+}
+
+pub fn split_artifact_relative_path(relative: &str) -> Option<ArtifactFilePath> {
+    let (slug, path) = relative.split_once('/')?;
+    if !is_valid_artifact_slug(slug) || path.is_empty() {
+        return None;
+    }
+    if path.split('/').any(|part| {
+        part.is_empty() || part == "." || part == ".." || part.contains('\\') || part.contains('\0')
+    }) {
+        return None;
+    }
+    Some(ArtifactFilePath {
+        slug: slug.to_string(),
+        path: path.to_string(),
+    })
+}
+
+pub fn is_valid_artifact_slug(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
 fn should_ignore(root: &Path, path: &Path) -> bool {
     if path == root.join("config.json") {
         return true;
@@ -286,7 +350,7 @@ fn should_ignore(root: &Path, path: &Path) -> bool {
     })
 }
 
-fn walk_files(
+fn walk_artifacts(
     root: &Path,
     visit: &mut dyn FnMut(&Path) -> Result<(), StateError>,
 ) -> Result<(), StateError> {
@@ -298,7 +362,35 @@ fn walk_files(
             continue;
         }
         if file_type.is_dir() {
-            walk_files(&path, visit)?;
+            let slug = entry.file_name();
+            let Some(slug) = slug.to_str() else {
+                tracing::warn!(artifact = %slug.to_string_lossy(), "artifact directory ignored because its name is not a valid URL slug");
+                continue;
+            };
+            if !is_valid_artifact_slug(slug) {
+                tracing::warn!(artifact = %slug, "artifact directory ignored because its name is not a valid URL slug");
+                continue;
+            }
+            walk_files(root, &path, visit)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_files(
+    root: &Path,
+    directory: &Path,
+    visit: &mut dyn FnMut(&Path) -> Result<(), StateError>,
+) -> Result<(), StateError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || should_ignore(root, &path) {
+            continue;
+        }
+        if file_type.is_dir() {
+            walk_files(root, &path, visit)?;
         } else if file_type.is_file() {
             visit(&path)?;
         }
@@ -311,25 +403,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queues_changed_files_but_excludes_config_and_symlinks() {
+    fn queues_files_under_each_artifact_but_ignores_loose_root_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("artifacts");
         fs::create_dir(&root).unwrap();
         let database = temp.path().join("state.sqlite3");
         let state = SyncState::open(&database).unwrap();
         fs::write(root.join("config.json"), r#"{"team":"w3dev"}"#).unwrap();
-        fs::write(root.join("report.txt"), "one").unwrap();
+        fs::write(root.join("loose.txt"), "ignored").unwrap();
+        let artifact = root.join("abc");
+        fs::create_dir_all(artifact.join("nested")).unwrap();
+        fs::write(artifact.join("report.txt"), "one").unwrap();
+        fs::write(artifact.join("nested/summary.md"), "nested").unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes/README.md"), "another artifact").unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
         state.reconcile(&root).unwrap();
         let pending = state.pending_due(i64::MAX, 10).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(state.pending_count().unwrap(), 1);
-        assert_eq!(pending[0].relative_path, PathBuf::from("report.txt"));
+        assert_eq!(pending.len(), 3);
+        assert_eq!(state.pending_count().unwrap(), 3);
+        assert_eq!(
+            pending[0].relative_path,
+            PathBuf::from("abc/nested/summary.md")
+        );
+        assert_eq!(pending[1].relative_path, PathBuf::from("abc/report.txt"));
+        assert_eq!(pending[2].relative_path, PathBuf::from("notes/README.md"));
         state.mark_uploaded(&pending[0]).unwrap();
         state.reconcile(&root).unwrap();
-        assert!(state.pending_due(i64::MAX, 10).unwrap().is_empty());
-        fs::write(root.join("report.txt"), "two").unwrap();
+        assert_eq!(state.pending_due(i64::MAX, 10).unwrap().len(), 2);
+        fs::write(artifact.join("report.txt"), "two").unwrap();
         state.reconcile(&root).unwrap();
-        assert_eq!(state.pending_due(i64::MAX, 10).unwrap().len(), 1);
+        assert_eq!(state.pending_due(i64::MAX, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reconciliation_drops_legacy_pending_root_files_and_ignores_invalid_slugs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("artifacts");
+        fs::create_dir_all(root.join("UpperCase")).unwrap();
+        fs::write(root.join("UpperCase/secret.txt"), "ignored").unwrap();
+        fs::write(root.join("loose.txt"), "ignored").unwrap();
+        let database = temp.path().join("state.sqlite3");
+        let state = SyncState::open(&database).unwrap();
+        state
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO pending(path, content_hash, attempts, next_attempt_at) VALUES ('loose.txt', 'old', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        state.reconcile(&root).unwrap();
+
+        assert!(state.pending_due(i64::MAX, 10).unwrap().is_empty());
+        assert!(!is_valid_artifact_slug("UpperCase"));
+        assert!(!is_valid_artifact_slug("with_underbar"));
+        assert!(!is_valid_artifact_slug("-starts-wrong"));
+        assert!(is_valid_artifact_slug("abc-123"));
+    }
+
+    #[test]
+    fn splits_artifact_slug_from_nested_file_path() {
+        assert_eq!(
+            split_artifact_relative_path("abc/reports/today.json"),
+            Some(ArtifactFilePath {
+                slug: "abc".into(),
+                path: "reports/today.json".into(),
+            })
+        );
+        assert!(split_artifact_relative_path("loose.txt").is_none());
+        assert!(split_artifact_relative_path("abc/../secret").is_none());
     }
 
     #[test]

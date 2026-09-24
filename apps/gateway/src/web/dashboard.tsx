@@ -3,6 +3,7 @@ import {
   artifactHref,
   formatBytes,
   type DashboardArtifact,
+  type DashboardArtifactFile,
   type DashboardDevice,
   type DashboardPage,
   type DashboardSession,
@@ -233,11 +234,11 @@ export function OverviewPage({
 
       <section class="content-section">
         <div class="section-heading">
-          <div><h2>Recent artifacts</h2><p>Latest files published under this team.</p></div>
+          <div><h2>Artifacts</h2><p>Each directory is one artifact with its own files.</p></div>
           <a href={`/dashboard/${team.id}/artifacts`}>View all artifacts →</a>
         </div>
         <Feedback error={storageError} />
-        {artifacts.length ? <ArtifactTable teamSlug={team.slug} objects={artifacts} /> : <EmptyState title="No artifacts published yet" body="Connect a device or run the Artifact Sync daemon to publish the first file." actionHref="/auth/device" actionLabel="Connect a device" />}
+        {artifacts.length ? <ArtifactDirectoryTable teamId={team.id} artifacts={artifacts} /> : <EmptyState title="No artifacts published yet" body="Create a folder under ~/.agents/artifacts and run the Artifact Sync daemon to publish it." actionHref="/auth/device" actionLabel="Connect a device" />}
       </section>
 
       <section class="metric-grid" aria-label="Workspace summary">
@@ -255,53 +256,89 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
 
 export function ArtifactsPage({
   session,
-  objects,
-  currentPrefix,
+  artifacts,
   nextCursor,
   storageError,
 }: {
   session: DashboardSession;
-  objects: DashboardArtifact[];
-  currentPrefix: string;
+  artifacts: DashboardArtifact[];
   nextCursor: string | null;
   storageError?: string | null;
 }) {
   const team = session.team!;
-  const requestedPrefix = currentPrefix.replace(/^\/+|\/+$/gu, "");
   return (
     <DashboardDocument session={session} title={`${team.name} artifacts`} active="artifacts">
       <PageHeader
         eyebrow="Artifacts"
-        title="All published artifacts"
-        description="Browse every file published under this team. Use a path prefix to narrow long artifact listings."
+        title="Published artifacts"
+        description="Each immediate folder under the publishing root is one artifact. Open one to browse its files."
         actions={<button class="button secondary" type="button" data-refresh>Refresh</button>}
       />
-      <form class="path-filter" method="get" action={`/dashboard/${team.id}/artifacts`}>
-        <div class="field"><label for="artifact-prefix">Path prefix</label><input id="artifact-prefix" name="prefix" value={requestedPrefix} placeholder="reports/daily" /></div>
-        <button class="button secondary" type="submit">Apply prefix</button>
-        {requestedPrefix ? <a class="button secondary" href={`/dashboard/${team.id}/artifacts`}>Clear</a> : null}
-      </form>
       <Feedback error={storageError} />
-      {objects.length ? <ArtifactTable teamSlug={team.slug} objects={objects} /> : <EmptyState title="No artifacts found" body={requestedPrefix ? "No published artifact exists under this path prefix." : "No artifacts have been published under this team yet."} actionHref={requestedPrefix ? `/dashboard/${team.id}/artifacts` : "/auth/device"} actionLabel={requestedPrefix ? "Clear prefix" : "Connect a device"} />}
-      {nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/artifacts?${new URLSearchParams({
-        ...(requestedPrefix ? { prefix: requestedPrefix } : {}),
-        cursor: nextCursor,
-      }).toString()}`}>Next page</a> : null}
+      {artifacts.length ? <ArtifactDirectoryTable teamId={team.id} artifacts={artifacts} /> : <EmptyState title="No artifacts found" body="Create a non-empty folder under ~/.agents/artifacts and run the Artifact Sync daemon." actionHref="/auth/device" actionLabel="Connect a device" />}
+      {nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/artifacts?cursor=${encodeURIComponent(nextCursor)}`}>Next page</a> : null}
     </DashboardDocument>
   );
 }
 
-function ArtifactTable({ teamSlug, objects }: { teamSlug: string; objects: DashboardArtifact[] }) {
+export function ArtifactDetailPage({
+  session,
+  artifact,
+  files,
+  nextCursor,
+  storageError,
+}: {
+  session: DashboardSession;
+  artifact: string;
+  files: DashboardArtifactFile[];
+  nextCursor: string | null;
+  storageError?: string | null;
+}) {
+  const team = session.team!;
+  return (
+    <DashboardDocument session={session} title={`${artifact} · ${team.name}`} active="artifacts">
+      <PageHeader
+        eyebrow="Artifact"
+        title={artifact}
+        description="Files and nested folders published as one artifact."
+        actions={<a class="button secondary" href={`/dashboard/${team.id}/artifacts`}>All artifacts</a>}
+      />
+      <Feedback error={storageError} />
+      {files.length ? <ArtifactFileTable teamSlug={team.slug} artifactSlug={artifact} files={files} /> : <EmptyState title="No files in this artifact" body="The artifact may have been removed or has not finished uploading." actionHref={`/dashboard/${team.id}/artifacts`} actionLabel="Back to artifacts" />}
+      {nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/artifacts/${encodeURIComponent(artifact)}?cursor=${encodeURIComponent(nextCursor)}`}>Next page</a> : null}
+    </DashboardDocument>
+  );
+}
+
+function ArtifactDirectoryTable({ teamId, artifacts }: { teamId: string; artifacts: DashboardArtifact[] }) {
   return (
     <div class="table-panel">
       <div class="data-table artifact-table" role="table" aria-label="Published artifacts">
-        <div class="table-row table-head" role="row"><span>Name</span><span>Size</span><span>Uploaded</span><span>Action</span></div>
-        {objects.map((object) => (
+        <div class="table-row table-head" role="row"><span>Artifact</span><span>Kind</span><span>Contents</span><span>Action</span></div>
+        {artifacts.map((artifact) => (
           <div class="table-row" role="row">
-            <span class="file-cell"><span class={`file-kind ${fileKind(object.path)}`}>{fileKind(object.path)}</span><code>{object.path}</code></span>
-            <span>{formatBytes(object.size)}</span>
-            <span><time datetime={object.uploadedAt}>{formatDate(object.uploadedAt)}</time></span>
-            <a class="row-action" href={artifactHref(teamSlug, object.path)} target="_blank" rel="noreferrer">Open ↗</a>
+            <span class="file-cell"><span class="file-kind directory">DIR</span><code>{artifact.slug}</code></span>
+            <span>Directory</span>
+            <span>Files and nested folders</span>
+            <a class="row-action" href={`/dashboard/${teamId}/artifacts/${encodeURIComponent(artifact.slug)}`}>Browse →</a>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ArtifactFileTable({ teamSlug, artifactSlug, files }: { teamSlug: string; artifactSlug: string; files: DashboardArtifactFile[] }) {
+  return (
+    <div class="table-panel">
+      <div class="data-table artifact-table" role="table" aria-label={`Files in ${artifactSlug}`}>
+        <div class="table-row table-head" role="row"><span>File</span><span>Size</span><span>Uploaded</span><span>Action</span></div>
+        {files.map((file) => (
+          <div class="table-row" role="row">
+            <span class="file-cell"><span class={`file-kind ${fileKind(file.path)}`}>{fileKind(file.path)}</span><code>{file.path}</code></span>
+            <span>{formatBytes(file.size)}</span>
+            <span><time datetime={file.uploadedAt}>{formatDate(file.uploadedAt)}</time></span>
+            <a class="row-action" href={artifactHref(teamSlug, `${artifactSlug}/${file.path}`)} target="_blank" rel="noreferrer">Open ↗</a>
           </div>
         ))}
       </div>

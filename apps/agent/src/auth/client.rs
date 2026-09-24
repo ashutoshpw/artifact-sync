@@ -156,6 +156,7 @@ impl AuthClient {
     pub async fn upload(
         &self,
         access_token: &SecretString,
+        artifact_slug: &str,
         relative_path: &str,
         body: Vec<u8>,
     ) -> Result<(), AuthClientError> {
@@ -163,7 +164,7 @@ impl AuthClient {
             .http
             .put(format!("{}/__api/v1/uploads", self.origin))
             .bearer_auth(access_token.expose())
-            .query(&[("path", relative_path)])
+            .query(&[("artifact", artifact_slug), ("path", relative_path)])
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(body)
             .send()
@@ -314,6 +315,42 @@ mod tests {
                 "https://artifact.w3dev.app/auth/device?code=AAAA2222"
             )
             .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_sends_artifact_slug_and_in_artifact_path_separately() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..length]).to_string()
+        });
+
+        let client = AuthClient::new(format!("http://{address}")).unwrap();
+        client
+            .upload(
+                &SecretString::new("test-token"),
+                "reports",
+                "nested/today.json",
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("PUT /__api/v1/uploads?artifact=reports&path=nested%2Ftoday.json ")
         );
     }
 }

@@ -3,7 +3,7 @@ import { createDatabase } from "../db/client.ts";
 import { apiTokens, deviceAuthorizations, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
 import { authError } from "../auth/middleware.ts";
 import { safePermissions } from "../auth/permissions.ts";
-import { TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug.ts";
+import { isValidTeamSlug, TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug.ts";
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebIdentity, type WebIdentity } from "../auth/web-session.ts";
 
@@ -25,6 +25,10 @@ export interface DashboardSession {
 }
 
 export interface DashboardArtifact {
+  slug: string;
+}
+
+export interface DashboardArtifactFile {
   path: string;
   size: number;
   uploadedAt: string;
@@ -111,28 +115,50 @@ export async function listUserTeams(userId: string, env: GatewayEnv): Promise<Da
 export async function listDashboardArtifacts(
   env: GatewayEnv,
   teamId: string,
-  requestedPrefix: string | null,
   cursor: string | null,
   limit = 50,
-): Promise<{
-  prefix: string;
-  objects: DashboardArtifact[];
-  nextCursor: string | null;
-} | Response> {
-  const prefix = safeArtifactPrefix(requestedPrefix);
-  if (prefix === null) return authError(400, "invalid_artifact_prefix");
+): Promise<DashboardPage<DashboardArtifact> | Response> {
+  if (!safeCursor(cursor)) return authError(400, "invalid_cursor");
   const artifactRoot = `uploads/${teamId}/artifacts/`;
-  const base = `${artifactRoot}${prefix}`;
   try {
     const result = await env.ARTIFACTS_BUCKET.list({
-      prefix: base,
+      prefix: artifactRoot,
+      delimiter: "/",
       cursor: cursor ?? undefined,
       limit: Math.min(Math.max(limit, 1), 1000),
     });
     return {
+      items: result.delimitedPrefixes.flatMap((delimitedPrefix) => {
+        if (!delimitedPrefix.startsWith(artifactRoot)) return [];
+        const slug = delimitedPrefix.slice(artifactRoot.length).replace(/\/$/u, "");
+        return isValidTeamSlug(slug) ? [{ slug }] : [];
+      }),
+      nextCursor: result.truncated ? result.cursor ?? null : null,
+    };
+  } catch {
+    return authError(503, "artifact_storage_unavailable");
+  }
+}
+
+export async function listDashboardArtifactFiles(
+  env: GatewayEnv,
+  teamId: string,
+  artifactSlug: string,
+  cursor: string | null,
+  limit = 50,
+): Promise<DashboardPage<DashboardArtifactFile> | Response> {
+  if (!isValidTeamSlug(artifactSlug)) return authError(404, "artifact_not_found");
+  if (!safeCursor(cursor)) return authError(400, "invalid_cursor");
+  const prefix = `uploads/${teamId}/artifacts/${artifactSlug}/`;
+  try {
+    const result = await env.ARTIFACTS_BUCKET.list({
       prefix,
-      objects: result.objects.map((object) => ({
-        path: object.key.slice(artifactRoot.length),
+      cursor: cursor ?? undefined,
+      limit: Math.min(Math.max(limit, 1), 1000),
+    });
+    return {
+      items: result.objects.map((object) => ({
+        path: object.key.slice(prefix.length),
         size: object.size,
         uploadedAt: object.uploaded.toISOString(),
         etag: object.httpEtag,
@@ -142,43 +168,6 @@ export async function listDashboardArtifacts(
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
-}
-
-const RECENT_ARTIFACT_PAGE_SIZE = 1000;
-const RECENT_ARTIFACT_MAX_PAGES = 5;
-
-export interface RecentArtifacts {
-  objects: DashboardArtifact[];
-  scanned: number;
-  truncated: boolean;
-}
-
-export async function listRecentArtifacts(
-  env: GatewayEnv,
-  teamId: string,
-  limit = 8,
-  maxScan = 1000,
-): Promise<RecentArtifacts | Response> {
-  const scanLimit = Math.max(maxScan, 1);
-  const pageSize = Math.min(RECENT_ARTIFACT_PAGE_SIZE, scanLimit);
-  const scanned: DashboardArtifact[] = [];
-  let cursor: string | null = null;
-  for (let page = 0; page < RECENT_ARTIFACT_MAX_PAGES && scanned.length < scanLimit; page += 1) {
-    const result = await listDashboardArtifacts(env, teamId, null, cursor, pageSize);
-    if (result instanceof Response) return result;
-    scanned.push(...result.objects);
-    cursor = result.nextCursor;
-    if (!cursor) break;
-  }
-  scanned.sort((left, right) => {
-    const delta = Date.parse(right.uploadedAt) - Date.parse(left.uploadedAt);
-    return Number.isNaN(delta) || delta === 0 ? left.path.localeCompare(right.path) : delta;
-  });
-  return {
-    objects: scanned.slice(0, Math.max(limit, 1)),
-    scanned: scanned.length,
-    truncated: cursor !== null,
-  };
 }
 
 export async function listDashboardTokens(
@@ -370,15 +359,6 @@ export function formatBytes(bytes: number): string {
     unit = units[index];
   }
   return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
-}
-
-function safeArtifactPrefix(value: string | null): string | null {
-  if (!value) return "";
-  if (value.length > 1024 || value.startsWith("/") || value.includes("\\") || value.includes("\0")) return null;
-  const normalized = value.normalize("NFC").replace(/^\/+|\/+$/gu, "");
-  const parts = normalized ? normalized.split("/") : [];
-  if (parts.some((part) => !part || part === "." || part === "..")) return null;
-  return parts.length ? `${parts.join("/")}/` : "";
 }
 
 function safeCursor(value: string | null): boolean {

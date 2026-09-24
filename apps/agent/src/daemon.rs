@@ -6,7 +6,7 @@ use crate::auth::commands::{
 use crate::auth::credentials::ActiveCredential;
 use crate::auth::store::CredentialStore;
 use crate::config::{SyncConfig, load_optional_publishing_config};
-use crate::state::{PendingItem, StateError, SyncState};
+use crate::state::{PendingItem, StateError, SyncState, split_artifact_relative_path};
 use crate::upload::{UploadError, UploadManager, UploadOutcome};
 use chrono::Utc;
 use notify::event::EventKind;
@@ -160,6 +160,7 @@ pub async fn run(
     let mut in_flight = HashSet::<String>::new();
     let mut changed_paths = HashSet::<PathBuf>::new();
     let mut debounce_armed = false;
+    let mut reconcile_after_debounce = false;
     let debounce_duration = Duration::from_millis(config.sync.debounce_ms.clamp(50, 10_000));
     let debounce_sleep = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
     tokio::pin!(debounce_sleep);
@@ -215,6 +216,11 @@ pub async fn run(
                             continue;
                         }
                         if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                            reconcile_after_debounce = true;
+                            debounce_sleep
+                                .as_mut()
+                                .reset(Instant::now() + debounce_duration);
+                            debounce_armed = true;
                             continue;
                         }
                         changed_paths.insert(path);
@@ -409,8 +415,17 @@ pub async fn run(
                 }
             }
             LoopEvent::Debounce => {
-                debug!(paths = changed_paths.len(), "debounced filesystem changes");
+                debug!(
+                    paths = changed_paths.len(),
+                    reconcile_after_debounce, "debounced filesystem changes"
+                );
                 debounce_armed = false;
+                if reconcile_after_debounce {
+                    reconcile_after_debounce = false;
+                    if let Err(error) = state.reconcile(&root) {
+                        warn!(error = %error, "artifact directory reconciliation failed");
+                    }
+                }
                 for path in changed_paths.drain() {
                     if let Err(error) = state.observe_file(&root, &path) {
                         warn!(error = %error, "could not queue changed artifact");
@@ -601,6 +616,10 @@ fn schedule_uploads(
             break;
         }
         let relative = item.relative_path.to_string_lossy().to_string();
+        if split_artifact_relative_path(&relative).is_none() {
+            state.remove_pending(root, &root.join(&item.relative_path))?;
+            continue;
+        }
         if in_flight.contains(&relative) {
             continue;
         }

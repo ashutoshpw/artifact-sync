@@ -6,15 +6,15 @@ import { handleApiTokens, handleDeviceApprove, handleRevokeApiToken } from "../a
 import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
 import { handleTeam } from "../auth/team-routes.ts";
 import type { GatewayEnv } from "../auth/types.ts";
-import { ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, TokensPage } from "./dashboard.tsx";
+import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, TokensPage } from "./dashboard.tsx";
 import { dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
 import {
   dashboardCounts,
   dashboardSettings,
+  listDashboardArtifactFiles,
   listDashboardArtifacts,
   listDashboardDevices,
   listDashboardTokens,
-  listRecentArtifacts,
   requireDashboardSession,
   type DashboardSession,
 } from "./dashboard-service.ts";
@@ -44,24 +44,42 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   app.get("/dashboard/:teamId", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const [recent, counts] = await Promise.all([
-      listRecentArtifacts(c.env, session.team.id),
+    const [artifacts, counts] = await Promise.all([
+      listDashboardArtifacts(c.env, session.team.id, null, 8),
       dashboardCounts(c.env, session.identity, session.team),
     ]);
-    if (recent instanceof Response) {
+    if (artifacts instanceof Response) {
       return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} counts={counts} storageError={actionMessage("artifact_storage_unavailable")} />);
     }
-    return dashboardHtml(c, <OverviewPage session={session} artifacts={recent.objects} counts={counts} />);
+    return dashboardHtml(c, <OverviewPage session={session} artifacts={artifacts.items} counts={counts} />);
   });
 
   app.get("/dashboard/:teamId/artifacts", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("prefix") ?? null, c.req.query("cursor") ?? null);
+    const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("cursor") ?? null);
     if (result instanceof Response) {
-      return dashboardHtml(c, <ArtifactsPage session={session} objects={[]} currentPrefix="" nextCursor={null} storageError={actionMessage("invalid_artifact_prefix")} />, result.status as ContentfulStatusCode);
+      return dashboardHtml(c, <ArtifactsPage session={session} artifacts={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
     }
-    return dashboardHtml(c, <ArtifactsPage session={session} objects={result.objects} currentPrefix={result.prefix} nextCursor={result.nextCursor} />);
+    return dashboardHtml(c, <ArtifactsPage session={session} artifacts={result.items} nextCursor={result.nextCursor} />);
+  });
+
+  app.get("/dashboard/:teamId/artifacts/:artifactSlug", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const artifactSlug = c.req.param("artifactSlug");
+    const result = await listDashboardArtifactFiles(
+      c.env,
+      session.team.id,
+      artifactSlug,
+      c.req.query("cursor") ?? null,
+    );
+    if (result instanceof Response) {
+      if (result.status === 404) return c.text("Not found", 404);
+      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
+    }
+    if (!c.req.query("cursor") && result.items.length === 0) return c.text("Not found", 404);
+    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} files={result.items} nextCursor={result.nextCursor} />);
   });
 
   app.get("/dashboard/:teamId/settings/general", async (c) => {

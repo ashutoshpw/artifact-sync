@@ -2,7 +2,7 @@ use crate::auth::client::{AuthClient, AuthClientError};
 use crate::auth::commands::saved_auth_for_upload;
 use crate::auth::credentials::{ActiveCredential, CredentialSource, SavedAuth, SecretString};
 use crate::auth::store::{CredentialStore, StoreError};
-use crate::state::normalized_relative_path;
+use crate::state::artifact_file_path;
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -84,8 +84,12 @@ impl UploadManager {
         expected_hash: &str,
         cancellation: &CancellationToken,
     ) -> Result<UploadOutcome, UploadError> {
-        let relative = normalized_relative_path(root, path).map_err(|_| UploadError::File)?;
-        if relative == "config.json" || relative.split('/').any(|part| part == ".artifact-sync") {
+        let artifact_path = artifact_file_path(root, path).map_err(|_| UploadError::File)?;
+        if artifact_path
+            .path
+            .split('/')
+            .any(|part| part == ".artifact-sync")
+        {
             return Err(UploadError::File);
         }
         let bytes = tokio::fs::read(path).await.map_err(|_| UploadError::File)?;
@@ -99,9 +103,12 @@ impl UploadManager {
             if expiry <= Utc::now() {
                 return Err(AuthClientError::InvalidCredential.into());
             }
-            let upload = self
-                .auth_client
-                .upload(&access_token, &relative, bytes.clone());
+            let upload = self.auth_client.upload(
+                &access_token,
+                &artifact_path.slug,
+                &artifact_path.path,
+                bytes.clone(),
+            );
             let result = tokio::select! {
                 _ = cancellation.cancelled() => return Err(UploadError::Cancelled),
                 result = upload => result,

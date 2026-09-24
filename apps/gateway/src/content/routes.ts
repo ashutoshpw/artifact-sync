@@ -25,46 +25,80 @@ export async function uploadArtifact(request: Request, env: GatewayEnv): Promise
   if (context instanceof Response) return context;
   if (!context.identity.permissions.includes(PUBLISH_PERMISSION)) return authError(403, "publish_permission_required");
 
-  const relativePath = safeRelativePath(new URL(request.url).searchParams.get("path"));
-  if (!relativePath || !request.body) return authError(400, "invalid_artifact_path_or_body");
+  const url = new URL(request.url);
+  const artifactSlug = url.searchParams.get("artifact");
+  const relativePath = safeRelativePath(url.searchParams.get("path"));
+  if (!artifactSlug || !isValidTeamSlug(artifactSlug) || !relativePath || !request.body) {
+    return authError(400, "invalid_artifact_slug_path_or_body");
+  }
 
-  const key = `uploads/${context.identity.teamId}/artifacts/${relativePath}`;
+  const key = `uploads/${context.identity.teamId}/artifacts/${artifactSlug}/${relativePath}`;
   try {
     await env.ARTIFACTS_BUCKET.put(key, request.body, {
       httpMetadata: { contentType: contentTypeForPath(relativePath) },
     });
-    return Response.json({ path: relativePath }, { status: 201, headers: noStoreHeaders() });
+    return Response.json({ artifact: artifactSlug, path: relativePath }, { status: 201, headers: noStoreHeaders() });
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
 }
 
 export async function listArtifacts(request: Request, env: GatewayEnv): Promise<Response> {
-  const requestedTeam = new URL(request.url).searchParams.get("team");
+  const url = new URL(request.url);
+  const requestedTeam = url.searchParams.get("team");
   const access = await resolveTeamAccess(request, env, requestedTeam, READ_PERMISSION);
   if (access instanceof Response) return access;
 
-  const url = new URL(request.url);
-  const relativePrefix = url.searchParams.get("prefix") ?? "";
-  if (relativePrefix && !safeRelativePath(relativePrefix, { allowTrailingSlash: true })) {
-    return authError(400, "invalid_artifact_prefix");
-  }
-  const prefix = `uploads/${access.teamId}/artifacts/${relativePrefix}`;
+  const prefix = `uploads/${access.teamId}/artifacts/`;
   const requestedLimit = Number(url.searchParams.get("limit") ?? "200");
   const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 200;
   const cursor = url.searchParams.get("cursor") ?? undefined;
 
   try {
+    const result = await env.ARTIFACTS_BUCKET.list({ prefix, delimiter: "/", limit, cursor });
+    const artifacts = result.delimitedPrefixes.flatMap((delimitedPrefix) => {
+      if (!delimitedPrefix.startsWith(prefix)) return [];
+      const slug = delimitedPrefix.slice(prefix.length).replace(/\/$/u, "");
+      return isValidTeamSlug(slug) ? [{ slug }] : [];
+    });
+    return Response.json({ team: access.team, artifacts, truncated: result.truncated, cursor: result.truncated ? result.cursor : null }, {
+      headers: noStoreHeaders(),
+    });
+  } catch {
+    return authError(503, "artifact_storage_unavailable");
+  }
+}
+
+export async function listArtifactFiles(
+  request: Request,
+  env: GatewayEnv,
+  artifactSlug: string,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const access = await resolveTeamAccess(request, env, url.searchParams.get("team"), READ_PERMISSION);
+  if (access instanceof Response) return access;
+  if (!isValidTeamSlug(artifactSlug)) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+
+  const prefix = `uploads/${access.teamId}/artifacts/${artifactSlug}/`;
+  const requestedLimit = Number(url.searchParams.get("limit") ?? "200");
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 200;
+  const cursor = url.searchParams.get("cursor") ?? undefined;
+  try {
     const result = await env.ARTIFACTS_BUCKET.list({ prefix, limit, cursor });
-    const objects = result.objects.map((object) => ({
-      path: object.key.slice(`uploads/${access.teamId}/artifacts/`.length),
+    if (result.objects.length === 0 && !cursor) return authError(404, "artifact_not_found");
+    const files = result.objects.map((object) => ({
+      path: object.key.slice(prefix.length),
       size: object.size,
       uploadedAt: object.uploaded.toISOString(),
       etag: object.httpEtag,
     }));
-    return Response.json({ team: access.team, objects, truncated: result.truncated, cursor: result.truncated ? result.cursor : null }, {
-      headers: noStoreHeaders(),
-    });
+    return Response.json({
+      team: access.team,
+      artifact: artifactSlug,
+      files,
+      truncated: result.truncated,
+      cursor: result.truncated ? result.cursor : null,
+    }, { headers: noStoreHeaders() });
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
@@ -76,6 +110,11 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   const rawRelative = requestUrl.pathname.slice(teamSlug.length + 2);
   const relativePath = safeRelativePath(rawRelative.split("/").map(decodePathPart).join("/"));
   if (!relativePath) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+  const [artifactSlug, ...filePathParts] = relativePath.split("/");
+  if (!isValidTeamSlug(artifactSlug) || filePathParts.length === 0) {
+    return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+  }
+  const artifactPath = filePathParts.join("/");
 
   let access: { teamId: string; team: string } | Response;
   if (request.headers.has("Authorization")) {
@@ -100,7 +139,7 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   }
 
   try {
-    const object = await env.ARTIFACTS_BUCKET.get(`uploads/${access.teamId}/artifacts/${relativePath}`);
+    const object = await env.ARTIFACTS_BUCKET.get(`uploads/${access.teamId}/artifacts/${artifactSlug}/${artifactPath}`);
     if (!object) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
     const headers = new Headers();
     object.writeHttpMetadata(headers);
@@ -165,13 +204,12 @@ async function resolveTeamAccess(
   return selected;
 }
 
-function safeRelativePath(value: string | null, options: { allowTrailingSlash?: boolean } = {}): string | null {
+function safeRelativePath(value: string | null): string | null {
   if (value === null || value.length === 0 || value.length > MAX_PATH_LENGTH || value.startsWith("/") || value.includes("\\") || value.includes("\0")) {
     return null;
   }
   const normalized = value.normalize("NFC");
   const parts = normalized.split("/");
-  if (options.allowTrailingSlash && parts.at(-1) === "") parts.pop();
   if (parts.some((part) => !part || part === "." || part === "..")) return null;
   return normalized;
 }

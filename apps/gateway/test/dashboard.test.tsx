@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { renderToString } from "hono/jsx/dom/server";
-import { ArtifactsPage, DashboardDocument, DeviceApprovalPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
-import { listRecentArtifacts, type DashboardSession } from "../src/web/dashboard-service.ts";
+import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
+import { listDashboardArtifactFiles, listDashboardArtifacts, type DashboardSession } from "../src/web/dashboard-service.ts";
 
 const team = {
   id: "team-1",
@@ -53,63 +53,56 @@ describe("dashboard server rendering", () => {
     expect(html).not.toContain('<aside class="sidebar"');
   });
 
-  it("lists every artifact passed from the team-scoped R2 page", async () => {
+  it("lists each artifact directory as one entry", async () => {
     const html = await renderToString(
       <ArtifactsPage
         session={session("sidebar")}
-        currentPrefix=""
         nextCursor="next-page"
-        objects={[
-          { path: "config/app.json", size: 1024, uploadedAt: "2026-09-24T10:00:00.000Z" },
-          { path: "notes.md", size: 2048, uploadedAt: "2026-09-24T11:00:00.000Z" },
-        ]}
+        artifacts={[{ slug: "reports" }, { slug: "notes" }]}
       />,
     );
 
-    expect(html).toContain("All published artifacts");
-    expect(html).toContain("config/app.json");
-    expect(html).toContain("notes.md");
+    expect(html).toContain("Published artifacts");
+    expect(html).toContain("Each immediate folder under the publishing root is one artifact");
+    expect(html).toContain("reports");
+    expect(html).toContain("notes");
+    expect(html).toContain("/dashboard/team-1/artifacts/reports");
     expect(html).toContain("Next page");
   });
 
-  it("preserves nested folder prefixes in artifact pagination", async () => {
+  it("browses nested files within a single artifact", async () => {
     const html = await renderToString(
-      <ArtifactsPage
+      <ArtifactDetailPage
         session={session("sidebar")}
-        currentPrefix="reports/daily/"
+        artifact="reports"
         nextCursor="next-page"
-        objects={[{ path: "reports/daily/today.json", size: 16, uploadedAt: "2026-09-24T10:00:00.000Z" }]}
+        files={[{ path: "daily/today.json", size: 16, uploadedAt: "2026-09-24T10:00:00.000Z" }]}
       />,
     );
 
-    expect(html).toContain("prefix=reports%2Fdaily&amp;");
+    expect(html).toContain("daily/today.json");
+    expect(html).toContain('href="/w3dev/reports/daily/today.json"');
     expect(html).toContain("cursor=next-page");
   });
 
-  it("uses a path filter instead of incomplete delimiter folder pagination", async () => {
+  it("shows an explicit empty state when the team has no artifact directories", async () => {
     const html = await renderToString(
       <ArtifactsPage
         session={session("sidebar")}
-        currentPrefix="reports/"
         nextCursor={null}
-        objects={[]}
+        artifacts={[]}
       />,
     );
 
-    expect(html).toContain('name="prefix"');
-    expect(html).toContain('value="reports"');
-    expect(html).toContain("Clear");
     expect(html).toContain("No artifacts found");
+    expect(html).toContain("Create a non-empty folder under ~/.agents/artifacts");
   });
 
-  it("prioritizes recent artifacts and drops the base URL panel on the overview", async () => {
+  it("shows artifact directories on the overview and drops the base URL panel", async () => {
     const html = await renderToString(
       <OverviewPage
         session={session("sidebar")}
-        artifacts={[
-          { path: "reports/today.json", size: 16, uploadedAt: "2026-09-24T12:00:00.000Z" },
-          { path: "notes.md", size: 32, uploadedAt: "2026-09-24T09:00:00.000Z" },
-        ]}
+        artifacts={[{ slug: "reports" }, { slug: "notes" }]}
         counts={{ tokens: 2, devices: 1 }}
       />,
     );
@@ -117,54 +110,63 @@ describe("dashboard server rendering", () => {
     expect(html).not.toContain("Private artifact base URL");
     expect(html).not.toContain("8+");
     expect(html).toContain("View all artifacts");
-    expect(html.indexOf("Recent artifacts")).toBeGreaterThan(html.indexOf("Team overview"));
-    expect(html.indexOf('aria-label="Workspace summary"')).toBeGreaterThan(html.indexOf("Recent artifacts"));
+    expect(html).toContain("Each directory is one artifact with its own files");
+    expect(html.indexOf('aria-label="Workspace summary"')).toBeGreaterThan(html.indexOf("Each directory is one artifact"));
   });
 
-  it("sorts recent artifacts by upload time across R2 pages", async () => {
-    const buckets: Record<string, { objects: Array<{ key: string; size: number; uploaded: Date; httpEtag: string }>; truncated: boolean; cursor?: string }> = {
-      start: {
-        objects: [
-          { key: "uploads/team-1/artifacts/zeta.txt", size: 1, uploaded: new Date("2026-09-20T10:00:00.000Z"), httpEtag: '"a"' },
-          { key: "uploads/team-1/artifacts/alpha.txt", size: 1, uploaded: new Date("2026-09-24T10:00:00.000Z"), httpEtag: '"b"' },
-        ],
-        truncated: true,
-        cursor: "page-2",
-      },
-      "page-2": {
-        objects: [
-          { key: "uploads/team-1/artifacts/middle.txt", size: 1, uploaded: new Date("2026-09-22T10:00:00.000Z"), httpEtag: '"c"' },
-        ],
-        truncated: false,
-      },
-    };
-    const env = { ARTIFACTS_BUCKET: { list: async ({ cursor }: { cursor?: string }) => buckets[cursor ?? "start"] } };
-
-    const result = await listRecentArtifacts(env as never, "team-1");
-    if (result instanceof Response) throw new Error("expected recent artifacts");
-    expect(result.objects.map((object) => object.path)).toEqual(["alpha.txt", "middle.txt", "zeta.txt"]);
-    expect(result.scanned).toBe(3);
-    expect(result.truncated).toBe(false);
-  });
-
-  it("caps the recent artifact scan and reports truncation", async () => {
+  it("paginates R2 artifact prefixes and excludes invalid and root-level entries", async () => {
+    const calls: R2ListOptions[] = [];
     const env = {
       ARTIFACTS_BUCKET: {
-        list: async () => ({
-          objects: [
-            { key: "uploads/team-1/artifacts/a.txt", size: 1, uploaded: new Date("2026-09-24T10:00:00.000Z"), httpEtag: '"a"' },
-            { key: "uploads/team-1/artifacts/b.txt", size: 1, uploaded: new Date("2026-09-24T09:00:00.000Z"), httpEtag: '"b"' },
-          ],
-          truncated: true,
-          cursor: "more",
-        }),
+        async list(options: R2ListOptions) {
+          calls.push(options);
+          return {
+            objects: [{ key: `${options.prefix}loose.txt`, size: 1, uploaded: new Date(), httpEtag: '"loose"' }],
+            delimitedPrefixes: [
+              `${options.prefix}alpha/`,
+              `${options.prefix}beta/`,
+              `${options.prefix}bad_name/`,
+              "uploads/another-team/artifacts/foreign/",
+            ],
+            truncated: true,
+            cursor: "page-2",
+          };
+        },
       },
     };
 
-    const result = await listRecentArtifacts(env as never, "team-1", 8, 2);
-    if (result instanceof Response) throw new Error("expected recent artifacts");
-    expect(result.scanned).toBe(2);
-    expect(result.truncated).toBe(true);
+    const result = await listDashboardArtifacts(env as never, "team-1", null, 10);
+    if (result instanceof Response) throw new Error("expected artifact page");
+    expect(result.items).toEqual([{ slug: "alpha" }, { slug: "beta" }]);
+    expect(result.nextCursor).toBe("page-2");
+    expect(calls[0]).toMatchObject({ prefix: "uploads/team-1/artifacts/", delimiter: "/", limit: 10 });
+  });
+
+  it("lists nested files relative to one artifact prefix", async () => {
+    const env = {
+      ARTIFACTS_BUCKET: {
+        async list(options: R2ListOptions) {
+          return {
+            objects: [{
+              key: `${options.prefix}nested/output.json`,
+              size: 16,
+              uploaded: new Date("2026-09-24T10:00:00.000Z"),
+              httpEtag: '"file"',
+            }],
+            delimitedPrefixes: [],
+            truncated: false,
+          };
+        },
+      },
+    };
+    const result = await listDashboardArtifactFiles(env as never, "team-1", "reports", null);
+    if (result instanceof Response) throw new Error("expected artifact files");
+    expect(result.items).toEqual([{
+      path: "nested/output.json",
+      size: 16,
+      uploadedAt: "2026-09-24T10:00:00.000Z",
+      etag: '"file"',
+    }]);
   });
 
   it("shows one-time token material and team-wide credential scope", async () => {

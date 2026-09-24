@@ -14,7 +14,7 @@ import { authError, noStoreHeaders, withNoStore } from "./auth/middleware.ts";
 import { handleTeam, handleTeamApiTokens, handleTeamDevices } from "./auth/team-routes.ts";
 import type { GatewayEnv } from "./auth/types.ts";
 import { getWebIdentity } from "./auth/web-session.ts";
-import { listArtifacts, serveArtifact, uploadArtifact } from "./content/routes.ts";
+import { listArtifactFiles, listArtifacts, serveArtifact, uploadArtifact } from "./content/routes.ts";
 import { AuthPage } from "./web/auth-page.tsx";
 import { authScript, authStyles } from "./web/auth-assets.ts";
 import { registerDashboardRoutes } from "./web/dashboard-routes.tsx";
@@ -56,6 +56,7 @@ app.post("/__api/v1/device/poll", (c) => handleDevicePoll(c.req.raw, c.env));
 app.post("/__api/v1/device/approve", (c) => handleDeviceApprove(c.req.raw, c.env));
 app.put("/__api/v1/uploads", (c) => uploadArtifact(c.req.raw, c.env));
 app.get("/__api/v1/artifacts", (c) => listArtifacts(c.req.raw, c.env));
+app.get("/__api/v1/artifacts/:artifactSlug/files", (c) => listArtifactFiles(c.req.raw, c.env, c.req.param("artifactSlug")));
 
 app.get("*", async (c) => {
   const url = new URL(c.req.url);

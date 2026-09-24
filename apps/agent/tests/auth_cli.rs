@@ -726,7 +726,8 @@ async fn offline_startup_keeps_new_files_pending_and_recovers_with_rotated_auth(
     let mut daemon = spawn_daemon(&home, &auth_path, &publishing_path, None, None);
     wait_for_daemon_ready(&home).await;
 
-    let artifact = root.join("first.json");
+    let artifact = root.join("first/manifest.json");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     std::fs::write(&artifact, "{\"ok\":true}").unwrap();
     let database = state_database(&home);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -774,7 +775,11 @@ async fn offline_startup_keeps_new_files_pending_and_recovers_with_rotated_auth(
     let saw_upload = tokio::time::timeout(std::time::Duration::from_secs(12), async {
         loop {
             match requests_rx.recv().await {
-                Some(request) if request.starts_with("PUT /__api/v1/uploads?") => break true,
+                Some(request) if request.starts_with("PUT /__api/v1/uploads?") => {
+                    assert!(request.contains("artifact=first"), "{request}");
+                    assert!(request.contains("path=manifest.json"), "{request}");
+                    break true;
+                }
                 Some(_) => {}
                 None => break false,
             }
@@ -850,7 +855,8 @@ async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
             .starts_with("GET /__api/v1/auth/me ")
     );
     wait_for_daemon_ready(&home).await;
-    let artifact = root.join("in-flight.json");
+    let artifact = root.join("in-flight/pending.json");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     std::fs::write(&artifact, "{\"pending\":true}").unwrap();
     let upload_request =
         tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
@@ -883,7 +889,8 @@ async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
     .await
     .unwrap();
 
-    let later = root.join("after-logout.json");
+    let later = root.join("later/after-logout.json");
+    std::fs::create_dir_all(later.parent().unwrap()).unwrap();
     std::fs::write(&later, "{\"still\":\"queued\"}").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

@@ -15,7 +15,7 @@ Optional publishing settings live at `~/.agents/artifacts/config.json`:
 }
 ```
 
-The directory containing that file is watched. If the file is absent, the daemon creates and watches `~/.agents/artifacts/`, uses default sync settings, and takes the team from the server-validated credential. When present, the file's team must match the credential. The local `config.json` is not uploaded and cannot select the server destination.
+The directory containing that file is the artifact root. Every immediate child directory is one artifact, named by its exact lowercase URL-safe folder name; files and nested folders inside it stay together. Empty folders, invalid slug names, and loose files directly under the root are not uploaded. If the config is absent, the daemon creates and watches `~/.agents/artifacts/` with default sync settings and takes the team from the server-validated credential. When present, its team must match the credential. The local `config.json` is not uploaded and cannot select the server destination.
 
 Build the CLI with Rust 1.88 or newer:
 
@@ -52,7 +52,7 @@ Service management uses macOS `launchd` or Linux `systemd --user`, requires no r
 Open `https://artifact.w3dev.app` after signing in to:
 
 - switch between every team membership and inspect the current role;
-- browse every artifact published under the selected team with cursor pagination and path-prefix filtering;
+- browse artifacts under the selected team, then open an artifact to browse its files;
 - connect CLI devices and view active personal or team-wide devices;
 - create one-time team-scoped API tokens and revoke credentials;
 - change an owned team slug while preserving permanent redirects from previous artifact URLs.
@@ -67,4 +67,4 @@ bun run test:gateway
 bun run check:gateway
 ```
 
-The daemon recursively reconciles the configured artifact directory at startup and uploads new or modified files after the configured debounce. It preserves queued work across connectivity failures. The Worker derives each R2 object key from the authenticated team identity; API/device credentials are limited to one team. Cloudflare administrative and R2 credentials remain server-side; running the CLI requires neither.
+The daemon reconciles every artifact directory at startup, watches the root recursively, and uploads new or modified files after the configured debounce. It preserves queued work across connectivity failures. R2 objects use `uploads/<authenticated-team-id>/artifacts/<artifact-slug>/<path-inside-artifact>`; the Worker derives the team prefix from the authenticated identity. API/device credentials are limited to one team. Cloudflare administrative and R2 credentials remain server-side; running the CLI requires neither.
