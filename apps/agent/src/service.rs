@@ -687,8 +687,7 @@ fn confirm_existing_artifact_uploads_interactive(
     }
     if !interactive {
         return Err(ServiceError::Message(format!(
-            "{} existing artifact(s) may upload when the service starts; rerun with `artifact-sync service {operation} --yes` to confirm",
-            artifact_count,
+            "{artifact_count} existing artifact(s) may upload when the service starts; rerun with `artifact-sync service {operation} --yes` to confirm",
         )));
     }
     print!(

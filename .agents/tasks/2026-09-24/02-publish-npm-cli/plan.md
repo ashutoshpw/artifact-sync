@@ -41,7 +41,7 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 - [ ] Confirm the publishing account can reserve the unscoped name `artifact-sync` on npm.
 - [x] Add the package manifest, launcher, README, license, and launcher tests.
 - [x] Add the staging script and verify it rejects missing, mismatched, or unverified release binaries.
-- [x] Add the Linux x64 target matrix using the Rust 1.85 toolchain and locked Cargo dependencies.
+- [x] Add the Linux x64 target matrix using the Rust 1.88 toolchain and locked Cargo dependencies.
 - [x] Add the main-branch workflow with least-privilege permissions, npm authentication, provenance, and a duplicate-version no-op.
 - [x] Run `npm pack --dry-run` and inspect the tarball contents for the wrapper, all supported binaries, README, and license only.
 - [x] Install the packed tarball in a clean temporary directory and verify `artifact-sync --version` plus argument and stdin forwarding.
