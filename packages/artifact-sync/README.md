@@ -55,4 +55,4 @@ The npm package currently supports Linux x64 and uses `systemd --user`; it does 
 
 ## Supported platforms
 
-The initial npm release supports Linux x64 with glibc. macOS, Linux arm64, and Windows support are not included in this first release. Windows support is tracked in [issue #1](https://github.com/ashutoshpw/artifact-sync/issues/1).
+The npm release supports Linux x64 with glibc. macOS, Linux arm64, and Windows support are not included in this release. Windows support is tracked in [issue #1](https://github.com/ashutoshpw/artifact-sync/issues/1).

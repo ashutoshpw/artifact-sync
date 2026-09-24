@@ -1,6 +1,6 @@
 {
   "name": "artifact-sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Watch and publish local artifacts to a team-scoped artifact gateway.",
   "license": "MIT",
   "repository": {

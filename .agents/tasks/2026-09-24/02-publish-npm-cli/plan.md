@@ -8,7 +8,7 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 
 ## Context
 - The monorepo root `package.json` is private and contains the Bun gateway workspace; it must not be published as the CLI package.
-- The executable is the Rust package `artifact-sync` in `apps/agent/Cargo.toml`, currently version `0.1.1`.
+- The executable is the Rust package `artifact-sync` in `apps/agent/Cargo.toml`, currently version `0.1.2`.
 - The existing `deploy.yml` workflow deploys the gateway and does not build or publish the Rust CLI.
 - The current agent uses Unix-only filesystem, locking, socket, and signal APIs. The first release will support Linux x64 with glibc; macOS and Windows support are deferred, with Windows tracked separately in [#1](https://github.com/ashutoshpw/artifact-sync/issues/1).
 - The working tree contains unrelated gateway changes; implementation must stage only the packaging, documentation, and release-workflow files.
@@ -59,9 +59,9 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 
 ## Status
 - Package sources, launcher tests, staging validation, Rust tests, gateway tests, typecheck, and local tarball installation are complete.
-- The initial `0.1.0` package is published and contains the service command; the npm README now documents service mode for the `0.1.1` release.
-- The first release remains intentionally limited to Linux x64; the `0.1.1` package is staged and locally verified at `dist/npm/artifact-sync`.
-- Trusted Publishing configuration, commit, push, and `0.1.1` publication remain pending.
+- The initial `0.1.0` package is published and contains the service command; `0.1.1` was published with provenance and service-mode documentation.
+- The `0.1.1` artifact built on Ubuntu 24.04 requires a newer glibc than older Linux hosts; `0.1.2` will build on Ubuntu 22.04 for broader compatibility.
+- The `0.1.2` package remains limited to Linux x64 and is pending publication.
 
 ## Out of scope
 - macOS and Linux arm64 npm binaries for the first release.
