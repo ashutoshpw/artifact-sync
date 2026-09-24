@@ -19,18 +19,20 @@ The deployment workflow and application are implemented locally. Finish Cloudfla
 - [x] Run gateway tests, typecheck, Wrangler dry-run, and workflow validation.
 - [x] Confirm publisher-token ID/expiry choice: `w3dev-workstation`, 90 days.
 - [x] Issue the publisher token and save only hash/metadata to the ignored local registry.
-- [x] Configure all three runtime secrets on Worker `artifact-sync-gateway` (user-confirmed; deployment must still validate them); do not add R2 credentials to GitHub Actions.
-- [ ] Push the verified main commit and confirm the GitHub deployment workflow succeeds.
-- [ ] Verify `/__api/v1/auth/me` returns `401` with `Cache-Control: no-store` without credentials.
-- [ ] Use the raw token over stdin for `artifact-sync login`; verify `whoami` reports the authorized identity/team and test a safe sample upload.
+- [x] Activate the publisher-token registry on Worker `artifact-sync-gateway`; live login and `whoami` now validate it. R2 credential exchange remains a separate pending smoke test; do not add R2 credentials to GitHub Actions.
+- [x] Push the verified main commit and confirm the GitHub deployment workflow succeeds.
+- [x] Verify `/__api/v1/auth/me` returns `401` with `Cache-Control: no-store` without credentials.
+- [x] Activate the valid publisher registry secret, use the raw token over stdin for `artifact-sync login`, and verify `whoami` reports the authorized identity/team from the auth file.
+- [ ] Perform a live R2 upload smoke test with an explicitly chosen disposable artifact; the current publishing config is absent, and this publisher cannot delete uploaded objects.
 
 ## Acceptance criteria
 - [x] PRs and non-main dispatches cannot deploy; forks cannot access deployment credentials.
 - [x] Main deploy uses locked Bun/Wrangler versions and does not pass Worker runtime secrets through GitHub.
 - [x] Wrangler dry-run validates the custom-domain config; docs show the selected production origin.
-- [ ] The deployed Worker is live on `artifact.w3dev.app` with required secrets and R2 bucket binding.
-- [ ] The publisher token is stored in the worker registry by hash and in the current user's protected auth file after successful login; no raw token is left in repo files, chat, or logs.
-- [ ] Authenticated identity and upload path are verified end-to-end; temporary R2 credentials remain team-prefix scoped and short-lived.
+- [x] The deployed Worker is live on `artifact.w3dev.app` with a valid active publisher registry secret.
+- [x] The publisher token is stored in the worker registry by hash and in the current user's protected auth file after successful login; no raw token is left in repo files, chat, or logs.
+- [x] The authenticated identity is verified against the live server with credential source `auth file`.
+- [ ] Verify the live R2 credential exchange and upload path end-to-end; temporary credentials must remain team-prefix scoped and short-lived.
 
 ## References
 - `models.dev/.github/workflows/deploy.yml` — deployment trigger and repository-guard reference.
