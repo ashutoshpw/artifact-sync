@@ -8,7 +8,7 @@
     "db:generate": "bunx drizzle-kit generate",
     "db:migrate:local": "bunx wrangler d1 migrations apply artifact-db --local",
     "db:migrate:remote": "bunx wrangler d1 migrations apply artifact-db --remote",
-    "test": "bun test",
+    "test": "bun test --jsx-import-source hono/jsx",
     "check": "bunx tsc --noEmit"
   },
   "devDependencies": {
@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "better-auth": "^1.7.5",
-    "drizzle-orm": "^0.45.3"
+    "drizzle-orm": "^0.45.3",
+    "hono": "^4.13.9"
   }
 }

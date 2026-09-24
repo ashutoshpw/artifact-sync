@@ -4,7 +4,7 @@
   "packageManager": "bun@1.4.2",
   "workspaces": ["apps/gateway"],
   "scripts": {
-    "test:gateway": "bun test apps/gateway/test",
+    "test:gateway": "bun test --jsx-import-source hono/jsx apps/gateway/test",
     "check:gateway": "bunx tsc --noEmit -p apps/gateway/tsconfig.json"
   }
 }

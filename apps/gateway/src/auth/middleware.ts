@@ -15,6 +15,27 @@ export function noStoreHeaders(headers?: HeadersInit): Headers {
   return result;
 }
 
+export function withNoStore(response: Response): Response {
+  try {
+    response.headers.set("Cache-Control", "no-store");
+    response.headers.set("Pragma", "no-cache");
+    return response;
+  } catch {
+    const headers = new Headers();
+    response.headers.forEach((value, name) => {
+      if (name.toLowerCase() !== "set-cookie") headers.append(name, value);
+    });
+    for (const cookie of response.headers.getSetCookie()) headers.append("Set-Cookie", cookie);
+    headers.set("Cache-Control", "no-store");
+    headers.set("Pragma", "no-cache");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+}
+
 export async function authenticate(request: Request, env: GatewayEnv): Promise<AuthContext | Response> {
   const authorization = request.headers.get("Authorization");
   const match = authorization?.match(/^Bearer ([A-Za-z0-9_.-]+)$/);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import worker from "../src/index.ts";
+import worker from "../src/index.tsx";
+import { withNoStore } from "../src/auth/middleware.ts";
 import { issueAccessToken } from "../src/auth/jwt.ts";
 import { ACCESS_TOKEN_SECONDS, PUBLISH_PERMISSION, READ_PERMISSION } from "../src/auth/types.ts";
 
@@ -187,15 +188,26 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     });
   });
 
-  it("serves login, API-token, and device routes without embedding credentials", async () => {
+  it("serves provider-first login and protects protected routes", async () => {
     const { env } = makeEnv();
     const login = await worker.fetch(request("/auth/login"), env);
     expect(login.status).toBe(200);
     const loginHtml = await login.text();
-    expect(loginHtml).toContain("sign-up/email");
-    expect(loginHtml).toContain("sign-in/social");
+    expect(loginHtml).toContain("Continue with GitHub");
+    expect(loginHtml).toContain("Continue with email");
+    expect(loginHtml).toContain('id="email-panel"');
+    expect(loginHtml).toContain('hidden=""');
+    expect(loginHtml).toContain('/assets/auth.js');
     expect(loginHtml).not.toContain(JWT_SECRET);
     expect(login.headers.get("Cache-Control")).toBe("no-store");
+    expect(login.headers.get("Content-Security-Policy")).not.toContain("unsafe-inline");
+
+    const script = await worker.fetch(request("/assets/auth.js"), env);
+    expect(script.status).toBe(200);
+    expect(script.headers.get("Content-Type")).toContain("text/javascript");
+    const scriptBody = await script.text();
+    expect(scriptBody).toContain("sign-up/email");
+    expect(scriptBody).toContain("sign-in/social");
 
     const tokens = await worker.fetch(request("/settings/api-tokens"), env);
     expect(tokens.status).toBe(302);
@@ -206,12 +218,30 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(device.headers.get("Location")).toContain("returnTo=%2Fauth%2Fdevice");
   });
 
-  it("escapes untrusted return paths before embedding them in an inline script", async () => {
+  it("replaces untrusted return paths with the safe dashboard fallback", async () => {
     const { env } = makeEnv();
     const login = await worker.fetch(request("/auth/login?returnTo=%2F%3C%2Fscript%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"), env);
     const html = await login.text();
 
     expect(html).not.toContain("</script><script>alert(1)</script>");
-    expect(html).toContain("\\u003c/script\\u003e\\u003cscript\\u003ealert(1)");
+    expect(html).toContain('data-return-to="/settings/api-tokens"');
+  });
+
+  it("preserves multiple authentication cookies while adding no-store headers", () => {
+    const original = new Response("ok", {
+      headers: [
+        ["Content-Type", "application/json"],
+        ["Set-Cookie", "session=one; Path=/; HttpOnly; Secure; SameSite=Lax"],
+        ["Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"],
+      ],
+    });
+
+    const response = withNoStore(original);
+    expect(response.headers.getSetCookie()).toEqual([
+      "session=one; Path=/; HttpOnly; Secure; SameSite=Lax",
+      "oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+    ]);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Pragma")).toBe("no-cache");
   });
 });
