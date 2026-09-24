@@ -46,7 +46,7 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 - [x] Run `npm pack --dry-run` and inspect the tarball contents for the wrapper, all supported binaries, README, and license only.
 - [x] Install the packed tarball in a clean temporary directory and verify `artifact-sync --version` plus argument and stdin forwarding.
 - [x] Push a versioned release to `main` and confirm Trusted Publishing publication.
-- [ ] Push again without a version change and confirm the workflow safely skips publication.
+- [x] Push again without a version change and confirm the workflow safely skips publication.
 - [x] Update the plan status with implementation and verification results.
 
 ## Acceptance criteria
@@ -62,7 +62,7 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 - Package sources, launcher tests, staging validation, Rust tests, gateway tests, typecheck, and local tarball installation are complete.
 - The initial `0.1.0` package is published and contains the service command; `0.1.1` was published with provenance and service-mode documentation.
 - The `0.1.1` artifact built on Ubuntu 24.04 requires a newer glibc than older Linux hosts; `0.1.2` was built on Ubuntu 22.04 for broader compatibility.
-- `artifact-sync@0.1.2` is published through the Trusted Publishing workflow with provenance and verified from the npm registry; the remaining platform expansion is out of scope.
+- `artifact-sync@0.1.2` is published through the Trusted Publishing workflow with provenance and verified from the npm registry; a same-version workflow run confirmed the publish step safely skips duplicates.
 
 ## Out of scope
 - macOS and Linux arm64 npm binaries for the first release.
