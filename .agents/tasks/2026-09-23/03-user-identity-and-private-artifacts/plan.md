@@ -26,9 +26,11 @@ Replace operator-issued device publisher tokens with human signup/login, team-sc
 - [x] Replace public content and temporary-credential routes with private listing/read/upload routes.
 - [x] Update Rust CLI credential lifecycle and server-derived team/object-key contract.
 - [x] Document configuration/deployment prerequisites and verify tests/builds.
+- [x] Deploy the D1-backed gateway and verify the production login page and GitHub OAuth initiation.
 
 ## Acceptance criteria
 - [x] The Worker D1 configuration targets the provisioned database and its initial identity/team migration is applied remotely.
+- [x] The production Worker is deployed with the D1 binding, and its GitHub OAuth start endpoint uses the configured client ID.
 - [ ] Verified email or GitHub signup creates a user, unique team slug, and admin membership atomically/idempotently.
 - [ ] Each API/device credential is scoped to one team; access JWT verification is local and refresh is rotating/revocable.
 - [ ] Private `/<team-slug>/<relative-path>` reads map to the team-ID R2 prefix and deny unauthorized teams.
