@@ -45,8 +45,9 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 - [x] Add the main-branch workflow with least-privilege permissions, npm authentication, provenance, and a duplicate-version no-op.
 - [x] Run `npm pack --dry-run` and inspect the tarball contents for the wrapper, all supported binaries, README, and license only.
 - [x] Install the packed tarball in a clean temporary directory and verify `artifact-sync --version` plus argument and stdin forwarding.
-- [ ] Push a versioned release to `main`, confirm publication, then push again without a version change and confirm the workflow safely skips publication.
-- [x] Update the plan status with implementation and verification results; publication remains pending.
+- [x] Push a versioned release to `main` and confirm Trusted Publishing publication.
+- [ ] Push again without a version change and confirm the workflow safely skips publication.
+- [x] Update the plan status with implementation and verification results.
 
 ## Acceptance criteria
 - [x] A clean npm install from the packed tarball exposes the `artifact-sync` command on the supported Linux x64 target.
@@ -54,14 +55,14 @@ Publish the Rust CLI as the public unscoped npm package `artifact-sync`, so user
 - [x] The launcher forwards CLI arguments, stdin, output, errors, signals, and exit status correctly.
 - [x] Unsupported platforms fail with an actionable message and no unusable binary is advertised.
 - [x] The package version matches the Rust release version and the workflow never overwrites an existing npm version.
-- [ ] The workflow runs only for the intended repository/main ref, uses npm trusted publishing or a protected secret, and publishes provenance.
+- [x] The workflow runs only for the intended repository/main ref, uses npm trusted publishing or a protected secret, and publishes provenance.
 - [x] The packed tarball contains no source secrets, build intermediates, or unrelated gateway files.
 
 ## Status
 - Package sources, launcher tests, staging validation, Rust tests, gateway tests, typecheck, and local tarball installation are complete.
 - The initial `0.1.0` package is published and contains the service command; `0.1.1` was published with provenance and service-mode documentation.
-- The `0.1.1` artifact built on Ubuntu 24.04 requires a newer glibc than older Linux hosts; `0.1.2` will build on Ubuntu 22.04 for broader compatibility.
-- The `0.1.2` package remains limited to Linux x64 and is pending publication.
+- The `0.1.1` artifact built on Ubuntu 24.04 requires a newer glibc than older Linux hosts; `0.1.2` was built on Ubuntu 22.04 for broader compatibility.
+- `artifact-sync@0.1.2` is published through the Trusted Publishing workflow with provenance and verified from the npm registry; the remaining platform expansion is out of scope.
 
 ## Out of scope
 - macOS and Linux arm64 npm binaries for the first release.
