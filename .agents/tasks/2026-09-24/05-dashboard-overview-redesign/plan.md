@@ -28,7 +28,7 @@ Make the team overview lead with recent artifacts, reduce the team-name typograp
 - [x] Move the account menu into `.sidebar-foot` with responsive visibility and an upward popover
 - [x] Extend `dashboardScript` with Escape, `aria-expanded`, and focus return
 - [x] Update `dashboard.test.tsx`: overview order, base URL absent, recency sort, menu placement per layout
-- [ ] Run `bun run test:gateway` and `bun run check:gateway`, commit, push, deploy via GitHub Actions
+- [x] Run `bun run test:gateway` and `bun run check:gateway`, commit, push, deploy via GitHub Actions
 - [ ] User manual QA of sidebar, topnav, and mobile
 
 ## Acceptance criteria
