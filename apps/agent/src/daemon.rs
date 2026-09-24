@@ -4,7 +4,7 @@ use crate::auth::commands::{
 };
 use crate::auth::credentials::ActiveCredential;
 use crate::auth::store::CredentialStore;
-use crate::config::{PublishingConfig, load_publishing_config};
+use crate::config::{SyncConfig, load_optional_publishing_config};
 use crate::state::{PendingItem, StateError, SyncState};
 use crate::upload::{UploadError, UploadManager, UploadOutcome};
 use chrono::Utc;
@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const PUBLISH_PERMISSION: &str = "artifacts:publish";
+
+struct DaemonConfig {
+    selected_team: Option<String>,
+    sync: SyncConfig,
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -58,14 +63,20 @@ enum LoopEvent {
 pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), DaemonError> {
     validate_auth_path(&auth_path, &publishing_path)
         .map_err(|error| DaemonError::Message(error.to_string()))?;
-    let config = load_publishing_config(&publishing_path)?;
+    let publishing = load_optional_publishing_config(&publishing_path)?;
     let root = publishing_path
         .parent()
         .ok_or_else(|| DaemonError::Message("publishing config has no parent directory".into()))?
         .to_path_buf();
-    if !root.is_dir() {
-        return Err(DaemonError::Message("artifact root does not exist".into()));
-    }
+    fs::create_dir_all(&root)?;
+    let config = DaemonConfig {
+        selected_team: publishing
+            .as_ref()
+            .map(|publishing| publishing.team.clone()),
+        sync: publishing
+            .map(|publishing| publishing.sync)
+            .unwrap_or_default(),
+    };
 
     let state = Arc::new(SyncState::open_default()?);
     let store = Arc::new(CredentialStore::new(auth_path.clone()));
@@ -89,7 +100,16 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
         .map_err(|error| DaemonError::Message(error.to_string()))?
         .ok_or_else(|| DaemonError::Message("team credentials are missing; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN and ARTIFACT_SYNC_SERVER_URL".into()))?;
 
-    let mut manager = authenticate_for_daemon(&mut active, &store, &config).await?;
+    // Without a publishing config, the cached team is only a selection hint:
+    // the gateway still verifies the credential and confirms this team before
+    // any upload can be scheduled.
+    let mut expected_team = config.selected_team.clone().or_else(|| {
+        active
+            .cached_auth
+            .as_ref()
+            .map(|auth| auth.cached_identity.team.clone())
+    });
+    let mut manager = authenticate_for_daemon(&mut active, &store, &mut expected_team).await?;
     let mut auth_paused = false;
     let mut auth_retry_delay = Duration::from_secs(1);
     let mut auth_retry_at = Instant::now() + auth_retry_delay;
@@ -121,7 +141,7 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
     tokio::pin!(shutdown_signal);
     let mut terminate_signal =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    info!(team = %config.team, root = %root.display(), "artifact sync daemon started");
+    info!(team = expected_team.as_deref().unwrap_or("resolved from credential"), root = %root.display(), "artifact sync daemon started");
 
     loop {
         let event = tokio::select! {
@@ -190,7 +210,7 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                         .reset(Instant::now() + Duration::from_secs(24 * 60 * 60));
                     reload_auth(
                         &store,
-                        &config,
+                        &mut expected_team,
                         &mut manager,
                         &mut cancellation,
                         &mut auth_paused,
@@ -253,7 +273,7 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                 auth_reload_armed = false;
                 reload_auth(
                     &store,
-                    &config,
+                    &mut expected_team,
                     &mut manager,
                     &mut cancellation,
                     &mut auth_paused,
@@ -264,7 +284,9 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                 if manager.is_none() && !auth_paused && Instant::now() >= auth_retry_at {
                     match resolve_active_credential(&store) {
                         Ok(Some(mut active)) => {
-                            match authenticate_for_daemon(&mut active, &store, &config).await {
+                            match authenticate_for_daemon(&mut active, &store, &mut expected_team)
+                                .await
+                            {
                                 Ok(Some(next)) => {
                                     manager = Some(next);
                                     auth_retry_delay = Duration::from_secs(1);
@@ -335,15 +357,19 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
 async fn authenticate_for_daemon(
     active: &mut ActiveCredential,
     store: &CredentialStore,
-    config: &PublishingConfig,
+    expected_team: &mut Option<String>,
 ) -> Result<Option<Arc<UploadManager>>, DaemonError> {
     match validate_active_credential(active, store).await {
         Ok(identity) => {
-            if identity.team != config.team {
-                return Err(DaemonError::Message(format!(
-                    "credential is authorized for team '{}' but publishing config selects '{}'",
-                    identity.team, config.team
-                )));
+            if let Some(expected) = expected_team.as_deref() {
+                if identity.team != expected {
+                    return Err(DaemonError::Message(format!(
+                        "credential is authorized for team '{}' but this daemon is bound to '{}'",
+                        identity.team, expected
+                    )));
+                }
+            } else {
+                *expected_team = Some(identity.team.clone());
             }
             if !identity
                 .permissions
@@ -354,14 +380,14 @@ async fn authenticate_for_daemon(
                     "credential lacks artifacts:publish permission".into(),
                 ));
             }
-            Ok(Some(make_upload_manager(active, &identity, config, store)?))
+            Ok(Some(make_upload_manager(active, &identity, store)?))
         }
         Err(AuthClientError::Unavailable) => Ok(None),
         Err(AuthClientError::InvalidCredential) => Err(DaemonError::Message(
             "team credential is invalid, expired, or revoked; run artifact-sync login".into(),
         )),
         Err(AuthClientError::Forbidden) => Err(DaemonError::Message(
-            "authenticated account lacks publishing permission for the configured team".into(),
+            "authenticated account lacks publishing permission for the authorized team".into(),
         )),
         Err(error) => Err(DaemonError::Message(format!(
             "authentication could not be validated: {error}"
@@ -372,7 +398,6 @@ async fn authenticate_for_daemon(
 fn make_upload_manager(
     active: &ActiveCredential,
     identity: &crate::auth::credentials::PublisherIdentity,
-    config: &PublishingConfig,
     store: &CredentialStore,
 ) -> Result<Arc<UploadManager>, DaemonError> {
     let client = crate::auth::client::AuthClient::new(active.server_origin.clone())
@@ -380,7 +405,7 @@ fn make_upload_manager(
     Ok(Arc::new(UploadManager::new(
         client,
         active,
-        config.team.clone(),
+        identity.team.clone(),
         identity.expires_at,
         store,
     )))
@@ -388,7 +413,7 @@ fn make_upload_manager(
 
 async fn reload_auth(
     store: &CredentialStore,
-    config: &PublishingConfig,
+    expected_team: &mut Option<String>,
     manager: &mut Option<Arc<UploadManager>>,
     cancellation: &mut CancellationToken,
     auth_paused: &mut bool,
@@ -409,7 +434,7 @@ async fn reload_auth(
             return;
         }
     };
-    match authenticate_for_daemon(&mut active, store, config).await {
+    match authenticate_for_daemon(&mut active, store, expected_team).await {
         Ok(Some(next)) => {
             *manager = Some(next);
             info!(
@@ -444,7 +469,7 @@ fn schedule_uploads(
     state: &SyncState,
     manager: &Arc<UploadManager>,
     root: &Path,
-    config: &PublishingConfig,
+    config: &DaemonConfig,
     cancellation: &CancellationToken,
     jobs: &mut JoinSet<JobResult>,
     in_flight: &mut HashSet<String>,

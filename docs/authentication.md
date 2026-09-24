@@ -18,7 +18,7 @@ Because access JWT verification is stateless, revoking an API/device token block
 
 ## CLI and watched directory
 
-Publishing configuration remains at `~/.agents/artifacts/config.json`:
+Optional publishing configuration lives at `~/.agents/artifacts/config.json`:
 
 ```json
 {
@@ -31,7 +31,7 @@ Publishing configuration remains at `~/.agents/artifacts/config.json`:
 }
 ```
 
-The directory containing the selected publishing config is the artifact root. The daemon recursively reconciles existing files at startup and watches that root. New and modified files are queued after the debounce period and uploaded with the credential scoped to the configured team. A changed file is re-read before upload so a newer edit is not marked complete using stale bytes. The publishing config, auth config, symlinks, and `.artifact-sync` state are excluded. Deleting a local file does not delete an R2 object.
+The directory containing the selected publishing config is the artifact root. If the default publishing config is absent, the daemon creates and watches `~/.agents/artifacts/` with default sync settings. In that case, the team comes from the authenticated credential; a saved identity cache may select the expected team, but the gateway must validate the credential and confirm that team before uploads are enabled. If a publishing config exists, its team is checked against the server-validated identity and its sync settings are applied. The daemon recursively reconciles existing files at startup and watches the root. New and modified files are queued after the configured debounce period. A changed file is re-read before upload so a newer edit is not marked complete using stale bytes. The publishing config, auth config, symlinks, and `.artifact-sync` state are excluded. Deleting a local file does not delete an R2 object.
 
 The Worker receives the file bytes and relative path over the authenticated gateway request, then derives the key as:
 

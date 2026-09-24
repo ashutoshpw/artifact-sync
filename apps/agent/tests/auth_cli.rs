@@ -243,6 +243,27 @@ fn spawn_daemon(
     )
 }
 
+fn spawn_daemon_without_publishing_config(
+    home: &Path,
+    auth_path: &Path,
+    server_origin: &str,
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_artifact-sync"));
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP", "1")
+        .env("RUST_LOG", "debug")
+        .env("ARTIFACT_SYNC_SERVER_URL", server_origin)
+        .arg("--auth-config")
+        .arg(auth_path)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().unwrap()
+}
+
 async fn wait_for_daemon_ready(home: &Path) {
     let socket_path = home.join(".config/artifact-sync/daemon.sock");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -252,6 +273,38 @@ async fn wait_for_daemon_ready(home: &Path) {
     })
     .await
     .expect("daemon control socket did not appear");
+}
+
+#[tokio::test]
+async fn daemon_starts_from_auth_config_without_publishing_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let artifact_root = home.join(".agents/artifacts");
+    let publishing_path = artifact_root.join("config.json");
+    let auth_path = home.join(".config/artifact-sync/config.json");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_origin = origin(&listener);
+    let (mut requests, server) =
+        sequence_server(listener, vec![MockResponse::json(200, identity("w3dev"))]).await;
+    private_auth(&auth_path, &server_origin);
+
+    let mut daemon = spawn_daemon_without_publishing_config(&home, &auth_path, &server_origin);
+    wait_for_daemon_ready(&home).await;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(request.starts_with("GET /__api/v1/auth/me "));
+    assert!(artifact_root.is_dir());
+    assert!(!publishing_path.exists());
+    assert!(daemon.try_wait().unwrap().is_none());
+
+    daemon.start_kill().unwrap();
+    let _ = daemon.wait().await;
+    server.await.unwrap();
 }
 
 fn state_database(home: &Path) -> std::path::PathBuf {

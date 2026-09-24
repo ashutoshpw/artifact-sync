@@ -2,7 +2,7 @@
 
 `artifact-sync` watches a local artifact directory and publishes changed files to a team-scoped artifact gateway. The CLI and daemon are Rust; the Cloudflare Worker and Drizzle migrations use Bun.
 
-Publishing settings live at `~/.agents/artifacts/config.json`:
+Optional publishing settings live at `~/.agents/artifacts/config.json`:
 
 ```json
 {
@@ -15,7 +15,7 @@ Publishing settings live at `~/.agents/artifacts/config.json`:
 }
 ```
 
-The directory containing that file is watched. The local `config.json` is not uploaded and cannot select the server destination.
+The directory containing that file is watched. If the file is absent, the daemon creates and watches `~/.agents/artifacts/`, uses default sync settings, and takes the team from the server-validated credential. When present, the file's team must match the credential. The local `config.json` is not uploaded and cannot select the server destination.
 
 Build the CLI with Rust 1.85 or newer:
 

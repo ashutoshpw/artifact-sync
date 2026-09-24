@@ -123,6 +123,19 @@ pub fn load_publishing_config(path: &Path) -> Result<PublishingConfig, ConfigErr
     Ok(config)
 }
 
+pub fn load_optional_publishing_config(
+    path: &Path,
+) -> Result<Option<PublishingConfig>, ConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ConfigError::Read(error)),
+    };
+    let config: PublishingConfig = serde_json::from_str(&text)?;
+    config.validate()?;
+    Ok(Some(config))
+}
+
 pub fn path_is_inside(path: &Path, root: &Path) -> Result<bool, std::io::Error> {
     let path = canonicalize_missing_tail(path)?;
     let root = canonicalize_missing_tail(root)?;
@@ -176,6 +189,16 @@ mod tests {
             r#"{"team":"w3dev","serverUrl":"https://evil.example"}"#,
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn optional_publishing_config_accepts_missing_file_but_rejects_malformed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        assert!(load_optional_publishing_config(&path).unwrap().is_none());
+
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(load_optional_publishing_config(&path).is_err());
     }
 
     #[test]
