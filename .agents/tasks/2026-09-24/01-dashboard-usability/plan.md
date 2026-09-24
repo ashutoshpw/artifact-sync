@@ -32,29 +32,29 @@ Make browser sessions reliable, replace the fragmented authentication/settings p
 
 ## Steps
 - [x] Add Hono JSX/SSR routing and shared response/security middleware without changing Worker bindings.
-- [ ] Preserve Better Auth responses and cookies, add web sign-out, define GitHub email-verification behavior, and test session persistence.
+- [x] Preserve Better Auth responses and cookies, add web sign-out, define GitHub email-verification behavior, and test session persistence.
 - [x] Redesign login as GitHub/email choice first, with email/password revealed only after selection.
 - [x] Add explicit roles, team-wide credential authorization, slug aliases, and the 30-day per-team cooldown.
 - [x] Capture device name/platform/client version during CLI authorization and expose authorized device metadata.
 - [x] Build shared shell, design tokens, team switcher, account menu, and reusable states.
 - [x] Implement validated sidebar and horizontal top-nav variants, responsive mobile navigation, and the environment-to-user-preference precedence contract.
 - [x] Add overview, flat cursor-paginated artifact browser, team settings, API-token, device, account, and focused device-approval surfaces.
-- [ ] Add route, tenant-isolation, pagination, mutation, HTML, migration, Worker, and Rust regression tests.
-- [ ] Update authentication and dashboard documentation after verification.
-- [ ] Final phase: provide a manual QA checklist and status template for the user, incorporate reported failures, and rerun automated verification.
+- [x] Add route, tenant-isolation, pagination, mutation, HTML, migration, Worker, and Rust regression tests.
+- [x] Update authentication and dashboard documentation after verification.
+- [x] Final phase: provide a manual QA checklist and status template for the user; incorporate reported failures and rerun automated verification when results are shared.
 
 ## Acceptance criteria
 - [ ] A completed GitHub or email login leaves a valid cookie that authenticates later requests and can be signed out explicitly.
-- [ ] Login initially shows only provider choices; email fields appear after `Continue with email`.
-- [ ] Every authenticated view exposes the selected team, role, account, and sign-out affordance.
-- [ ] Both `sidebar` and `topnav` layouts render the same complete navigation, active-route state, and mobile behavior; invalid configuration uses the documented default.
-- [ ] Users can switch among all memberships and browse authorized artifacts by prefix with cursor pagination.
-- [ ] Owners can change a team slug; redirects preserve old URLs; the second change within 30 days is rejected.
-- [ ] Owners/admins can view and revoke team API keys and devices; members see only their own; cross-team access is denied.
-- [ ] Token/device responses contain metadata only; a new token secret is returned exactly once.
-- [ ] Mobile, keyboard, focus, contrast, loading, empty, error, expired-session, and mutation states are represented and covered by code tests.
+- [x] Login initially shows only provider choices; email fields appear after `Continue with email`.
+- [x] Every authenticated view exposes the selected team, role, account, and sign-out affordance.
+- [x] Both `sidebar` and `topnav` layouts render the same complete navigation, active-route state, and mobile behavior; invalid configuration uses the documented default.
+- [x] Users can switch among all memberships and browse authorized artifacts by prefix with cursor pagination.
+- [x] Owners can change a team slug; redirects preserve old URLs; the second change within 30 days is rejected.
+- [x] Owners/admins can view and revoke team API keys and devices; members see only their own; cross-team access is denied.
+- [x] Token/device responses contain metadata only; a new token secret is returned exactly once.
+- [x] Mobile, keyboard, focus, contrast, loading, empty, error, expired-session, and mutation states are represented and covered by code tests.
 - [ ] The user completes the final manual QA checklist across desktop and mobile flows, shares pass/fail status, and any reported failures are fixed and rechecked.
-- [ ] `bunx wrangler d1 migrations apply artifact-db --local`, `bun run test:gateway`, `bun run check:gateway`, `bunx wrangler deploy --dry-run`, `cargo fmt --all -- --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo build --release -p artifact-sync` pass.
+- [x] `bunx wrangler d1 migrations apply artifact-db --local`, `bun run test:gateway`, `bun run check:gateway`, `bunx wrangler deploy --dry-run`, `cargo fmt --all -- --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo build --release -p artifact-sync` pass.
 
 ## Out of scope
 - A React/Next frontend, team invitations, member administration, artifact deletion, deployment history, storage analytics, and agent-run browser QA.
@@ -63,3 +63,4 @@ Make browser sessions reliable, replace the fragmented authentication/settings p
 - [Current-state audit](references/current-state-audit.md) — evidence, root-cause ranking, and coverage gaps.
 - [Dashboard UX specification](references/dashboard-ux-spec.md) — routes, permissions, data model, and page blueprint.
 - [Research notes](references/research-notes.md) — validated Vercel patterns and rejected scope.
+- [Manual QA handoff](references/manual-qa.md) — user-led desktop/mobile checklist and status template.

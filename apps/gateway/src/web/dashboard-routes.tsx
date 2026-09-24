@@ -181,7 +181,7 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     const authResponse = withNoStore(await createWebAuth(c.env).handler(proxyJsonRequest(c.req.raw, "/__api/auth/sign-out", "POST", { disableRedirect: true })));
     const headers = new Headers({ Location: "/auth/login", "Cache-Control": "no-store", Pragma: "no-cache" });
     authResponse.headers.forEach((value, name) => {
-      if (name.toLowerCase() !== "set-cookie") headers.append(name, value);
+      if (name.toLowerCase() !== "set-cookie") headers.set(name, value);
     });
     for (const cookie of authResponse.headers.getSetCookie()) headers.append("Set-Cookie", cookie);
     return new Response(null, { status: 303, headers });

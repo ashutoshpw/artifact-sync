@@ -24,7 +24,9 @@ function makeEnv() {
   const lookups: string[] = [];
   const env = {
     JWT_SECRET,
+    BETTER_AUTH_SECRET: "test-better-auth-secret-that-is-long-enough",
     APP_ORIGIN: "https://artifact.w3dev.app",
+    DASHBOARD_LAYOUT: "sidebar",
     DB: {},
     EMAIL: {},
     ARTIFACTS_BUCKET: {
@@ -216,6 +218,35 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const device = await worker.fetch(request("/auth/device"), env);
     expect(device.status).toBe(302);
     expect(device.headers.get("Location")).toContain("returnTo=%2Fauth%2Fdevice");
+
+    const dashboard = await worker.fetch(request("/dashboard"), env);
+    expect(dashboard.status).toBe(302);
+    expect(dashboard.headers.get("Location")).toContain("returnTo=%2Fdashboard");
+
+    const root = await worker.fetch(request("/"), env);
+    expect(root.status).toBe(302);
+    expect(root.headers.get("Location")).toContain("returnTo=%2Fdashboard");
+  });
+
+  it("signs out through Better Auth and rejects cross-origin dashboard mutations", async () => {
+    const { env } = makeEnv();
+    const logout = await worker.fetch(request("/auth/logout", {
+      method: "POST",
+      headers: { Origin: "https://artifact.w3dev.app" },
+    }), env);
+    expect(logout.status).toBe(303);
+    expect(logout.headers.get("Location")).toBe("/auth/login");
+    expect(logout.headers.get("Cache-Control")).toBe("no-store");
+
+    const mutation = await worker.fetch(request("/dashboard/team-1/settings/api-tokens/revoke", {
+      method: "POST",
+      headers: {
+        Origin: "https://attacker.example",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: "tokenId=api_12345678-1234-4234-9234-123456789abc",
+    }), env);
+    expect(mutation.status).toBe(403);
   });
 
   it("replaces untrusted return paths with the safe dashboard fallback", async () => {

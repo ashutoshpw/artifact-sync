@@ -4,13 +4,15 @@ Artifact Sync uses Better Auth for web accounts and team-scoped API/device crede
 
 ## Account and team model
 
-Users can sign up with email/password or GitHub at `https://artifact.w3dev.app/auth/login`. Email/password accounts must verify their email before publishing access is provisioned. A verified new account receives a personal team and an `admin` membership. The membership schema supports users belonging to multiple teams, but invitations and joining an additional team are not part of v1.
+Users choose GitHub or email at `https://artifact.w3dev.app/auth/login`; email and password fields stay hidden until `Continue with email` is selected. Email/password accounts must verify their email before publishing access is provisioned. GitHub access is accepted only when Better Auth resolves a verified account email; an unverified social identity remains verification-required. A verified new account receives a personal team and an `owner` membership. The membership schema supports `owner`, `admin`, and `member` roles across multiple teams, but invitations and joining an additional team are not part of this release.
 
-The API-token page is `https://artifact.w3dev.app/settings/api-tokens`. Each API token or authorized device is associated with exactly one user and one team. The server issues its team ID and permissions; the CLI's `team` setting is checked against that identity, never used as proof of access.
+The dashboard is `https://artifact.w3dev.app/dashboard`. Every authenticated page keeps the selected team, role, account menu, and sign-out action visible. `DASHBOARD_LAYOUT=sidebar|topnav` selects the navigation layout and defaults to `sidebar`. Each API token or authorized device is associated with exactly one user and one team. The server issues its team ID and permissions; the CLI's `team` setting is checked against that identity, never used as proof of access.
 
 ## API and device credential lifetime
 
-The settings page displays a newly created `as_api_…` API token once. Store it as a secret. It is a refresh credential, not a Cloudflare key or an R2 key. `artifact-sync login --token-stdin` exchanges it for a signed access JWT and a rotating refresh credential. Interactive CLI login uses device authorization at `/auth/device`: approve the displayed short code in the browser and select the single team for that device. Device codes expire after 10 minutes and the CLI polls every 3 seconds by default.
+The team API-token page is `https://artifact.w3dev.app/dashboard/<team-id>/settings/api-tokens`; `/settings/api-tokens` redirects to the selected team for compatibility. The page displays a newly created `as_api_…` API token once. Store it as a secret. It is a refresh credential, not a Cloudflare key or an R2 key. `artifact-sync login --token-stdin` exchanges it for a signed access JWT and a rotating refresh credential. Interactive CLI login uses device authorization at `/auth/device`: approve the displayed short code in the browser and select the single team for that device. Device codes expire after 10 minutes and the CLI polls every 3 seconds by default.
+
+Device authorization records include a safe device label, operating system, and CLI version. The dashboard's active device list is filtered to unexpired, non-revoked credentials. Members see their own devices; owners and admins can switch to all active devices in the team. Revoking a device revokes its linked team API credential.
 
 The Worker signs access JWTs with `JWT_SECRET`; the CLI receives a seven-day access token. Protected artifact requests verify that JWT locally in the Worker and do not query D1 for each file. Refresh credentials are stored server-side only as SHA-256 hashes, rotate on refresh, expire after 30 days without refresh, and have a 90-day absolute lifetime. Refresh and revocation use D1.
 
@@ -39,7 +41,7 @@ The Worker receives the file bytes and relative path over the authenticated gate
 uploads/<authenticated-team-id>/artifacts/<relative-path>
 ```
 
-The client cannot supply a team ID or full R2 key. The Worker's R2 binding keeps the bucket private; no temporary R2 credentials, account credentials, or parent R2 credentials are sent to the client. The Workbench serves objects through `https://artifact.w3dev.app/<team-slug>/<relative-path>` only to an authenticated browser session or a valid team-scoped JWT with `artifacts:read`. The Worker resolves the slug to its team ID and reads only that team's prefix.
+The client cannot supply a team ID or full R2 key. The Worker's R2 binding keeps the bucket private; no temporary R2 credentials, account credentials, or parent R2 credentials are sent to the client. The dashboard and content service expose objects through `https://artifact.w3dev.app/<team-slug>/<relative-path>` only to an authenticated browser session or a valid team-scoped JWT with `artifacts:read`. The Worker resolves the slug to its team ID and reads only that team's prefix. The dashboard artifact page uses a flat, cursor-paginated file list with an optional path-prefix filter so every published object remains reachable without relying on delimiter-folder pagination. Owners can change a slug from team settings, but only once per team every 30 days. Every prior slug remains reserved and browser requests receive a permanent redirect to the current URL; bearer credentials continue to authorize by immutable team ID.
 
 ## CLI login and credential storage
 
@@ -93,13 +95,13 @@ An environment API token or access JWT is never written to disk implicitly. Envi
 
 `artifact-sync whoami` validates the active credential against that server and displays its origin, user/publisher identity, team, permissions, expiry, and source (`auth file` or `environment`). An unreachable server is reported as unverified, not as a freshly verified cached identity. Authentication redirects are not followed; the publisher Authorization header is never sent to R2 or an artifact-content URL.
 
-`artifact-sync logout` removes the locally stored credential while preserving unrelated settings and sync state, then notifies a running daemon to clear its in-memory tokens, cancel uploads best-effort, and leave pending work queued. Local logout is not server-side revocation. Revoke a credential from `/settings/api-tokens`; already-issued JWTs can remain valid until their seven-day expiry. If `ARTIFACTS_PUBLISH_TOKEN` is configured in the parent shell or service, logout cannot remove it and reports that it remains active.
+`artifact-sync logout` removes the locally stored credential while preserving unrelated settings and sync state, then notifies a running daemon to clear its in-memory tokens, cancel uploads best-effort, and leave pending work queued. Local logout is not server-side revocation. Revoke a credential from the selected team's dashboard API-token or device page; already-issued JWTs can remain valid until their seven-day expiry. Signing out from the account menu ends the browser session separately. If `ARTIFACTS_PUBLISH_TOKEN` is configured in the parent shell or service, CLI logout cannot remove it and reports that it remains active.
 
 On macOS/Linux the application auth directory is created with mode `0700`, and auth/temporary files with mode `0600` before secret bytes are written. The store validates ownership and permissions, rejects symlinked credential files/path components, locks updates, and atomically replaces the file inside the protected directory. It leaves no credential-bearing backups. V1 JSON storage is plaintext protected by filesystem access controls: it does not protect against another process running as the same user or a compromised account. The credential store is isolated from watcher/upload logic so a future OS keychain backend can replace it.
 
 ## Identity and storage implementation
 
-Better Auth stores user, account, browser session, and email-verification records in D1 through Drizzle. Application tables store teams, memberships, hashed API refresh credentials, and hashed pending device codes. API-token management and credential refresh use the D1 binding. Access JWT verification uses only the Worker's `JWT_SECRET` and the signed claims (user, team ID/slug, permissions, token ID, issuer, audience, and expiry).
+Better Auth stores user, account, browser session, and email-verification records in D1 through Drizzle. Application tables store teams, owner/admin/member memberships, current and historical team slugs, transactional slug-change locks, hashed API refresh credentials, and device authorization metadata. API-token management and credential refresh use the D1 binding. Access JWT verification uses only the Worker's `JWT_SECRET` and the signed claims (user, team ID/slug, permissions, token ID, issuer, audience, and expiry).
 
 The Worker requires `artifacts:publish` for upload and `artifacts:read` for list/read. The authenticated team ID is the sole prefix source. The gateway does not grant deletion or bucket administration to clients. Authentication, refresh, token, device, and artifact responses use `Cache-Control: no-store` (artifact bytes are private/no-store). Authorization headers are not logged or forwarded to storage.
 
@@ -114,19 +116,19 @@ bun run check:gateway
 bunx wrangler types apps/gateway/worker-configuration.d.ts --config apps/gateway/wrangler.jsonc
 ```
 
-The schema source is `apps/gateway/src/db/schema.ts`; review generated SQL before applying a migration. Apply locally during development with `bun run --cwd apps/gateway db:migrate:local`. Apply production migrations explicitly before deploying code that requires them with `bun run --cwd apps/gateway db:migrate:remote`. The production D1 database must exist and its ID must replace the placeholder in `apps/gateway/wrangler.jsonc` first.
+The schema source is `apps/gateway/src/db/schema.ts`; review generated SQL before applying a migration. Apply locally during development with `bun run --cwd apps/gateway db:migrate:local`. The production deployment workflow applies pending D1 migrations transactionally before deploying the Worker. The equivalent manual command is `bun run --cwd apps/gateway db:migrate:remote`. The production D1 database must exist and its ID must replace the placeholder in `apps/gateway/wrangler.jsonc` first.
 
 ## Cloudflare setup and deployment
 
-The production Worker is `artifact-sync-gateway` on the dedicated custom domain `artifact.w3dev.app`. Its R2 binding targets the private `artifact-sync` bucket. GitHub Actions deploys on pushes to `main` and manual dispatches from `main`; pull requests verify but do not deploy.
+The production Worker is `artifact-sync-gateway` on the dedicated custom domain `artifact.w3dev.app`. Its R2 binding targets the private `artifact-sync` bucket. GitHub Actions verifies the gateway and Rust workspace, applies pending D1 migrations, then deploys on pushes to `main` and manual dispatches from `main`; pull requests verify but do not migrate or deploy.
 
 Before the first production deployment:
 
-1. Create the D1 database named `artifact-db`, put its ID in `apps/gateway/wrangler.jsonc`, and apply the checked-in migration with `bun run --cwd apps/gateway db:migrate:remote`.
+1. Create the D1 database named `artifact-db` and put its ID in `apps/gateway/wrangler.jsonc`; the deployment workflow applies checked-in migrations before the Worker update.
 2. Confirm the `artifact-sync` R2 bucket and active `w3dev.app` zone exist in the Cloudflare account. The worker custom domain requires `artifact.w3dev.app` to be available and routed to this Worker.
 3. Configure Worker secrets using Wrangler (the prompts read values without placing them in shell history): `BETTER_AUTH_SECRET`, `JWT_SECRET` (each a unique random secret of at least 32 bytes), `GITHUB_CLIENT_ID`, and `GITHUB_CLIENT_SECRET`. Set the GitHub OAuth callback URL to `https://artifact.w3dev.app/__api/auth/callback/github`.
 4. Enable Cloudflare Email sending and verify the `artifact.w3dev.app` sender domain used by `AUTH_EMAIL_FROM`, so signup verification and password-reset emails can be delivered.
-5. In GitHub repository settings, set secret `CLOUDFLARE_API_TOKEN` with the narrow Worker deployment/custom-domain permissions needed, and repository variable `CLOUDFLARE_ACCOUNT_ID` for the account owning the zone, Worker, D1 database, and R2 bucket.
+5. In GitHub repository settings, set secret `CLOUDFLARE_API_TOKEN` with the narrow Worker deployment/custom-domain and D1 migration permissions needed, and repository variable `CLOUDFLARE_ACCOUNT_ID` for the account owning the zone, Worker, D1 database, and R2 bucket.
 
 The GitHub deployment workflow does not upload application secrets or credentials. No publisher-token registry, R2 parent secret, or client-side Cloudflare credential is used. Running artifact-sync requires no Cloudflare administrative access.
 

@@ -33,6 +33,18 @@ artifact-sync daemon
 
 For headless login, pass a team API token on standard input with `--token-stdin`; there is intentionally no `--token` argument. See [accounts and artifact access](docs/authentication.md) for account setup, team-scoped credentials, credential storage, environment overrides, logout, and revocation.
 
+## Dashboard
+
+Open `https://artifact.w3dev.app` after signing in to:
+
+- switch between every team membership and inspect the current role;
+- browse every artifact published under the selected team with cursor pagination and path-prefix filtering;
+- connect CLI devices and view active personal or team-wide devices;
+- create one-time team-scoped API tokens and revoke credentials;
+- change an owned team slug while preserving permanent redirects from previous artifact URLs.
+
+The non-secret `DASHBOARD_LAYOUT` Worker variable selects `sidebar` or `topnav`; invalid or missing values default to `sidebar`. Both variants use the same routes, permissions, and responsive navigation.
+
 Use Bun 1.4.2 for the TypeScript Worker:
 
 ```sh

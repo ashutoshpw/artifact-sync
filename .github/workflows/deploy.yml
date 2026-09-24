@@ -30,6 +30,23 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build release agent
+        run: cargo build --release -p artifact-sync
+
       - name: Run gateway tests
         run: bun run test:gateway
 
@@ -68,6 +85,16 @@ jobs:
             echo "::error::Set the CLOUDFLARE_ACCOUNT_ID repository variable before deploying."
             exit 1
           fi
+
+      - name: Apply D1 migrations
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply artifact-db --remote
+          packageManager: bun
+          wranglerVersion: "4.137.0"
+          workingDirectory: apps/gateway
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v4

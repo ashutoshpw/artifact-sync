@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull, lt, or, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, isNotNull, isNull, lt, or, type SQL } from "drizzle-orm";
 import { createDatabase } from "../db/client.ts";
 import { apiTokens, deviceAuthorizations, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
 import { requireBrowserIdentity } from "./identity.ts";
@@ -126,10 +126,14 @@ export async function handleTeamDevices(request: Request, env: GatewayEnv, teamI
   const limit = readLimit(url.searchParams.get("limit"));
   const cursor = decodeCursor(url.searchParams.get("cursor"));
   if (url.searchParams.has("cursor") && !cursor) return authError(400, "invalid_cursor");
+  const now = new Date();
   const conditions = [
     eq(deviceAuthorizations.teamId, teamId),
     eq(deviceAuthorizations.status, "completed"),
     isNotNull(deviceAuthorizations.apiTokenId),
+    isNull(apiTokens.revokedAt),
+    gt(apiTokens.expiresAt, now),
+    gt(apiTokens.idleExpiresAt, now),
   ];
   if (team.role === "member") conditions.push(eq(apiTokens.userId, identity.id));
   if (cursor) conditions.push(cursorCondition(cursor, apiTokens.createdAt, apiTokens.id));

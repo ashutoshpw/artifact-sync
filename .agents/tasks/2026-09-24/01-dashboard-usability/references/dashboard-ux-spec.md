@@ -11,7 +11,7 @@ Dashboard navigation uses stable team IDs so changing a slug does not break dash
 | `/` | Redirect authenticated users to `/dashboard`; anonymous users to login |
 | `/dashboard` | Resolve one membership and redirect to its team overview |
 | `/dashboard/:teamId` | Team overview and onboarding |
-| `/dashboard/:teamId/artifacts` | Prefix browser with cursor pagination |
+| `/dashboard/:teamId/artifacts` | Flat file browser with path-prefix filtering and cursor pagination |
 | `/dashboard/:teamId/settings/general` | Team identity and slug management |
 | `/dashboard/:teamId/settings/api-tokens` | Team credential inventory and creation |
 | `/dashboard/:teamId/settings/devices` | Personal/team device inventory and revocation |
@@ -49,9 +49,9 @@ No members, invitations, activity, usage, deployment, or delete controls appear 
 - No “recent deployments” until an event model exists.
 
 ## Artifacts
-- Breadcrumb from the selected team root and current prefix.
-- Rows show path, size, uploaded time, and open/download action.
-- Load more uses the R2 cursor; no unbounded list.
+- Flat rows show the complete object path, size, uploaded time, and open/download action.
+- An optional path-prefix filter narrows long listings without pretending delimiter folders are complete across R2 pages.
+- Next page uses the R2 cursor and preserves the active prefix; no unbounded list.
 - Distinct empty-prefix, storage-unavailable, unauthorized, and missing-object states.
 - Global search is omitted because the current storage contract supports prefix listing, not search.
 
@@ -86,9 +86,10 @@ No members, invitations, activity, usage, deployment, or delete controls appear 
 | View historical slugs | Yes | Yes | Yes |
 
 ## Data and API changes
-- Extend membership roles to `owner | admin | member`; migrate existing admins to owners to preserve current access.
-- Add a canonical `team_slugs` registry with unique slug, team, current flag, changed time/by, and current team-slug compatibility.
-- Add device metadata (`deviceName`, `platform`, `clientVersion`) to authorization records; keep `apiTokenId` as the durable credential link.
+- Extend membership roles to `owner | admin | member`; promote one deterministic existing admin per team to owner and preserve additional admins.
+- Add a canonical `team_slugs` registry with unique slug, team, current flag, changed time/by, and an atomic per-team cooldown lock.
+- Add device metadata (`deviceName`, `platform`, `clientVersion`) plus recoverable single-delivery claims to authorization records; keep `apiTokenId` as the durable credential link.
+- Dashboard device lists include only active, unexpired, non-revoked credentials.
 - Add `PATCH /__api/v1/teams/:teamId` for owner-only slug changes.
 - Add `GET /__api/v1/teams/:teamId/api-tokens` and `GET /__api/v1/teams/:teamId/devices` with role-scoped rows and pagination.
 - Extend token/device revoke authorization to allow the owner or admin of that record's team, otherwise require record ownership.
@@ -100,7 +101,7 @@ No members, invitations, activity, usage, deployment, or delete controls appear 
 - No decorative hero, oversized marketing headings, or generic card grid in authenticated pages.
 - Semantic buttons/forms/dialogs, visible focus, keyboard support, `aria-current`, `aria-expanded`, live errors, and sufficient contrast.
 - Skeletons match rows/cards, inline field errors stay below inputs, destructive actions confirm, and mutations prevent duplicate submits.
-- CSP remains strict; generated inline script/style receives a per-response nonce or is externalized, avoiding broad `unsafe-inline` where practical.
+- CSP remains strict; scripts and styles are served as same-origin static assets with no broad `unsafe-inline` allowance.
 
 ## Acceptance focus
 - Stable shell and team context on every authenticated page.
