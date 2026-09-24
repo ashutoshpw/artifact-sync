@@ -30,14 +30,14 @@ pub enum CommandError {
 }
 
 pub fn validate_auth_path(auth_path: &Path, publishing_path: &Path) -> Result<(), CommandError> {
-    if let Some(root) = publishing_path.parent() {
-        if path_is_inside(auth_path, root).map_err(|_| {
+    if let Some(root) = publishing_path.parent()
+        && path_is_inside(auth_path, root).map_err(|_| {
             CommandError::Message("could not resolve configuration paths safely".into())
-        })? {
-            return Err(CommandError::Message(
-                "authentication configuration must be outside the watched artifact root".into(),
-            ));
-        }
+        })?
+    {
+        return Err(CommandError::Message(
+            "authentication configuration must be outside the watched artifact root".into(),
+        ));
     }
     Ok(())
 }

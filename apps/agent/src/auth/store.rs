@@ -208,11 +208,11 @@ impl CredentialStore {
             parent.sync_all()?;
             Ok(())
         })();
-        if result.is_err() {
-            if let Ok(temp_cstr) = c_name(std::ffi::OsStr::new(&temp_name)) {
-                unsafe {
-                    libc::unlinkat(parent.as_raw_fd(), temp_cstr.as_ptr(), 0);
-                }
+        if result.is_err()
+            && let Ok(temp_cstr) = c_name(std::ffi::OsStr::new(&temp_name))
+        {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temp_cstr.as_ptr(), 0);
             }
         }
         result
