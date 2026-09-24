@@ -224,7 +224,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const html = await login.text();
 
     expect(html).not.toContain("</script><script>alert(1)</script>");
-    expect(html).toContain('data-return-to="/settings/api-tokens"');
+    expect(html).toContain('data-return-to="/dashboard"');
   });
 
   it("preserves multiple authentication cookies while adding no-store headers", () => {

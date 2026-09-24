@@ -17,10 +17,10 @@ import { getWebIdentity } from "./auth/web-session.ts";
 import { listArtifacts, serveArtifact, uploadArtifact } from "./content/routes.ts";
 import { AuthPage } from "./web/auth-page.tsx";
 import { authScript, authStyles } from "./web/auth-assets.ts";
+import { registerDashboardRoutes } from "./web/dashboard-routes.tsx";
 import { assetHeaders, pageSecurityHeaders, safeLocalPath } from "./web/http.ts";
-import { apiTokensPage, devicePage } from "./web/pages.ts";
 
-const DEFAULT_AUTH_RETURN = "/settings/api-tokens";
+const DEFAULT_AUTH_RETURN = "/dashboard";
 const reservedFirstSegments = new Set(["__api", "auth", "dashboard", "settings", "favicon.ico", "robots.txt"]);
 const app = new Hono<{ Bindings: GatewayEnv }>();
 
@@ -30,6 +30,8 @@ app.all("/__api/auth/*", (c) => createWebAuth(c.env).handler(c.req.raw).then(wit
 app.get("/assets/auth.css", (c) => c.body(authStyles, 200, assetHeaders("text/css; charset=utf-8")));
 app.get("/assets/auth.js", (c) => c.body(authScript, 200, assetHeaders("text/javascript; charset=utf-8")));
 
+registerDashboardRoutes(app);
+
 app.get("/auth/login", async (c) => {
   const returnTo = safeLocalPath(c.req.query("returnTo") ?? DEFAULT_AUTH_RETURN, DEFAULT_AUTH_RETURN);
   const identity = await getWebIdentity(c.req.raw, c.env).catch(() => null);
@@ -37,18 +39,6 @@ app.get("/auth/login", async (c) => {
   c.header("Cache-Control", "no-store");
   c.header("Pragma", "no-cache");
   return c.html(<AuthPage returnTo={returnTo} />, 200, pageSecurityHeaders);
-});
-
-app.get("/settings/api-tokens", async (c) => {
-  const identity = await getWebIdentity(c.req.raw, c.env).catch(() => null);
-  if (!identity) return loginRedirect(c.req.path, c.req.url);
-  return apiTokensPage();
-});
-
-app.get("/auth/device", async (c) => {
-  const identity = await getWebIdentity(c.req.raw, c.env).catch(() => null);
-  if (!identity) return loginRedirect(c.req.path, c.req.url);
-  return devicePage();
 });
 
 app.get("/__api/v1/auth/me", (c) => handleAuthMe(c.req.raw, c.env));
@@ -75,7 +65,7 @@ app.get("*", async (c) => {
   }
   if (url.pathname === "/") {
     const identity = await getWebIdentity(c.req.raw, c.env).catch(() => null);
-    return identity ? c.redirect("/settings/api-tokens", 302) : loginRedirect("/settings/api-tokens", url.toString());
+    return identity ? c.redirect("/dashboard", 302) : loginRedirect("/dashboard", url.toString());
   }
   return c.text("Not found", 404, Object.fromEntries(noStoreHeaders()));
 });

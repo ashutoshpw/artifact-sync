@@ -8,6 +8,9 @@
 - Explicit owner/admin/member authorization, deterministic owner backfill, historical slug redirects, transactional 30-day slug cooldowns, team credential/device APIs, and CLI device metadata are implemented.
 - Local D1 verification confirmed one owner per existing team and that an immediate second slug change is blocked.
 - Device polling now uses a recoverable claim and a one-time delivery marker with an atomic active-token check.
+- The shared dashboard shell now supports environment-selected `sidebar` and `topnav` layouts with responsive mobile navigation.
+- Team overview, flat cursor-paginated artifact listing with path-prefix filtering, team settings, one-time API token creation, active personal/team devices, device approval, and account sign-out are implemented.
+- Dashboard server-render contract tests cover both layouts, artifact paths/pagination, request-origin URLs, token secrets, slug history, and device approval.
 - The dashboard stack is Cloudflare Workers, Hono JSX/SSR, TypeScript, D1/Drizzle, Better Auth, R2, and Bun tests.
 - Navigation supports `sidebar` and `topnav` through `DASHBOARD_LAYOUT`, with a later user preference override.
 - Agent-run browser QA is excluded; the final phase provides a user-led manual QA checklist and status template.

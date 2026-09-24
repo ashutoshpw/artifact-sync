@@ -19,4 +19,4 @@ export interface AuthContext {
   identity: PublisherIdentity;
 }
 
-export type GatewayEnv = Env;
+export type GatewayEnv = Omit<Env, "DASHBOARD_LAYOUT"> & { DASHBOARD_LAYOUT?: string };

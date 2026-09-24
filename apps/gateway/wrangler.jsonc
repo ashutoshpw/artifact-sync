@@ -12,6 +12,7 @@
   "vars": {
     "APP_ORIGIN": "https://artifact.w3dev.app",
     "AUTH_EMAIL_FROM": "Artifact Sync <no-reply@artifact.w3dev.app>",
+    "DASHBOARD_LAYOUT": "sidebar",
     "ARTIFACTS_PUBLIC_PREFIX": "artifacts",
     "GITHUB_CLIENT_ID": "Iv23liFBST7qs3NafuDM",
     "R2_ACCOUNT_ID": "e50bb65c405eeac58f1a07f2903e509b",

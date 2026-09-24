@@ -1,0 +1,260 @@
+import type { Context, Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { HtmlEscapedString } from "hono/utils/html";
+import { createWebAuth } from "../auth/better-auth.ts";
+import { handleApiTokens, handleDeviceApprove, handleRevokeApiToken } from "../auth/routes.ts";
+import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
+import { handleTeam } from "../auth/team-routes.ts";
+import type { GatewayEnv } from "../auth/types.ts";
+import { ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, TokensPage } from "./dashboard.tsx";
+import { dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
+import {
+  dashboardCounts,
+  dashboardSettings,
+  listDashboardArtifacts,
+  listDashboardDevices,
+  listDashboardTokens,
+  requireDashboardSession,
+  type DashboardSession,
+} from "./dashboard-service.ts";
+import { assetHeaders, pageSecurityHeaders } from "./http.ts";
+
+type DashboardEnv = { Bindings: GatewayEnv };
+type DashboardApp = Hono<DashboardEnv>;
+type DashboardContext = Context<DashboardEnv>;
+
+export function registerDashboardRoutes(app: DashboardApp): void {
+  app.get("/assets/dashboard.css", (c) => c.body(dashboardStyles, 200, assetHeaders("text/css; charset=utf-8")));
+  app.get("/assets/dashboard.js", (c) => c.body(dashboardScript, 200, assetHeaders("text/javascript; charset=utf-8")));
+
+  app.get("/settings/api-tokens", async (c) => {
+    const session = await dashboardSession(c);
+    if (session instanceof Response) return session;
+    return c.redirect(session.team ? `/dashboard/${session.team.id}/settings/api-tokens` : "/dashboard", 302);
+  });
+
+  app.get("/dashboard", async (c) => {
+    const session = await dashboardSession(c);
+    if (session instanceof Response) return session;
+    if (!session.team) return dashboardHtml(c, <NoTeamsPage session={session} />);
+    return c.redirect(`/dashboard/${session.team.id}`, 302);
+  });
+
+  app.get("/dashboard/:teamId", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const [artifacts, counts] = await Promise.all([
+      listDashboardArtifacts(c.env, session.team.id, null, null, 8),
+      dashboardCounts(c.env, session.identity, session.team),
+    ]);
+    if (artifacts instanceof Response) {
+      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} counts={counts} origin={new URL(c.req.url).origin} storageError={actionMessage("artifact_storage_unavailable")} />);
+    }
+    return dashboardHtml(c, <OverviewPage session={session} artifacts={artifacts.objects} counts={counts} origin={new URL(c.req.url).origin} />);
+  });
+
+  app.get("/dashboard/:teamId/artifacts", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("prefix") ?? null, c.req.query("cursor") ?? null);
+    if (result instanceof Response) {
+      return dashboardHtml(c, <ArtifactsPage session={session} objects={[]} currentPrefix="" nextCursor={null} storageError={actionMessage("invalid_artifact_prefix")} />, result.status as ContentfulStatusCode);
+    }
+    return dashboardHtml(c, <ArtifactsPage session={session} objects={result.objects} currentPrefix={result.prefix} nextCursor={result.nextCursor} />);
+  });
+
+  app.get("/dashboard/:teamId/settings/general", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const settings = await dashboardSettings(c.env, session.team);
+    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} feedback={queryFeedback(c)} />);
+  });
+
+  app.post("/dashboard/:teamId/settings/general", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const form = await c.req.raw.formData();
+    const response = await handleTeam(proxyJsonRequest(c.req.raw, `/__api/v1/teams/${encodeURIComponent(teamId)}`, "PATCH", {
+      slug: String(form.get("slug") ?? ""),
+    }), c.env, teamId);
+    if (response.ok) {
+      const refreshed = await dashboardSession(c, teamId);
+      if (refreshed instanceof Response) return refreshed;
+      if (!refreshed.team) return c.text("Not found", 404);
+      const settings = await dashboardSettings(c.env, refreshed.team);
+      return dashboardHtml(c, <GeneralSettingsPage session={refreshed} settings={settings} feedback={{ notice: "Team slug updated. Existing artifact URLs now redirect to the new slug." }} />);
+    }
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const settings = await dashboardSettings(c.env, session.team);
+    return dashboardHtml(c, <GeneralSettingsPage session={session} settings={settings} feedback={{ error: actionMessage(String(payload.error ?? "invalid_request"), String(payload.nextAvailableAt ?? "")) }} />, response.status as ContentfulStatusCode);
+  });
+
+  app.get("/dashboard/:teamId/settings/api-tokens", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const page = await listDashboardTokens(c.env, session.identity, session.team, c.req.query("cursor") ?? null);
+    if (page instanceof Response) return page;
+    return dashboardHtml(c, <TokensPage session={session} page={page} feedback={queryFeedback(c)} />);
+  });
+
+  app.post("/dashboard/:teamId/settings/api-tokens", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const form = await c.req.raw.formData();
+    const response = await handleApiTokens(proxyJsonRequest(c.req.raw, "/__api/v1/api-tokens", "POST", {
+      name: String(form.get("name") ?? ""),
+      teamId,
+    }), c.env);
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const page = await listDashboardTokens(c.env, session.identity, session.team, null);
+    if (response.status === 201 && page && !(page instanceof Response) && typeof payload.token === "string") {
+      return dashboardHtml(c, <TokensPage session={session} page={page} createdToken={{ name: String(payload.name ?? "API token"), token: payload.token }} />);
+    }
+    if (page instanceof Response) return page;
+    return dashboardHtml(c, <TokensPage session={session} page={page} feedback={{ error: actionMessage(String(payload.error ?? "invalid_request")) }} />, response.status as ContentfulStatusCode);
+  });
+
+  app.post("/dashboard/:teamId/settings/api-tokens/revoke", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response) return session;
+    if (!session.team) return c.text("Not found", 404);
+    const form = await c.req.raw.formData();
+    const tokenId = String(form.get("tokenId") ?? "");
+    const response = await handleRevokeApiToken(proxyRequest(c.req.raw, `/__api/v1/api-tokens/${encodeURIComponent(tokenId)}`, "DELETE"), c.env, tokenId);
+    if (response.status === 204) return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/api-tokens?revoked=1`, 303);
+    return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/api-tokens?revokeError=1`, 303);
+  });
+
+  app.get("/dashboard/:teamId/settings/devices", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const scope = c.req.query("scope") === "team" && session.team.role !== "member" ? "team" : "mine";
+    const page = await listDashboardDevices(c.env, session.identity, session.team, scope, c.req.query("cursor") ?? null);
+    if (page instanceof Response) return page;
+    return dashboardHtml(c, <DevicesPage session={session} page={page} scope={scope} feedback={queryFeedback(c)} />);
+  });
+
+  app.post("/dashboard/:teamId/settings/devices/revoke", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response) return session;
+    if (!session.team) return c.text("Not found", 404);
+    const form = await c.req.raw.formData();
+    const tokenId = String(form.get("tokenId") ?? "");
+    const response = await handleRevokeApiToken(proxyRequest(c.req.raw, `/__api/v1/api-tokens/${encodeURIComponent(tokenId)}`, "DELETE"), c.env, tokenId);
+    if (response.status === 204) return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/devices?revoked=1`, 303);
+    return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/devices?revokeError=1`, 303);
+  });
+
+  app.get("/auth/device", async (c) => {
+    const session = await dashboardSession(c);
+    if (session instanceof Response) return session;
+    if (!session.teams.length) return c.redirect("/dashboard", 302);
+    return dashboardHtml(c, <DeviceApprovalPage session={session} code={safeUserCode(c.req.query("code"))} />);
+  });
+
+  app.post("/auth/device", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const session = await dashboardSession(c);
+    if (session instanceof Response) return session;
+    if (!session.teams.length) return c.redirect("/dashboard", 302);
+    const form = await c.req.raw.formData();
+    const userCode = String(form.get("userCode") ?? "").toUpperCase();
+    const response = await handleDeviceApprove(proxyJsonRequest(c.req.raw, "/__api/v1/device/approve", "POST", {
+      userCode,
+      teamId: String(form.get("teamId") ?? ""),
+    }), c.env);
+    if (response.ok) return dashboardHtml(c, <DeviceApprovalPage session={session} code={userCode} success />);
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return dashboardHtml(c, <DeviceApprovalPage session={session} code={userCode} error={actionMessage(String(payload.error ?? "invalid_request"))} />, response.status as ContentfulStatusCode);
+  });
+
+  app.post("/auth/logout", async (c) => {
+    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    const authResponse = withNoStore(await createWebAuth(c.env).handler(proxyJsonRequest(c.req.raw, "/__api/auth/sign-out", "POST", { disableRedirect: true })));
+    const headers = new Headers({ Location: "/auth/login", "Cache-Control": "no-store", Pragma: "no-cache" });
+    authResponse.headers.forEach((value, name) => {
+      if (name.toLowerCase() !== "set-cookie") headers.append(name, value);
+    });
+    for (const cookie of authResponse.headers.getSetCookie()) headers.append("Set-Cookie", cookie);
+    return new Response(null, { status: 303, headers });
+  });
+}
+
+async function dashboardSession(c: DashboardContext, teamId?: string): Promise<DashboardSession | Response> {
+  const result = await requireDashboardSession(c.req.raw, c.env, teamId);
+  if (!(result instanceof Response)) return result;
+  if (result.status !== 401) return result;
+  const returnTo = `${c.req.path}${new URL(c.req.url).search}`;
+  return c.redirect(`/auth/login?returnTo=${encodeURIComponent(returnTo)}`, 302);
+}
+
+function dashboardHtml(
+  c: DashboardContext,
+  content: HtmlEscapedString | Promise<HtmlEscapedString>,
+  status: ContentfulStatusCode = 200,
+): Response | Promise<Response> {
+  c.header("Cache-Control", "no-store");
+  c.header("Pragma", "no-cache");
+  return c.html(content, status, pageSecurityHeaders);
+}
+
+function proxyJsonRequest(request: Request, path: string, method: "POST" | "PATCH", body: unknown): Request {
+  return proxyRequest(request, path, method, {
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function proxyRequest(request: Request, path: string, method: string, options: { body?: string; headers?: Record<string, string> } = {}): Request {
+  const headers = new Headers(options.headers);
+  const cookie = request.headers.get("Cookie");
+  if (cookie) headers.set("Cookie", cookie);
+  return new Request(new URL(path, request.url), { method, headers, body: options.body });
+}
+
+function sameOrigin(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+  return !origin || origin === new URL(request.url).origin;
+}
+
+function safeUserCode(value: string | undefined): string {
+  const normalized = (value ?? "").toUpperCase();
+  return /^[A-HJ-NP-Z2-9]{0,8}$/u.test(normalized) ? normalized : "";
+}
+
+function queryFeedback(c: DashboardContext): { error?: string; notice?: string } | undefined {
+  if (c.req.query("revoked")) return { notice: "Credential revoked. Future refresh attempts are blocked." };
+  if (c.req.query("revokeError")) return { error: "Credential could not be revoked." };
+  return undefined;
+}
+
+function actionMessage(code: string, nextAvailableAt = ""): string {
+  const messages: Record<string, string> = {
+    invalid_request: "The request could not be completed.",
+    invalid_team_slug: "Use 1–63 lowercase letters, numbers, or hyphens, with no leading or trailing hyphen.",
+    invalid_token_name: "Enter a token name between 1 and 64 characters.",
+    invalid_cursor: "This page link is invalid. Return to the first page and try again.",
+    invalid_artifact_prefix: "The selected artifact folder is invalid.",
+    team_owner_required: "Only a team owner can change this slug.",
+    team_slug_taken: "That team URL is already reserved.",
+    team_slug_change_cooldown: nextAvailableAt
+      ? `This team can change its URL again after ${new Date(nextAvailableAt).toLocaleString("en-US", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" })} UTC.`
+      : "This team can change its URL only once every 30 days.",
+    artifact_storage_unavailable: "Artifact storage is temporarily unavailable.",
+    invalid_device_code: "That device code is invalid or has expired.",
+    device_request_not_found_or_expired: "That device request is invalid or has expired.",
+    device_request_denied: "That device request was denied.",
+    team_access_required: "You do not have access to this team.",
+    token_service_unavailable: "Credential service is temporarily unavailable.",
+    identity_service_unavailable: "Identity service is temporarily unavailable.",
+  };
+  return messages[code] ?? "The request could not be completed.";
+}
