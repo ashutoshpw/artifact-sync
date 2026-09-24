@@ -122,7 +122,7 @@ The production Worker is `artifact-sync-gateway` on the dedicated custom domain 
 
 Before the first production deployment:
 
-1. Create the D1 database named `artifact-sync-auth`, put its ID in `apps/gateway/wrangler.jsonc`, and apply the checked-in migration with `bun run --cwd apps/gateway db:migrate:remote`.
+1. Create the D1 database named `artifact-db`, put its ID in `apps/gateway/wrangler.jsonc`, and apply the checked-in migration with `bun run --cwd apps/gateway db:migrate:remote`.
 2. Confirm the `artifact-sync` R2 bucket and active `w3dev.app` zone exist in the Cloudflare account. The worker custom domain requires `artifact.w3dev.app` to be available and routed to this Worker.
 3. Configure Worker secrets using Wrangler (the prompts read values without placing them in shell history): `BETTER_AUTH_SECRET`, `JWT_SECRET` (each a unique random secret of at least 32 bytes), `GITHUB_CLIENT_ID`, and `GITHUB_CLIENT_SECRET`. Set the GitHub OAuth callback URL to `https://artifact.w3dev.app/__api/auth/callback/github`.
 4. Enable Cloudflare Email sending and verify the `artifact.w3dev.app` sender domain used by `AUTH_EMAIL_FROM`, so signup verification and password-reset emails can be delivered.

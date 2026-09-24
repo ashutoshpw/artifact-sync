@@ -16,7 +16,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "artifact-sync-auth",
+      "database_name": "artifact-db",
       "database_id": "replace-with-d1-database-id",
       "migrations_dir": "drizzle"
     }
