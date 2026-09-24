@@ -11,7 +11,11 @@
   "observability": { "enabled": true },
   "vars": {
     "APP_ORIGIN": "https://artifact.w3dev.app",
-    "AUTH_EMAIL_FROM": "Artifact Sync <no-reply@artifact.w3dev.app>"
+    "AUTH_EMAIL_FROM": "Artifact Sync <no-reply@artifact.w3dev.app>",
+    "ARTIFACTS_PUBLIC_PREFIX": "artifacts",
+    "GITHUB_CLIENT_ID": "Iv23liFBST7qs3NafuDM",
+    "R2_ACCOUNT_ID": "e50bb65c405eeac58f1a07f2903e509b",
+    "R2_BUCKET_NAME": "artifact-sync"
   },
   "d1_databases": [
     {
@@ -29,7 +33,6 @@
     "required": [
       "BETTER_AUTH_SECRET",
       "JWT_SECRET",
-      "GITHUB_CLIENT_ID",
       "GITHUB_CLIENT_SECRET"
     ]
   }
