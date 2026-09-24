@@ -1,7 +1,7 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
@@ -14,6 +14,8 @@ pub enum StateError {
     Sql(#[from] rusqlite::Error),
     #[error("artifact path is outside the watched root")]
     OutsideRoot,
+    #[error("sync state is unsafe: {0}")]
+    Unsafe(String),
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,38 @@ pub struct SyncState {
 }
 
 impl SyncState {
+    pub fn pending_count_default() -> Result<usize, StateError> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
+        })?;
+        let home = fs::canonicalize(home)?;
+        let directory = home.join(".local/state/artifact-sync");
+        let mut current = PathBuf::new();
+        for component in directory.components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(StateError::Unsafe(format!(
+                        "state directory contains a symlink or non-directory: {}",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(StateError::Unsafe(
+                "state directory must be owned by the current user with mode 0700".into(),
+            ));
+        }
+        pending_count_from_path(&directory.join("state.sqlite3"))
+    }
+
     pub fn open_default() -> Result<Self, StateError> {
         let home = dirs::home_dir().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
@@ -144,6 +178,14 @@ impl SyncState {
             .map_err(StateError::from)
     }
 
+    pub fn pending_count(&self) -> Result<usize, StateError> {
+        self.connection
+            .lock()
+            .expect("state mutex poisoned")
+            .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
+            .map_err(StateError::from)
+    }
+
     pub fn mark_uploaded(&self, item: &PendingItem) -> Result<(), StateError> {
         let now = chrono::Utc::now().timestamp();
         let mut connection = self.connection.lock().expect("state mutex poisoned");
@@ -176,6 +218,29 @@ impl SyncState {
             Ok(())
         })
     }
+}
+
+fn pending_count_from_path(path: &Path) -> Result<usize, StateError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StateError::Unsafe(
+            "state database must be a regular file, not a symlink".into(),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(StateError::Unsafe(
+            "state database must be owned by the current user and not group/world accessible"
+                .into(),
+        ));
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection
+        .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
+        .map_err(StateError::from)
 }
 
 pub fn hash_file(path: &Path) -> Result<String, StateError> {
@@ -257,6 +322,7 @@ mod tests {
         state.reconcile(&root).unwrap();
         let pending = state.pending_due(i64::MAX, 10).unwrap();
         assert_eq!(pending.len(), 1);
+        assert_eq!(state.pending_count().unwrap(), 1);
         assert_eq!(pending[0].relative_path, PathBuf::from("report.txt"));
         state.mark_uploaded(&pending[0]).unwrap();
         state.reconcile(&root).unwrap();
@@ -273,5 +339,31 @@ mod tests {
         fs::create_dir(&root).unwrap();
         assert!(normalized_relative_path(&root, &root.join("../secret")).is_err());
         assert!(normalized_relative_path(&root, &temp.path().join("outside")).is_err());
+    }
+
+    #[test]
+    fn read_only_pending_count_handles_missing_and_existing_databases() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.sqlite3");
+        assert_eq!(pending_count_from_path(&database).unwrap(), 0);
+
+        let state = SyncState::open(&database).unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+        state
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        state
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO pending(path, content_hash, attempts, next_attempt_at) VALUES ('report.txt', 'hash', 0, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(pending_count_from_path(&database).unwrap(), 1);
     }
 }

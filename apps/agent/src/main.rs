@@ -33,7 +33,15 @@ enum Command {
     },
     Whoami,
     Logout,
-    Daemon,
+    Daemon {
+        /// Ignore environment credentials; used by installed per-user services
+        #[arg(long, hide = true)]
+        auth_file_only: bool,
+    },
+    Service {
+        #[command(subcommand)]
+        command: artifact_sync::service::ServiceCommand,
+    },
 }
 
 #[tokio::main]
@@ -62,8 +70,15 @@ async fn run(cli: Cli) -> Result<(), CommandError> {
         } => commands::login(&server, token_stdin, auth_path, publishing_path).await,
         Command::Whoami => commands::whoami(auth_path, publishing_path).await,
         Command::Logout => commands::logout(auth_path, publishing_path).await,
-        Command::Daemon => artifact_sync::daemon::run(auth_path, publishing_path)
-            .await
-            .map_err(|error| CommandError::Message(error.to_string())),
+        Command::Daemon { auth_file_only } => {
+            artifact_sync::daemon::run(auth_path, publishing_path, auth_file_only)
+                .await
+                .map_err(|error| CommandError::Message(error.to_string()))
+        }
+        Command::Service { command } => {
+            artifact_sync::service::run(command, auth_path, publishing_path)
+                .await
+                .map_err(|error| CommandError::Message(error.to_string()))
+        }
     }
 }

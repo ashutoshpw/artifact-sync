@@ -33,6 +33,18 @@ artifact-sync daemon
 
 For headless login, pass a team API token on standard input with `--token-stdin`; there is intentionally no `--token` argument. See [accounts and artifact access](docs/authentication.md) for account setup, team-scoped credentials, credential storage, environment overrides, logout, and revocation.
 
+To run the watcher under the current user's service manager instead of keeping a terminal open:
+
+```sh
+artifact-sync service install
+artifact-sync service status
+artifact-sync service stop
+artifact-sync service start
+artifact-sync service uninstall
+```
+
+Service management uses macOS `launchd` or Linux `systemd --user`, requires no root access, and never captures environment tokens. Install after logging in; it may reconcile and upload existing artifacts, so interactive installs ask first and headless installs with existing files require `--yes`. See the authentication guide for lifecycle, status, and Linux session behavior.
+
 ## Dashboard
 
 Open `https://artifact.w3dev.app` after signing in to:

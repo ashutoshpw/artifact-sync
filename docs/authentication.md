@@ -97,6 +97,30 @@ An environment API token or access JWT is never written to disk implicitly. Envi
 
 `artifact-sync logout` removes the locally stored credential while preserving unrelated settings and sync state, then notifies a running daemon to clear its in-memory tokens, cancel uploads best-effort, and leave pending work queued. Local logout is not server-side revocation. Revoke a credential from the selected team's dashboard API-token or device page; already-issued JWTs can remain valid until their seven-day expiry. Signing out from the account menu ends the browser session separately. If `ARTIFACTS_PUBLISH_TOKEN` is configured in the parent shell or service, CLI logout cannot remove it and reports that it remains active.
 
+## Running as a user service
+
+After a successful CLI login, install the watcher with the current native user service manager:
+
+```sh
+artifact-sync service install
+artifact-sync service status
+```
+
+The supported managers are macOS `launchd` and Linux `systemd --user`. Installation uses the absolute executable path plus the selected auth and publishing config paths. It registers, enables, and starts the watcher for the current user; it does not need root or Cloudflare credentials. The service explicitly uses saved-file credentials only, so `ARTIFACTS_PUBLISH_TOKEN` or other shell environment values are never copied into a launchd plist or systemd unit. The installed auth path is not changed implicitly; pass the same `--auth-config` and `--config` values to later service commands if non-default paths were used during installation.
+
+The daemon recursively reconciles the artifact root on startup. If files are already present, `service install` asks before starting; non-interactive installs must include `--yes`. Starting a previously stopped service has the same confirmation behavior:
+
+```sh
+artifact-sync service install --yes
+artifact-sync service start --yes
+```
+
+`service status` combines native manager state with a local daemon status request. It makes no authentication or gateway network request and reports the local publishing state (`ready`, `offline`, or `paused`), configured artifact root, pending count, and whether the daemon verified its identity during this run. If the daemon is stopped or its status protocol is unavailable, it reads the pending count from the local state database. An offline cached identity is not represented as freshly verified. Use `artifact-sync whoami` when you want to validate credentials against the server.
+
+`service stop` disables automatic startup and stops the watcher but leaves its definition, credentials, artifacts, and pending sync state in place. `service start` reenables and resumes it; changes made while stopped are found by startup reconciliation. `service uninstall` unregisters and removes only artifact-sync-managed service files and settings; authentication, artifacts, and sync state remain. On Linux, the user manager runs only while the normal user session is active unless the administrator or user separately enables systemd lingering; artifact-sync never changes linger settings automatically. On macOS, launchd output is written to `~/Library/Logs/artifact-sync.log` and `~/Library/Logs/artifact-sync.error.log`.
+
+If the CLI executable is moved or replaced at another path, run `service install` again to update the native definition. The daemon has its own bounded network retry behavior; native managers restart unexpected process failures with throttling (systemd also applies a start limit). A definitive 401/403 during publishing pauses uploads and preserves pending work; invalid credentials at initial startup are reported in manager logs and are never retried in a tight loop or prompted from a background process.
+
 On macOS/Linux the application auth directory is created with mode `0700`, and auth/temporary files with mode `0600` before secret bytes are written. The store validates ownership and permissions, rejects symlinked credential files/path components, locks updates, and atomically replaces the file inside the protected directory. It leaves no credential-bearing backups. V1 JSON storage is plaintext protected by filesystem access controls: it does not protect against another process running as the same user or a compromised account. The credential store is isolated from watcher/upload logic so a future OS keychain backend can replace it.
 
 ## Identity and storage implementation

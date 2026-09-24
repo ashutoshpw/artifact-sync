@@ -1,6 +1,7 @@
 use crate::auth::client::AuthClientError;
 use crate::auth::commands::{
-    resolve_active_credential, validate_active_credential, validate_auth_path,
+    resolve_active_credential, resolve_saved_credential, validate_active_credential,
+    validate_auth_path,
 };
 use crate::auth::credentials::ActiveCredential;
 use crate::auth::store::CredentialStore;
@@ -10,6 +11,7 @@ use crate::upload::{UploadError, UploadManager, UploadOutcome};
 use chrono::Utc;
 use notify::event::EventKind;
 use notify::{RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -29,6 +31,36 @@ const PUBLISH_PERMISSION: &str = "artifacts:publish";
 struct DaemonConfig {
     selected_team: Option<String>,
     sync: SyncConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishingState {
+    Ready,
+    Offline,
+    Paused,
+}
+
+impl PublishingState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Offline => "offline",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonStatus {
+    pub publishing_state: PublishingState,
+    pub process_id: u32,
+    pub artifact_root: String,
+    pub team: Option<String>,
+    pub identity_verified: bool,
+    pub credential_source: Option<String>,
+    pub pending_count: usize,
 }
 
 #[derive(Debug, Error)]
@@ -60,7 +92,11 @@ enum LoopEvent {
     Shutdown,
 }
 
-pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), DaemonError> {
+pub async fn run(
+    auth_path: PathBuf,
+    publishing_path: PathBuf,
+    auth_file_only: bool,
+) -> Result<(), DaemonError> {
     validate_auth_path(&auth_path, &publishing_path)
         .map_err(|error| DaemonError::Message(error.to_string()))?;
     let publishing = load_optional_publishing_config(&publishing_path)?;
@@ -96,9 +132,9 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
     watcher.watch(auth_parent, RecursiveMode::NonRecursive)?;
     state.reconcile(&root)?;
 
-    let mut active = resolve_active_credential(&store)
-        .map_err(|error| DaemonError::Message(error.to_string()))?
-        .ok_or_else(|| DaemonError::Message("team credentials are missing; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN and ARTIFACT_SYNC_SERVER_URL".into()))?;
+    let mut active = resolve_daemon_credential(&store, auth_file_only)?
+        .ok_or_else(|| DaemonError::Message(missing_credential_message(auth_file_only).into()))?;
+    let mut credential_source = Some(active.source.label().to_string());
 
     // Without a publishing config, the cached team is only a selection hint:
     // the gateway still verifies the credential and confirms this team before
@@ -199,24 +235,70 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
             }
             LoopEvent::Control(Ok((mut stream, _))) => {
                 let mut command = [0u8; 64];
-                if tokio::time::timeout(Duration::from_secs(2), stream.read(&mut command))
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-                    && command.starts_with(b"AUTH_CHANGED")
+                if let Ok(Ok(length)) =
+                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut command)).await
                 {
-                    auth_reload_armed = false;
-                    auth_reload_sleep
-                        .as_mut()
-                        .reset(Instant::now() + Duration::from_secs(24 * 60 * 60));
-                    reload_auth(
-                        &store,
-                        &mut expected_team,
-                        &mut manager,
-                        &mut cancellation,
-                        &mut auth_paused,
-                    )
-                    .await;
-                    stream.write_all(b"OK\n").await?;
+                    match std::str::from_utf8(&command[..length])
+                        .unwrap_or_default()
+                        .trim()
+                    {
+                        "AUTH_CHANGED" => {
+                            auth_reload_armed = false;
+                            auth_reload_sleep
+                                .as_mut()
+                                .reset(Instant::now() + Duration::from_secs(24 * 60 * 60));
+                            reload_auth(
+                                &store,
+                                &mut expected_team,
+                                auth_file_only,
+                                &mut credential_source,
+                                &mut manager,
+                                &mut cancellation,
+                                &mut auth_paused,
+                            )
+                            .await;
+                            let _ = stream.write_all(b"OK\n").await;
+                        }
+                        "STATUS" => {
+                            let status_result =
+                                state.pending_count().map(|pending_count| DaemonStatus {
+                                    publishing_state: if manager.is_some() {
+                                        PublishingState::Ready
+                                    } else if auth_paused {
+                                        PublishingState::Paused
+                                    } else {
+                                        PublishingState::Offline
+                                    },
+                                    process_id: std::process::id(),
+                                    artifact_root: root.to_string_lossy().into_owned(),
+                                    team: expected_team.clone(),
+                                    identity_verified: manager.is_some(),
+                                    credential_source: credential_source.clone(),
+                                    pending_count,
+                                });
+                            match status_result {
+                                Ok(status) => match serde_json::to_vec(&status) {
+                                    Ok(mut response) => {
+                                        response.push(b'\n');
+                                        let _ = stream.write_all(&response).await;
+                                    }
+                                    Err(error) => {
+                                        warn!(error = %error, "could not serialize daemon status");
+                                        let _ = stream
+                                            .write_all(b"{\"error\":\"status unavailable\"}\n")
+                                            .await;
+                                    }
+                                },
+                                Err(error) => {
+                                    warn!(error = %error, "could not read pending count for daemon status");
+                                    let _ = stream
+                                        .write_all(b"{\"error\":\"status unavailable\"}\n")
+                                        .await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             LoopEvent::Control(Err(error)) => {
@@ -274,6 +356,8 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                 reload_auth(
                     &store,
                     &mut expected_team,
+                    auth_file_only,
+                    &mut credential_source,
                     &mut manager,
                     &mut cancellation,
                     &mut auth_paused,
@@ -282,8 +366,9 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
             }
             LoopEvent::Retry => {
                 if manager.is_none() && !auth_paused && Instant::now() >= auth_retry_at {
-                    match resolve_active_credential(&store) {
+                    match resolve_daemon_credential(&store, auth_file_only) {
                         Ok(Some(mut active)) => {
+                            credential_source = Some(active.source.label().to_string());
                             match authenticate_for_daemon(&mut active, &store, &mut expected_team)
                                 .await
                             {
@@ -310,6 +395,7 @@ pub async fn run(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), Dae
                             }
                         }
                         Ok(None) => {
+                            credential_source = None;
                             auth_paused = true;
                             warn!(
                                 "team credentials were removed; queued uploads remain pending until login"
@@ -411,9 +497,31 @@ fn make_upload_manager(
     )))
 }
 
+fn resolve_daemon_credential(
+    store: &CredentialStore,
+    auth_file_only: bool,
+) -> Result<Option<ActiveCredential>, DaemonError> {
+    let result = if auth_file_only {
+        resolve_saved_credential(store)
+    } else {
+        resolve_active_credential(store)
+    };
+    result.map_err(|error| DaemonError::Message(error.to_string()))
+}
+
+fn missing_credential_message(auth_file_only: bool) -> &'static str {
+    if auth_file_only {
+        "saved team credentials are missing; run `artifact-sync login` before installing the service"
+    } else {
+        "team credentials are missing; run `artifact-sync login` or configure ARTIFACTS_PUBLISH_TOKEN and ARTIFACT_SYNC_SERVER_URL"
+    }
+}
+
 async fn reload_auth(
     store: &CredentialStore,
     expected_team: &mut Option<String>,
+    auth_file_only: bool,
+    credential_source: &mut Option<String>,
     manager: &mut Option<Arc<UploadManager>>,
     cancellation: &mut CancellationToken,
     auth_paused: &mut bool,
@@ -421,9 +529,10 @@ async fn reload_auth(
     invalidate_current_manager(manager, cancellation).await;
     *auth_paused = false;
 
-    let mut active = match resolve_active_credential(store) {
+    let mut active = match resolve_daemon_credential(store, auth_file_only) {
         Ok(Some(active)) => active,
         Ok(None) => {
+            *credential_source = None;
             *auth_paused = true;
             warn!("team credentials were removed; uploads are paused and queued work is preserved");
             return;
@@ -434,6 +543,7 @@ async fn reload_auth(
             return;
         }
     };
+    *credential_source = Some(active.source.label().to_string());
     match authenticate_for_daemon(&mut active, store, expected_team).await {
         Ok(Some(next)) => {
             *manager = Some(next);
@@ -540,10 +650,75 @@ fn is_ignored_path(root: &Path, path: &Path) -> bool {
     })
 }
 
+pub fn daemon_socket_path() -> Result<PathBuf, std::io::Error> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
+    })?;
+    Ok(home.join(".config/artifact-sync/daemon.sock"))
+}
+
+pub async fn daemon_is_running() -> Result<bool, std::io::Error> {
+    let path = daemon_socket_path()?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon control path is not a safe user-owned socket",
+        ));
+    }
+    match UnixStream::connect(path).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::ConnectionRefused
+                || error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn query_status() -> Result<Option<DaemonStatus>, std::io::Error> {
+    if !daemon_is_running().await? {
+        return Ok(None);
+    }
+    let mut stream = UnixStream::connect(daemon_socket_path()?).await?;
+    stream.write_all(b"STATUS\n").await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon status timed out")
+        })??;
+    if response.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "running daemon does not support status requests",
+        ));
+    }
+    serde_json::from_slice(&response)
+        .map(Some)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("daemon returned invalid status data: {error}"),
+            )
+        })
+}
+
 async fn bind_control_socket() -> Result<(UnixListener, SocketGuard), DaemonError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| DaemonError::Message("home directory unavailable".into()))?;
-    let directory = home.join(".config/artifact-sync");
+    let directory = daemon_socket_path()?
+        .parent()
+        .ok_or_else(|| DaemonError::Message("daemon control path has no parent".into()))?
+        .to_path_buf();
     let _directory_handle = crate::auth::store::open_private_directory(&directory)?;
     let path = directory.join("daemon.sock");
     match fs::symlink_metadata(&path) {
@@ -583,5 +758,30 @@ struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_protocol_labels_cached_identity_unverified_while_offline() {
+        let status = DaemonStatus {
+            publishing_state: PublishingState::Offline,
+            process_id: 42,
+            artifact_root: "/tmp/artifacts".into(),
+            team: Some("w3dev".into()),
+            identity_verified: false,
+            credential_source: Some("auth file".into()),
+            pending_count: 3,
+        };
+        let encoded = serde_json::to_value(status).unwrap();
+        assert_eq!(encoded["publishingState"], "offline");
+        assert_eq!(encoded["identityVerified"], false);
+        assert_eq!(encoded["pendingCount"], 3);
+        assert_eq!(encoded["processId"], 42);
+        assert_eq!(PublishingState::Ready.as_str(), "ready");
+        assert_eq!(PublishingState::Paused.as_str(), "paused");
     }
 }

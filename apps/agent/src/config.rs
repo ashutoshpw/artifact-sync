@@ -142,7 +142,7 @@ pub fn path_is_inside(path: &Path, root: &Path) -> Result<bool, std::io::Error> 
     Ok(path == root || path.starts_with(root))
 }
 
-fn canonicalize_missing_tail(path: &Path) -> Result<PathBuf, std::io::Error> {
+pub(crate) fn canonicalize_missing_tail(path: &Path) -> Result<PathBuf, std::io::Error> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

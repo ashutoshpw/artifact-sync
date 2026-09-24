@@ -220,8 +220,29 @@ pub async fn logout(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), 
 pub fn resolve_active_credential(
     store: &CredentialStore,
 ) -> Result<Option<ActiveCredential>, CommandError> {
-    let env_token = optional_environment_value("ARTIFACTS_PUBLISH_TOKEN")?;
-    let env_server = optional_environment_value("ARTIFACT_SYNC_SERVER_URL")?;
+    resolve_credential(store, true)
+}
+
+pub fn resolve_saved_credential(
+    store: &CredentialStore,
+) -> Result<Option<ActiveCredential>, CommandError> {
+    resolve_credential(store, false)
+}
+
+fn resolve_credential(
+    store: &CredentialStore,
+    allow_environment: bool,
+) -> Result<Option<ActiveCredential>, CommandError> {
+    let env_token = if allow_environment {
+        optional_environment_value("ARTIFACTS_PUBLISH_TOKEN")?
+    } else {
+        None
+    };
+    let env_server = if allow_environment {
+        optional_environment_value("ARTIFACT_SYNC_SERVER_URL")?
+    } else {
+        None
+    };
     if let Some(token) = env_token {
         if token.is_empty() {
             return Err(CommandError::Message(
@@ -548,6 +569,33 @@ mod tests {
                 .contains("selected server differs")
         );
         unsafe {
+            std::env::remove_var("ARTIFACT_SYNC_SERVER_URL");
+        }
+    }
+
+    #[test]
+    fn file_only_service_credential_resolution_ignores_environment_tokens_and_destinations() {
+        let _guard = lock().lock().unwrap();
+        unsafe {
+            std::env::set_var(
+                "ARTIFACTS_PUBLISH_TOKEN",
+                format!("as_api_{}", "C".repeat(43)),
+            );
+            std::env::set_var("ARTIFACT_SYNC_SERVER_URL", "https://environment.example");
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(temp.path().join("private/config.json"));
+        store
+            .save_login("https://saved.example", &saved_auth())
+            .unwrap();
+
+        let active = resolve_saved_credential(&store).unwrap().unwrap();
+        assert_eq!(active.source, CredentialSource::AuthFile);
+        assert_eq!(active.server_origin, "https://saved.example");
+        assert_eq!(active.access_token.expose(), SAVED_ACCESS);
+
+        unsafe {
+            std::env::remove_var("ARTIFACTS_PUBLISH_TOKEN");
             std::env::remove_var("ARTIFACT_SYNC_SERVER_URL");
         }
     }
