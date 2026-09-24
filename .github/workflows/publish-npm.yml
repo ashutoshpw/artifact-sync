@@ -26,6 +26,7 @@ jobs:
       - name: Install Rust 1.85
         run: |
           rustup toolchain install 1.85.0 --profile minimal
+          rustup component add rustfmt clippy
           rustup default 1.85.0
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
