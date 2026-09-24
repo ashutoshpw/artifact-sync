@@ -21,12 +21,14 @@ Replace operator-issued device publisher tokens with human signup/login, team-sc
 
 ## Steps
 - [x] Add schemas, D1 migration/configuration, Better Auth, email delivery, and account/team bootstrap.
+- [x] Apply `0000_identity_and_teams.sql` to the provisioned remote D1 database `artifact-db`.
 - [x] Add authenticated API-token/device flows and Worker-served login/settings/device pages.
 - [x] Replace public content and temporary-credential routes with private listing/read/upload routes.
 - [x] Update Rust CLI credential lifecycle and server-derived team/object-key contract.
 - [x] Document configuration/deployment prerequisites and verify tests/builds.
 
 ## Acceptance criteria
+- [x] The Worker D1 configuration targets the provisioned database and its initial identity/team migration is applied remotely.
 - [ ] Verified email or GitHub signup creates a user, unique team slug, and admin membership atomically/idempotently.
 - [ ] Each API/device credential is scoped to one team; access JWT verification is local and refresh is rotating/revocable.
 - [ ] Private `/<team-slug>/<relative-path>` reads map to the team-ID R2 prefix and deny unauthorized teams.
