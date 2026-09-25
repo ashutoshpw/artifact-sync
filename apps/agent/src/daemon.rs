@@ -5,7 +5,6 @@ use crate::auth::commands::{
 };
 use crate::auth::credentials::ActiveCredential;
 use crate::auth::store::CredentialStore;
-use crate::config::{SyncConfig, load_optional_publishing_config};
 use crate::state::{PendingItem, StateError, SyncState, split_artifact_relative_path};
 use crate::upload::{UploadError, UploadManager, UploadOutcome};
 use chrono::Utc;
@@ -27,11 +26,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const PUBLISH_PERMISSION: &str = "artifacts:publish";
-
-struct DaemonConfig {
-    selected_team: Option<String>,
-    sync: SyncConfig,
-}
+const DEBOUNCE: Duration = Duration::from_millis(750);
+const MAX_CONCURRENT_UPLOADS: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,8 +71,6 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
     #[error("authentication configuration failed: {0}")]
     Store(#[from] crate::auth::store::StoreError),
-    #[error("publishing configuration failed: {0}")]
-    Config(#[from] crate::config::ConfigError),
 }
 
 type JobResult = (PendingItem, Result<UploadOutcome, UploadError>);
@@ -86,7 +80,6 @@ enum LoopEvent {
     Control(std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>),
     Upload(Option<Result<JobResult, tokio::task::JoinError>>),
     AuthReload,
-    Audit,
     Retry,
     Debounce,
     Shutdown,
@@ -94,25 +87,12 @@ enum LoopEvent {
 
 pub async fn run(
     auth_path: PathBuf,
-    publishing_path: PathBuf,
+    root: PathBuf,
     auth_file_only: bool,
 ) -> Result<(), DaemonError> {
-    validate_auth_path(&auth_path, &publishing_path)
+    validate_auth_path(&auth_path, &root)
         .map_err(|error| DaemonError::Message(error.to_string()))?;
-    let publishing = load_optional_publishing_config(&publishing_path)?;
-    let root = publishing_path
-        .parent()
-        .ok_or_else(|| DaemonError::Message("publishing config has no parent directory".into()))?
-        .to_path_buf();
     fs::create_dir_all(&root)?;
-    let config = DaemonConfig {
-        selected_team: publishing
-            .as_ref()
-            .map(|publishing| publishing.team.clone()),
-        sync: publishing
-            .map(|publishing| publishing.sync)
-            .unwrap_or_default(),
-    };
 
     let state = Arc::new(SyncState::open_default()?);
     let store = Arc::new(CredentialStore::new(auth_path.clone()));
@@ -136,15 +116,12 @@ pub async fn run(
         .ok_or_else(|| DaemonError::Message(missing_credential_message(auth_file_only).into()))?;
     let mut credential_source = Some(active.source.label().to_string());
 
-    // Without a publishing config, the cached team is only a selection hint:
-    // the gateway still verifies the credential and confirms this team before
-    // any upload can be scheduled.
-    let mut expected_team = config.selected_team.clone().or_else(|| {
-        active
-            .cached_auth
-            .as_ref()
-            .map(|auth| auth.cached_identity.team.clone())
-    });
+    // The cached team is only a selection hint: the gateway still verifies the
+    // credential and confirms this team before any upload can be scheduled.
+    let mut expected_team = active
+        .cached_auth
+        .as_ref()
+        .map(|auth| auth.cached_identity.team.clone());
     let mut manager = authenticate_for_daemon(&mut active, &store, &mut expected_team).await?;
     let mut auth_paused = false;
     let mut auth_retry_delay = Duration::from_secs(1);
@@ -161,7 +138,7 @@ pub async fn run(
     let mut changed_paths = HashSet::<PathBuf>::new();
     let mut debounce_armed = false;
     let mut reconcile_after_debounce = false;
-    let debounce_duration = Duration::from_millis(config.sync.debounce_ms.clamp(50, 10_000));
+    let debounce_duration = DEBOUNCE;
     let debounce_sleep = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
     tokio::pin!(debounce_sleep);
     let auth_reload_sleep = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
@@ -170,10 +147,6 @@ pub async fn run(
     let mut cancellation = CancellationToken::new();
     let mut retry_timer = tokio::time::interval(Duration::from_secs(1));
     retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut audit_timer = tokio::time::interval(Duration::from_secs(
-        config.sync.audit_interval_seconds.max(1),
-    ));
-    audit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
     let mut terminate_signal =
@@ -186,7 +159,6 @@ pub async fn run(
             result = control_listener.accept() => LoopEvent::Control(result),
             joined = jobs.join_next(), if !jobs.is_empty() => LoopEvent::Upload(joined),
             _ = retry_timer.tick() => LoopEvent::Retry,
-            _ = audit_timer.tick(), if config.sync.audit_interval_seconds > 0 => LoopEvent::Audit,
             _ = &mut debounce_sleep, if debounce_armed => LoopEvent::Debounce,
             _ = &mut auth_reload_sleep, if auth_reload_armed => LoopEvent::AuthReload,
             _ = &mut shutdown_signal => LoopEvent::Shutdown,
@@ -209,7 +181,6 @@ pub async fn run(
                     }
                     for path in fs_event.paths {
                         if path == auth_path
-                            || path == publishing_path
                             || !path.starts_with(&root)
                             || is_ignored_path(&root, &path)
                         {
@@ -231,9 +202,11 @@ pub async fn run(
                     }
                 }
             }
-            LoopEvent::Filesystem(Some(Err(_))) => warn!(
-                "filesystem watcher reported an error; periodic audit can reconcile missed changes"
-            ),
+            LoopEvent::Filesystem(Some(Err(_))) => {
+                warn!(
+                    "filesystem watcher reported an error; changes may need a restart to reconcile"
+                )
+            }
             LoopEvent::Filesystem(None) => {
                 return Err(DaemonError::Message(
                     "filesystem watcher stopped unexpectedly".into(),
@@ -352,11 +325,6 @@ pub async fn run(
                 warn!("upload worker exited unexpectedly; pending work remains in local state")
             }
             LoopEvent::Upload(None) => {}
-            LoopEvent::Audit => {
-                if let Err(error) = state.reconcile(&root) {
-                    warn!(error = %error, "artifact audit failed");
-                }
-            }
             LoopEvent::AuthReload => {
                 auth_reload_armed = false;
                 reload_auth(
@@ -446,7 +414,6 @@ pub async fn run(
                 &state,
                 current_manager,
                 &root,
-                &config,
                 &cancellation,
                 &mut jobs,
                 &mut in_flight,
@@ -594,15 +561,11 @@ fn schedule_uploads(
     state: &SyncState,
     manager: &Arc<UploadManager>,
     root: &Path,
-    config: &DaemonConfig,
     cancellation: &CancellationToken,
     jobs: &mut JoinSet<JobResult>,
     in_flight: &mut HashSet<String>,
 ) -> Result<(), DaemonError> {
-    let available = config
-        .sync
-        .max_concurrent_uploads
-        .saturating_sub(in_flight.len());
+    let available = MAX_CONCURRENT_UPLOADS.saturating_sub(in_flight.len());
     if available == 0 {
         return Ok(());
     }
@@ -659,9 +622,6 @@ fn is_mutating_event_kind(kind: &EventKind) -> bool {
 }
 
 fn is_ignored_path(root: &Path, path: &Path) -> bool {
-    if path == root.join("config.json") {
-        return true;
-    }
     path.strip_prefix(root).ok().is_some_and(|relative| {
         relative
             .components()

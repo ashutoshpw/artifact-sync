@@ -4,9 +4,7 @@ use super::credentials::{
     TokenExchange, is_access_token, is_refresh_credential,
 };
 use super::store::{CredentialStore, StoreError};
-use crate::config::{
-    ConfigError, default_auth_config_path, load_publishing_config, path_is_inside,
-};
+use crate::config::{ConfigError, default_auth_config_path, path_is_inside};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,11 +27,9 @@ pub enum CommandError {
     TokenInput,
 }
 
-pub fn validate_auth_path(auth_path: &Path, publishing_path: &Path) -> Result<(), CommandError> {
-    if let Some(root) = publishing_path.parent()
-        && path_is_inside(auth_path, root).map_err(|_| {
-            CommandError::Message("could not resolve configuration paths safely".into())
-        })?
+pub fn validate_auth_path(auth_path: &Path, artifact_root: &Path) -> Result<(), CommandError> {
+    if path_is_inside(auth_path, artifact_root)
+        .map_err(|_| CommandError::Message("could not resolve configuration paths safely".into()))?
     {
         return Err(CommandError::Message(
             "authentication configuration must be outside the watched artifact root".into(),
@@ -46,9 +42,9 @@ pub async fn login(
     server: &str,
     token_stdin: bool,
     auth_path: PathBuf,
-    publishing_path: PathBuf,
+    artifact_root: PathBuf,
 ) -> Result<(), CommandError> {
-    validate_auth_path(&auth_path, &publishing_path)?;
+    validate_auth_path(&auth_path, &artifact_root)?;
     let origin = normalize_server_origin(server).map_err(CommandError::Message)?;
     println!("Destination server: {origin}");
     let client = AuthClient::new(origin.clone())?;
@@ -69,16 +65,6 @@ pub async fn login(
         return Err(CommandError::Message(
             "gateway returned inconsistent identity data; no credential was saved".into(),
         ));
-    }
-
-    if publishing_path.exists() {
-        let publishing = load_publishing_config(&publishing_path)?;
-        if identity.team != publishing.team {
-            return Err(CommandError::Message(format!(
-                "credential is authorized for team '{}' but publishing configuration selects '{}'; no credential was saved",
-                identity.team, publishing.team
-            )));
-        }
     }
 
     let auth = saved_auth_for_upload(&exchange);
@@ -175,8 +161,8 @@ fn open_browser_best_effort(url: &str) {
         .spawn();
 }
 
-pub async fn whoami(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), CommandError> {
-    validate_auth_path(&auth_path, &publishing_path)?;
+pub async fn whoami(auth_path: PathBuf, artifact_root: PathBuf) -> Result<(), CommandError> {
+    validate_auth_path(&auth_path, &artifact_root)?;
     let store = CredentialStore::new(auth_path);
     let mut active = resolve_active_credential(&store)?.ok_or_else(|| {
         CommandError::Message("no team credential is configured; run `artifact-sync login`".into())
@@ -190,8 +176,8 @@ pub async fn whoami(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), 
     Ok(())
 }
 
-pub async fn logout(auth_path: PathBuf, publishing_path: PathBuf) -> Result<(), CommandError> {
-    validate_auth_path(&auth_path, &publishing_path)?;
+pub async fn logout(auth_path: PathBuf, artifact_root: PathBuf) -> Result<(), CommandError> {
+    validate_auth_path(&auth_path, &artifact_root)?;
     let removed = CredentialStore::new(auth_path.clone()).logout()?;
     if removed {
         println!("Removed the locally stored team credential.");

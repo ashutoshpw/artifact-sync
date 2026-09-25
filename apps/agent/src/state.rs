@@ -340,9 +340,6 @@ pub fn is_valid_artifact_slug(value: &str) -> bool {
 }
 
 fn should_ignore(root: &Path, path: &Path) -> bool {
-    if path == root.join("config.json") {
-        return true;
-    }
     path.strip_prefix(root).ok().is_some_and(|relative| {
         relative
             .components()

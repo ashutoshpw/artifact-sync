@@ -28,8 +28,6 @@ pub(super) fn render_definition(settings: &ServiceSettings) -> Result<String, Se
         settings.executable.as_os_str(),
         std::ffi::OsStr::new("--auth-config"),
         settings.auth_config.as_os_str(),
-        std::ffi::OsStr::new("--config"),
-        settings.publishing_config.as_os_str(),
         std::ffi::OsStr::new("daemon"),
         std::ffi::OsStr::new("--auth-file-only"),
     ];
@@ -222,11 +220,11 @@ mod tests {
         let settings = ServiceSettings {
             executable: PathBuf::from("/Users/alice/Applications/Artifact & Sync"),
             auth_config: PathBuf::from("/Users/alice/.config/artifact-sync/config.json"),
-            publishing_config: PathBuf::from("/Users/alice/.agents/artifacts/config.json"),
         };
         let rendered = render_definition(&settings).unwrap();
         assert!(rendered.contains("Artifact &amp; Sync"));
         assert!(rendered.contains("--auth-file-only"));
+        assert!(!rendered.contains("--config"));
         assert!(rendered.contains(SERVICE_MARKER));
         assert!(!rendered.contains("ARTIFACTS_PUBLISH_TOKEN"));
         assert!(!rendered.contains("as_api_"));

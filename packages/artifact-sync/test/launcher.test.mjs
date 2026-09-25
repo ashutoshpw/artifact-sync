@@ -71,7 +71,7 @@ test("forwards arguments and stdio to the selected binary", async () => {
     platform: "linux",
     arch: "x64",
     vendorDirectory: "/tmp/artifact-sync-test",
-    argv: ["daemon", "--config", "/tmp/config.json"],
+    argv: ["daemon", "--auth-config", "/tmp/auth.json"],
     fileExists: () => true,
     spawnProcess: (binary, args, options) => {
       invocation = { binary, args, options };
@@ -81,7 +81,7 @@ test("forwards arguments and stdio to the selected binary", async () => {
   });
 
   assert.equal(code, 0);
-  assert.deepEqual(invocation.args, ["daemon", "--config", "/tmp/config.json"]);
+  assert.deepEqual(invocation.args, ["daemon", "--auth-config", "/tmp/auth.json"]);
   assert.deepEqual(invocation.options, { stdio: "inherit" });
   assert.match(invocation.binary, /artifact-sync-linux-x64$/);
 });

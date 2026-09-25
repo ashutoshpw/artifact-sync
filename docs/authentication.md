@@ -6,7 +6,7 @@ Artifact Sync uses Better Auth for web accounts and team-scoped API/device crede
 
 Users choose GitHub or email at `https://artifact.w3dev.app/auth/login`; email and password fields stay hidden until `Continue with email` is selected. Email/password accounts must verify their email before publishing access is provisioned. GitHub access is accepted only when Better Auth resolves a verified account email; an unverified social identity remains verification-required. A verified new account receives a personal team and an `owner` membership. The membership schema supports `owner`, `admin`, and `member` roles across multiple teams, but invitations and joining an additional team are not part of this release.
 
-The dashboard is `https://artifact.w3dev.app/dashboard`. Every authenticated page keeps the selected team, role, account menu, and sign-out action visible. `DASHBOARD_LAYOUT=sidebar|topnav` selects the navigation layout and defaults to `sidebar`. Each API token or authorized device is associated with exactly one user and one team. The server issues its team ID and permissions; the CLI's `team` setting is checked against that identity, never used as proof of access.
+The dashboard is `https://artifact.w3dev.app/dashboard`. Every authenticated page keeps the selected team, role, account menu, and sign-out action visible. `DASHBOARD_LAYOUT=sidebar|topnav` selects the navigation layout and defaults to `sidebar`. Each API token or authorized device is associated with exactly one user and one team. The server issues its team ID and permissions; the CLI never chooses a team or destination locally, and the gateway verifies that team before any upload.
 
 ## API and device credential lifetime
 
@@ -20,20 +20,7 @@ Because access JWT verification is stateless, revoking an API/device token block
 
 ## CLI and watched directory
 
-Optional publishing configuration lives at `~/.agents/artifacts/config.json`:
-
-```json
-{
-  "team": "w3dev",
-  "sync": {
-    "debounceMs": 750,
-    "maxConcurrentUploads": 2,
-    "auditIntervalSeconds": 0
-  }
-}
-```
-
-The directory containing the selected publishing config is the artifact root. Each immediate child directory is one artifact; its exact basename is the slug, validated with the same lowercase letter/digit/hyphen rules as team URL slugs. Nested directories are part of that artifact. Empty artifact directories, invalid slug names, and loose files at the root are ignored. If the default publishing config is absent, the daemon creates and watches `~/.agents/artifacts/` with default sync settings. The team comes from the authenticated credential; a saved identity cache may select the expected team, but the gateway validates the credential and confirms that team before uploads are enabled. If a publishing config exists, its team is checked against the server-validated identity and its sync settings are applied. The daemon reconciles files inside valid artifact directories at startup and watches the root. New and modified files are queued after the configured debounce period. A changed file is re-read before upload so a newer edit is not marked complete using stale bytes. The publishing config, auth config, symlinks, and `.artifact-sync` state are excluded. Deleting a local file does not delete an R2 object.
+The daemon always creates and watches `~/.agents/artifacts/`. Each immediate child directory is one artifact; its exact basename is the slug, validated with the same lowercase letter/digit/hyphen rules as team URL slugs. Nested directories are part of that artifact. Empty artifact directories, invalid slug names, and loose files at the root are ignored. The team comes from the authenticated credential; a saved identity cache may select the expected team, but the gateway validates the credential and confirms that team before uploads are enabled. The daemon reconciles files inside valid artifact directories at startup and watches the root. New and modified files are queued after a 750 ms debounce, at most two uploads run concurrently, and a changed file is re-read before upload so a newer edit is not marked complete using stale bytes. The auth config, symlinks, and `.artifact-sync` state are excluded. Deleting a local file does not delete an R2 object. The only configuration file is the authentication config at `~/.config/artifact-sync/config.json`; the artifact directory never contains daemon configuration.
 
 The Worker receives the file bytes, artifact slug, and path relative to that artifact over the authenticated gateway request, then derives the key as:
 
@@ -58,9 +45,9 @@ secret-manager read artifact-sync/api-token | artifact-sync login \
   --server https://artifact.w3dev.app --token-stdin
 ```
 
-There is intentionally no `--token <secret>` option. Login validates the exchange with `GET /__api/v1/auth/me`, checks the configured publishing team if a publishing config exists, and only then atomically saves the new credential. A failed login leaves an existing credential unchanged. Login does not start the watcher, upload files, change the configured team, or rebind sync state.
+There is intentionally no `--token <secret>` option. Login validates the exchange with `GET /__api/v1/auth/me` and only then atomically saves the new credential. A failed login leaves an existing credential unchanged. Login does not start the watcher, upload files, or rebind sync state.
 
-Saved authentication is separate from publishing configuration and has this shape at `~/.config/artifact-sync/config.json` on macOS and Linux:
+Saved authentication is the CLI's only configuration file and has this shape at `~/.config/artifact-sync/config.json` on macOS and Linux:
 
 ```json
 {
@@ -84,7 +71,7 @@ Saved authentication is separate from publishing configuration and has this shap
 }
 ```
 
-The identity/expiry cache is informational; the gateway is authoritative. Artifact-local configuration never chooses the destination of a saved credential. Use `--auth-config PATH` or `ARTIFACT_SYNC_AUTH_CONFIG` to select another auth file; these are distinct from publishing `--config PATH`. A credential file located inside the watched artifact root is rejected.
+The identity/expiry cache is informational; the gateway is authoritative. Local configuration never chooses the destination of a saved credential. Use `--auth-config PATH` or `ARTIFACT_SYNC_AUTH_CONFIG` to select another auth file. A credential file located inside the watched artifact root is rejected.
 
 Credential precedence is:
 
@@ -106,7 +93,7 @@ artifact-sync service install
 artifact-sync service status
 ```
 
-The supported managers are macOS `launchd` and Linux `systemd --user`. Installation uses the absolute executable path plus the selected auth and publishing config paths. It registers, enables, and starts the watcher for the current user; it does not need root or Cloudflare credentials. The service explicitly uses saved-file credentials only, so `ARTIFACTS_PUBLISH_TOKEN` or other shell environment values are never copied into a launchd plist or systemd unit. The installed auth path is not changed implicitly; pass the same `--auth-config` and `--config` values to later service commands if non-default paths were used during installation.
+The supported managers are macOS `launchd` and Linux `systemd --user`. Installation uses the absolute executable path and the selected auth config path. It registers, enables, and starts the watcher for the current user; it does not need root or Cloudflare credentials. The service explicitly uses saved-file credentials only, so `ARTIFACTS_PUBLISH_TOKEN` or other shell environment values are never copied into a launchd plist or systemd unit. The installed auth path is not changed implicitly; pass the same `--auth-config` value to later service commands if a non-default path was used during installation.
 
 The daemon recursively reconciles the artifact root on startup. If files are already present, `service install` asks before starting; non-interactive installs must include `--yes`. Starting a previously stopped service has the same confirmation behavior:
 

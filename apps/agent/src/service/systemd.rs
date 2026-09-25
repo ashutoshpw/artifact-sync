@@ -17,8 +17,6 @@ pub(super) fn render_definition(settings: &ServiceSettings) -> Result<String, Se
         settings.executable.as_os_str(),
         std::ffi::OsStr::new("--auth-config"),
         settings.auth_config.as_os_str(),
-        std::ffi::OsStr::new("--config"),
-        settings.publishing_config.as_os_str(),
         std::ffi::OsStr::new("daemon"),
         std::ffi::OsStr::new("--auth-file-only"),
     ];
@@ -220,11 +218,11 @@ mod tests {
         let settings = ServiceSettings {
             executable: PathBuf::from("/opt/artifact-sync"),
             auth_config: PathBuf::from("/home/alice/.config/artifact-sync/config.json"),
-            publishing_config: PathBuf::from("/home/alice/.agents/artifacts/config.json"),
         };
         let rendered = render_definition(&settings).unwrap();
         assert!(rendered.contains(SERVICE_MARKER));
         assert!(rendered.contains("--auth-file-only"));
+        assert!(!rendered.contains("--config"));
         assert!(rendered.contains("RestartSec=30s"));
         assert!(!rendered.contains("ProtectKernelModules="));
         assert!(!rendered.contains("ARTIFACTS_PUBLISH_TOKEN"));
@@ -246,7 +244,6 @@ mod tests {
         let settings = ServiceSettings {
             executable: std::env::current_exe().unwrap(),
             auth_config: temp.path().join("auth config.json"),
-            publishing_config: temp.path().join("artifact root/config.json"),
         };
         let unit = temp.path().join(UNIT_NAME);
         std::fs::write(&unit, render_definition(&settings).unwrap()).unwrap();

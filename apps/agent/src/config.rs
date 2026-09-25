@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -6,83 +5,20 @@ use thiserror::Error;
 pub enum ConfigError {
     #[error("home directory is unavailable")]
     HomeUnavailable,
-    #[error("could not read publishing configuration: {0}")]
-    Read(#[from] std::io::Error),
-    #[error("publishing configuration is invalid: {0}")]
-    Parse(#[from] serde_json::Error),
-    #[error("publishing team must use lowercase letters, digits, hyphens, or underscores")]
-    InvalidTeam,
-    #[error("sync.maxConcurrentUploads must be between 1 and 32")]
-    InvalidConcurrency,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SyncConfig {
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u64,
-    #[serde(default = "default_max_concurrent_uploads")]
-    pub max_concurrent_uploads: usize,
-    #[serde(default)]
-    pub audit_interval_seconds: u64,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            debounce_ms: default_debounce_ms(),
-            max_concurrent_uploads: default_max_concurrent_uploads(),
-            audit_interval_seconds: 0,
-        }
-    }
-}
-
-fn default_debounce_ms() -> u64 {
-    750
-}
-fn default_max_concurrent_uploads() -> usize {
-    2
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct PublishingConfig {
-    pub team: String,
-    #[serde(default)]
-    pub sync: SyncConfig,
-}
-
-impl PublishingConfig {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.team.is_empty()
-            || self.team.len() > 63
-            || !self.team.bytes().enumerate().all(|(index, byte)| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || (index > 0 && (byte == b'-' || byte == b'_'))
-            })
-            || !self.team.as_bytes()[0].is_ascii_lowercase()
-                && !self.team.as_bytes()[0].is_ascii_digit()
-        {
-            return Err(ConfigError::InvalidTeam);
-        }
-        if !(1..=32).contains(&self.sync.max_concurrent_uploads) {
-            return Err(ConfigError::InvalidConcurrency);
-        }
-        Ok(())
-    }
+    #[error("configuration path could not be resolved: {0}")]
+    Path(#[from] std::io::Error),
 }
 
 pub fn home_dir() -> Result<PathBuf, ConfigError> {
     dirs::home_dir().ok_or(ConfigError::HomeUnavailable)
 }
 
-pub fn default_publishing_config_path() -> Result<PathBuf, ConfigError> {
-    Ok(home_dir()?.join(".agents/artifacts/config.json"))
-}
-
 pub fn default_auth_config_path() -> Result<PathBuf, ConfigError> {
     Ok(home_dir()?.join(".config/artifact-sync/config.json"))
+}
+
+pub fn default_artifact_root() -> Result<PathBuf, ConfigError> {
+    Ok(home_dir()?.join(".agents/artifacts"))
 }
 
 pub fn resolve_auth_config_path(argument: Option<PathBuf>) -> Result<PathBuf, ConfigError> {
@@ -93,12 +29,6 @@ pub fn resolve_auth_config_path(argument: Option<PathBuf>) -> Result<PathBuf, Co
         return expand_home(PathBuf::from(value));
     }
     default_auth_config_path()
-}
-
-pub fn resolve_publishing_config_path(argument: Option<PathBuf>) -> Result<PathBuf, ConfigError> {
-    argument
-        .map(expand_home)
-        .unwrap_or_else(default_publishing_config_path)
 }
 
 fn expand_home(path: PathBuf) -> Result<PathBuf, ConfigError> {
@@ -114,26 +44,6 @@ fn expand_home(path: PathBuf) -> Result<PathBuf, ConfigError> {
     } else {
         Ok(std::env::current_dir()?.join(expanded))
     }
-}
-
-pub fn load_publishing_config(path: &Path) -> Result<PublishingConfig, ConfigError> {
-    let text = std::fs::read_to_string(path)?;
-    let config: PublishingConfig = serde_json::from_str(&text)?;
-    config.validate()?;
-    Ok(config)
-}
-
-pub fn load_optional_publishing_config(
-    path: &Path,
-) -> Result<Option<PublishingConfig>, ConfigError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ConfigError::Read(error)),
-    };
-    let config: PublishingConfig = serde_json::from_str(&text)?;
-    config.validate()?;
-    Ok(Some(config))
 }
 
 pub fn path_is_inside(path: &Path, root: &Path) -> Result<bool, std::io::Error> {
@@ -184,21 +94,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_rejects_local_server_destination() {
-        let parsed = serde_json::from_str::<PublishingConfig>(
-            r#"{"team":"w3dev","serverUrl":"https://evil.example"}"#,
-        );
-        assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn optional_publishing_config_accepts_missing_file_but_rejects_malformed_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.json");
-        assert!(load_optional_publishing_config(&path).unwrap().is_none());
-
-        std::fs::write(&path, "not-json").unwrap();
-        assert!(load_optional_publishing_config(&path).is_err());
+    fn default_paths_stay_separate_and_outside_each_other() {
+        let auth = default_auth_config_path().unwrap();
+        let root = default_artifact_root().unwrap();
+        assert!(auth.ends_with(".config/artifact-sync/config.json"));
+        assert!(root.ends_with(".agents/artifacts"));
+        assert!(!auth.starts_with(&root));
     }
 
     #[test]

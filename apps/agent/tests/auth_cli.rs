@@ -154,21 +154,13 @@ fn private_auth(path: &Path, origin: &str) {
         .unwrap();
 }
 
-fn publishing_config(root: &Path, team: &str) -> std::path::PathBuf {
-    std::fs::create_dir_all(root).unwrap();
-    let path = root.join("config.json");
-    std::fs::write(
-        &path,
-        format!(r#"{{"team":"{team}","sync":{{"debounceMs":50,"maxConcurrentUploads":1,"auditIntervalSeconds":0}}}}"#),
-    )
-    .unwrap();
-    path
+fn artifact_root(home: &Path) -> std::path::PathBuf {
+    home.join(".agents/artifacts")
 }
 
 fn spawn_command(
     home: &Path,
     auth_path: &Path,
-    publishing_path: &Path,
     args: &[&str],
     input: Option<&str>,
     environment_token: Option<&str>,
@@ -182,8 +174,6 @@ fn spawn_command(
         .env("RUST_LOG", "debug")
         .arg("--auth-config")
         .arg(auth_path)
-        .arg("--config")
-        .arg(publishing_path)
         .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -204,7 +194,6 @@ fn spawn_command(
 async fn run_command(
     home: &Path,
     auth_path: &Path,
-    publishing_path: &Path,
     args: &[&str],
     input: Option<&str>,
     environment_token: Option<&str>,
@@ -213,7 +202,6 @@ async fn run_command(
     let mut child = spawn_command(
         home,
         auth_path,
-        publishing_path,
         args,
         input,
         environment_token,
@@ -234,14 +222,12 @@ async fn run_command(
 fn spawn_daemon(
     home: &Path,
     auth_path: &Path,
-    publishing_path: &Path,
     environment_token: Option<&str>,
     server_origin: Option<&str>,
 ) -> Child {
     spawn_command(
         home,
         auth_path,
-        publishing_path,
         &["daemon"],
         None,
         environment_token,
@@ -249,7 +235,7 @@ fn spawn_daemon(
     )
 }
 
-fn spawn_daemon_without_publishing_config(
+fn spawn_daemon_with_environment_server(
     home: &Path,
     auth_path: &Path,
     server_origin: &str,
@@ -282,12 +268,12 @@ async fn wait_for_daemon_ready(home: &Path) {
 }
 
 #[tokio::test]
-async fn daemon_starts_from_auth_config_without_publishing_config() {
+async fn daemon_starts_from_auth_config_without_any_artifact_config() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let artifact_root = home.join(".agents/artifacts");
-    let publishing_path = artifact_root.join("config.json");
+    let root = artifact_root(&home);
+    let config_path = root.join("config.json");
     let auth_path = home.join(".config/artifact-sync/config.json");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -296,7 +282,7 @@ async fn daemon_starts_from_auth_config_without_publishing_config() {
         sequence_server(listener, vec![MockResponse::json(200, identity("w3dev"))]).await;
     private_auth(&auth_path, &server_origin);
 
-    let mut daemon = spawn_daemon_without_publishing_config(&home, &auth_path, &server_origin);
+    let mut daemon = spawn_daemon_with_environment_server(&home, &auth_path, &server_origin);
     wait_for_daemon_ready(&home).await;
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
         .await
@@ -304,8 +290,8 @@ async fn daemon_starts_from_auth_config_without_publishing_config() {
         .unwrap();
 
     assert!(request.starts_with("GET /__api/v1/auth/me "));
-    assert!(artifact_root.is_dir());
-    assert!(!publishing_path.exists());
+    assert!(root.is_dir());
+    assert!(!config_path.exists());
     assert!(daemon.try_wait().unwrap().is_none());
 
     daemon.start_kill().unwrap();
@@ -337,8 +323,6 @@ async fn stdin_api_token_login_rotates_saves_and_reuses_credentials_after_restar
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_origin = origin(&listener);
@@ -355,7 +339,6 @@ async fn stdin_api_token_login_rotates_saves_and_reuses_credentials_after_restar
     let login = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &["login", "--server", &server_origin, "--token-stdin"],
         Some(&format!("{API_TOKEN}\n")),
         None,
@@ -379,16 +362,7 @@ async fn stdin_api_token_login_rotates_saves_and_reuses_credentials_after_restar
     assert_eq!(saved.refresh_token.expose(), ROTATED_REFRESH);
     assert_eq!(saved.cached_identity.team, "w3dev");
 
-    let whoami = run_command(
-        &home,
-        &auth_path,
-        &publishing_path,
-        &["whoami"],
-        None,
-        None,
-        None,
-    )
-    .await;
+    let whoami = run_command(&home, &auth_path, &["whoami"], None, None, None).await;
     assert!(whoami.status.success(), "{}", output_text(&whoami));
     let output = output_text(&whoami);
     assert!(output.contains("Server: "));
@@ -409,12 +383,10 @@ async fn stdin_api_token_login_rotates_saves_and_reuses_credentials_after_restar
 }
 
 #[tokio::test]
-async fn invalid_or_mismatched_login_preserves_existing_credentials() {
+async fn invalid_login_preserves_existing_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_origin = origin(&listener);
@@ -431,7 +403,6 @@ async fn invalid_or_mismatched_login_preserves_existing_credentials() {
     let invalid = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &["login", "--server", &server_origin, "--token-stdin"],
         Some(&format!("{API_TOKEN}\n")),
         None,
@@ -453,55 +424,6 @@ async fn invalid_or_mismatched_login_preserves_existing_credentials() {
         "POST /__api/v1/auth/refresh HTTP/1.1"
     );
     server.await.unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mismatch_origin = origin(&listener);
-    let (mut requests, server) = sequence_server(
-        listener,
-        vec![
-            MockResponse::json(200, exchange(ROTATED_REFRESH, "other-team")),
-            MockResponse::json(200, identity("other-team")),
-        ],
-    )
-    .await;
-    let mismatch = run_command(
-        &home,
-        &auth_path,
-        &publishing_path,
-        &["login", "--server", &mismatch_origin, "--token-stdin"],
-        Some(&format!("{API_TOKEN}\n")),
-        None,
-        None,
-    )
-    .await;
-    assert!(!mismatch.status.success());
-    assert!(output_text(&mismatch).contains("publishing configuration selects 'w3dev'"));
-    assert_eq!(
-        CredentialStore::new(&auth_path)
-            .load()
-            .unwrap()
-            .unwrap()
-            .auth
-            .unwrap()
-            .refresh_token
-            .expose(),
-        SAVED_REFRESH
-    );
-    assert!(
-        requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("POST /__api/v1/auth/refresh ")
-    );
-    assert!(
-        requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("GET /__api/v1/auth/me ")
-    );
-    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -509,13 +431,10 @@ async fn headless_login_requires_stdin_and_cross_origin_redirect_never_receives_
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let no_input = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &["login", "--server", "https://artifact.w3dev.app"],
         None,
         None,
@@ -535,7 +454,6 @@ async fn headless_login_requires_stdin_and_cross_origin_redirect_never_receives_
     let redirected = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &["login", "--server", &server_origin, "--token-stdin"],
         Some(&format!("{API_TOKEN}\n")),
         None,
@@ -557,13 +475,11 @@ async fn auth_file_path_inside_artifact_root_is_rejected_before_network_access()
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
+    let root = artifact_root(&home);
     let auth_path = root.join("private-auth.json");
     let result = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &[
             "login",
             "--server",
@@ -585,24 +501,13 @@ async fn offline_whoami_does_not_claim_cached_identity_is_verified() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_origin = origin(&listener);
     drop(listener);
     private_auth(&auth_path, &server_origin);
 
-    let whoami = run_command(
-        &home,
-        &auth_path,
-        &publishing_path,
-        &["whoami"],
-        None,
-        None,
-        None,
-    )
-    .await;
+    let whoami = run_command(&home, &auth_path, &["whoami"], None, None, None).await;
     assert!(!whoami.status.success());
     let output = output_text(&whoami);
     assert!(output.contains("authentication server is unreachable"));
@@ -615,8 +520,6 @@ async fn logout_preserves_other_settings_and_reports_environment_credential() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     private_auth(&auth_path, "https://artifact.w3dev.app");
     let mut raw: serde_json::Value =
@@ -629,7 +532,6 @@ async fn logout_preserves_other_settings_and_reports_environment_credential() {
     let logout = run_command(
         &home,
         &auth_path,
-        &publishing_path,
         &["logout"],
         None,
         Some(API_TOKEN),
@@ -652,8 +554,6 @@ async fn environment_api_token_is_not_persisted_and_idle_daemon_does_not_poll_au
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_origin = origin(&listener);
@@ -679,13 +579,7 @@ async fn environment_api_token_is_not_persisted_and_idle_daemon_does_not_poll_au
         }
     });
 
-    let mut daemon = spawn_daemon(
-        &home,
-        &auth_path,
-        &publishing_path,
-        Some(API_TOKEN),
-        Some(&server_origin),
-    );
+    let mut daemon = spawn_daemon(&home, &auth_path, Some(API_TOKEN), Some(&server_origin));
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
         .await
         .unwrap()
@@ -715,15 +609,14 @@ async fn offline_startup_keeps_new_files_pending_and_recovers_with_rotated_auth(
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
+    let root = artifact_root(&home);
     let auth_path = home.join(".config/artifact-sync/config.json");
     let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
     let server_origin = format!("http://{address}");
     private_auth(&auth_path, &server_origin);
-    let mut daemon = spawn_daemon(&home, &auth_path, &publishing_path, None, None);
+    let mut daemon = spawn_daemon(&home, &auth_path, None, None);
     wait_for_daemon_ready(&home).await;
 
     let artifact = root.join("first/manifest.json");
@@ -818,8 +711,7 @@ async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let root = temp.path().join("artifacts");
-    let publishing_path = publishing_config(&root, "w3dev");
+    let root = artifact_root(&home);
     let auth_path = home.join(".config/artifact-sync/config.json");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_origin = origin(&listener);
@@ -846,7 +738,7 @@ async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
         });
     });
 
-    let mut daemon = spawn_daemon(&home, &auth_path, &publishing_path, None, None);
+    let mut daemon = spawn_daemon(&home, &auth_path, None, None);
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(5), requests_rx.recv())
             .await
@@ -865,16 +757,7 @@ async fn logout_during_upload_cancels_best_effort_and_preserves_pending_work() {
             .unwrap();
     assert!(upload_request.starts_with("PUT /__api/v1/uploads?"));
 
-    let logout = run_command(
-        &home,
-        &auth_path,
-        &publishing_path,
-        &["logout"],
-        None,
-        None,
-        None,
-    )
-    .await;
+    let logout = run_command(&home, &auth_path, &["logout"], None, None, None).await;
     assert!(logout.status.success(), "{}", output_text(&logout));
     assert!(output_text(&logout).contains("running daemon was notified"));
     let database = state_database(&home);
