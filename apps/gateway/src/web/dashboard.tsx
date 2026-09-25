@@ -49,6 +49,10 @@ function initial(value: string): string {
   return value.trim().charAt(0).toUpperCase() || "A";
 }
 
+function CsrfField({ token }: { token: string }) {
+  return <input type="hidden" name="csrfToken" value={token} />;
+}
+
 function navigation(teamId: string) {
   return [
     { id: "overview" as const, label: "Overview", short: "OV", href: `/dashboard/${teamId}` },
@@ -140,6 +144,7 @@ function AccountMenu({ session, variant = "header" }: { session: DashboardSessio
         <strong>{session.identity.email}</strong>
         <a href="/auth/device">Connect another device</a>
         <form method="post" action="/auth/logout">
+          <CsrfField token={session.csrfToken} />
           <button type="submit">Sign out</button>
         </form>
       </div>
@@ -374,6 +379,7 @@ export function GeneralSettingsPage({ session, settings, origin, feedback }: { s
             </div>
             {team.role === "owner" ? (
               <form class="slug-form" method="post" action={`/dashboard/${team.id}/settings/general`} data-slug-form>
+                <CsrfField token={session.csrfToken} />
                 <div class="field"><label for="slug">New team slug</label><input id="slug" name="slug" value={team.slug} minlength={1} maxlength={63} pattern="[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?" required disabled={!canChange} /><p>Use lowercase letters, numbers, and hyphens. A team can change its slug once every 30 days.</p></div>
                 {settings.nextAvailableAt && !canChange ? <p class="cooldown">Next change available {formatDate(settings.nextAvailableAt)}.</p> : null}
                 <button class="button primary" type="submit" disabled={!canChange}>Update slug</button>
@@ -410,13 +416,14 @@ export function TokensPage({ session, page, createdToken, feedback }: { session:
       {createdToken ? <SecretReveal name={createdToken.name} token={createdToken.token} /> : null}
       <div class="table-panel">
         <div class="table-toolbar"><h2>Credentials</h2><span>{page.items.length} on this page</span></div>
-        {page.items.length ? <div class="data-table token-table" role="table" aria-label="API tokens"><div class="table-row table-head" role="row"><span>Name</span><span>Owner</span><span>Last refreshed</span><span>Expires</span><span>Status</span><span>Action</span></div>{page.items.map((token) => <TokenRow key={token.id} team={team} token={token} />)}</div> : <EmptyState title="No API tokens" body="Create a token for CI, a server, or another trusted machine." />}
+        {page.items.length ? <div class="data-table token-table" role="table" aria-label="API tokens"><div class="table-row table-head" role="row"><span>Name</span><span>Owner</span><span>Last refreshed</span><span>Expires</span><span>Status</span><span>Action</span></div>{page.items.map((token) => <TokenRow key={token.id} team={team} token={token} csrfToken={session.csrfToken} />)}</div> : <EmptyState title="No API tokens" body="Create a token for CI, a server, or another trusted machine." />}
       </div>
       {page.nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/settings/api-tokens?cursor=${encodeURIComponent(page.nextCursor)}`}>Next page</a> : null}
 
       <dialog id="create-token" class="modal">
         <div class="modal-head"><div><p class="section-label">New credential</p><h2>Create API token</h2></div><button class="icon-button" type="button" data-dialog-close aria-label="Close">×</button></div>
         <form method="post" action={`/dashboard/${team.id}/settings/api-tokens`} class="modal-form">
+          <CsrfField token={session.csrfToken} />
           <div class="field"><label for="token-name">Token name</label><input id="token-name" name="name" maxlength={64} placeholder="Production publisher" required /><p>Use a name that identifies where the secret is stored.</p></div>
           <div class="scope-preview"><span>Scope</span><code>{team.slug}</code><small>artifacts:publish · artifacts:read</small></div>
           <div class="modal-actions"><button class="button secondary" type="button" data-dialog-close>Cancel</button><button class="button primary" type="submit">Create token</button></div>
@@ -426,7 +433,7 @@ export function TokensPage({ session, page, createdToken, feedback }: { session:
   );
 }
 
-function TokenRow({ team, token }: { team: DashboardSession["team"]; token: DashboardToken }) {
+function TokenRow({ team, token, csrfToken }: { team: DashboardSession["team"]; token: DashboardToken; csrfToken: string }) {
   const status = token.revokedAt ? "Revoked" : new Date(token.expiresAt).getTime() <= Date.now() ? "Expired" : "Active";
   return (
     <div class="table-row" role="row">
@@ -435,7 +442,7 @@ function TokenRow({ team, token }: { team: DashboardSession["team"]; token: Dash
       <span>{formatDate(token.lastUsedAt)}</span>
       <span>{formatDate(token.expiresAt)}</span>
       <span><span class={`status ${status.toLowerCase()}`}>{status}</span></span>
-      <span>{!token.revokedAt ? <form method="post" action={`/dashboard/${team!.id}/settings/api-tokens/revoke`} data-confirm={`Revoke ${token.name}? Future refreshes will stop immediately.`}><input type="hidden" name="tokenId" value={token.id} /><button class="danger-link" type="submit">Revoke</button></form> : <span class="muted">—</span>}</span>
+      <span>{!token.revokedAt ? <form method="post" action={`/dashboard/${team!.id}/settings/api-tokens/revoke`} data-confirm={`Revoke ${token.name}? Future refreshes will stop immediately.`}><CsrfField token={csrfToken} /><input type="hidden" name="tokenId" value={token.id} /><button class="danger-link" type="submit">Revoke</button></form> : <span class="muted">—</span>}</span>
     </div>
   );
 }
@@ -460,14 +467,14 @@ export function DevicesPage({ session, page, scope, feedback }: { session: Dashb
       {canViewTeam ? <nav class="scope-tabs" aria-label="Device scope"><a href={`/dashboard/${team.id}/settings/devices?scope=mine`} aria-current={scope === "mine" ? "page" : undefined}>My devices</a><a href={`/dashboard/${team.id}/settings/devices?scope=team`} aria-current={scope === "team" ? "page" : undefined}>All team devices</a></nav> : null}
       <div class="table-panel">
         <div class="table-toolbar"><h2>{scope === "team" ? "Team devices" : "Your devices"}</h2><span>{page.items.length} on this page</span></div>
-        {page.items.length ? <div class="data-table device-table" role="table" aria-label="Connected devices"><div class="table-row table-head" role="row"><span>Device</span><span>Connected by</span><span>Last refreshed</span><span>Expires</span><span>Status</span><span>Action</span></div>{page.items.map((device) => <DeviceRow key={device.id} team={team} device={device} />)}</div> : <EmptyState title="No connected devices" body="Run artifact-sync login and approve the code to connect the first machine." actionHref="/auth/device" actionLabel="Connect a device" />}
+        {page.items.length ? <div class="data-table device-table" role="table" aria-label="Connected devices"><div class="table-row table-head" role="row"><span>Device</span><span>Connected by</span><span>Last refreshed</span><span>Expires</span><span>Status</span><span>Action</span></div>{page.items.map((device) => <DeviceRow key={device.id} team={team} device={device} csrfToken={session.csrfToken} />)}</div> : <EmptyState title="No connected devices" body="Run artifact-sync login and approve the code to connect the first machine." actionHref="/auth/device" actionLabel="Connect a device" />}
       </div>
       {page.nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/settings/devices?scope=${scope}&cursor=${encodeURIComponent(page.nextCursor)}`}>Next page</a> : null}
     </DashboardDocument>
   );
 }
 
-function DeviceRow({ team, device }: { team: DashboardSession["team"]; device: DashboardDevice }) {
+function DeviceRow({ team, device, csrfToken }: { team: DashboardSession["team"]; device: DashboardDevice; csrfToken: string }) {
   const status = device.revokedAt ? "Revoked" : new Date(device.expiresAt).getTime() <= Date.now() ? "Expired" : "Connected";
   return (
     <div class="table-row" role="row">
@@ -476,7 +483,7 @@ function DeviceRow({ team, device }: { team: DashboardSession["team"]; device: D
       <span>{formatDate(device.lastUsedAt)}</span>
       <span>{formatDate(device.expiresAt)}</span>
       <span><span class={`status ${status.toLowerCase()}`}>{status}</span></span>
-      <span>{!device.revokedAt ? <form method="post" action={`/dashboard/${team!.id}/settings/devices/revoke`} data-confirm={`Revoke ${device.name}? The device will need to sign in again.`}><input type="hidden" name="tokenId" value={device.tokenId} /><button class="danger-link" type="submit">Revoke</button></form> : <span class="muted">—</span>}</span>
+      <span>{!device.revokedAt ? <form method="post" action={`/dashboard/${team!.id}/settings/devices/revoke`} data-confirm={`Revoke ${device.name}? The device will need to sign in again.`}><CsrfField token={csrfToken} /><input type="hidden" name="tokenId" value={device.tokenId} /><button class="danger-link" type="submit">Revoke</button></form> : <span class="muted">—</span>}</span>
     </div>
   );
 }
@@ -499,7 +506,7 @@ export function DeviceApprovalPage({ session, code, success, error }: { session:
         <main class="approval-main">
           <section class="approval-copy"><p class="page-eyebrow">Device authorization</p><h1>Approve a trusted machine.</h1><p>Confirm the code printed by <code>artifact-sync login</code>. The device receives access to one team only.</p><ol><li>Keep the CLI open.</li><li>Confirm the short code.</li><li>Choose the destination team.</li></ol></section>
           <section class="approval-card">
-            {success ? <div class="approval-success"><span class="success-mark">✓</span><h2>Device approved</h2><p>Return to the terminal. The CLI will finish connecting automatically.</p><a class="button primary" href="/dashboard">Open dashboard</a></div> : <><div class="modal-head"><div><p class="section-label">Verification</p><h2>Authorize device</h2></div><span class="status pending">10 min expiry</span></div><Feedback error={error} /><form method="post" action="/auth/device" class="modal-form"><div class="field"><label for="user-code">Device code</label><input id="user-code" name="userCode" class="code-input" value={code} minlength={8} maxlength={8} pattern="[A-HJ-NP-Z2-9]{8}" autocomplete="one-time-code" required /></div><div class="field"><label for="teamId">Grant access to</label><select id="teamId" name="teamId" required>{session.teams.map((team) => <option value={team.id}>{team.name} · {team.slug}</option>)}</select></div><button class="button primary" type="submit">Approve device</button></form></>}
+            {success ? <div class="approval-success"><span class="success-mark">✓</span><h2>Device approved</h2><p>Return to the terminal. The CLI will finish connecting automatically.</p><a class="button primary" href="/dashboard">Open dashboard</a></div> : <><div class="modal-head"><div><p class="section-label">Verification</p><h2>Authorize device</h2></div><span class="status pending">10 min expiry</span></div><Feedback error={error} /><form method="post" action="/auth/device" class="modal-form"><CsrfField token={session.csrfToken} /><div class="field"><label for="user-code">Device code</label><input id="user-code" name="userCode" class="code-input" value={code} minlength={8} maxlength={8} pattern="[A-HJ-NP-Z2-9]{8}" autocomplete="one-time-code" required /></div><div class="field"><label for="teamId">Grant access to</label><select id="teamId" name="teamId" required>{session.teams.map((team) => <option value={team.id}>{team.name} · {team.slug}</option>)}</select></div><button class="button primary" type="submit">Approve device</button></form></>}
           </section>
         </main>
       </body>

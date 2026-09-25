@@ -2,10 +2,12 @@ import type { Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HtmlEscapedString } from "hono/utils/html";
 import { createWebAuth } from "../auth/better-auth.ts";
+import { isDashboardMutationAllowed } from "../auth/csrf.ts";
 import { handleApiTokens, handleDeviceApprove, handleRevokeApiToken } from "../auth/routes.ts";
 import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
 import { handleTeam } from "../auth/team-routes.ts";
 import type { GatewayEnv } from "../auth/types.ts";
+import { getWebSession } from "../auth/web-session.ts";
 import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, TokensPage } from "./dashboard.tsx";
 import { dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
 import {
@@ -90,11 +92,13 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/dashboard/:teamId/settings/general", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
     const teamId = c.req.param("teamId");
     const session = await dashboardSession(c, teamId);
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const form = await c.req.raw.formData();
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
     const response = await handleTeam(proxyJsonRequest(c.req.raw, `/__api/v1/teams/${encodeURIComponent(teamId)}`, "PATCH", {
       slug: String(form.get("slug") ?? ""),
     }), c.env, teamId);
@@ -119,11 +123,13 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/dashboard/:teamId/settings/api-tokens", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
     const teamId = c.req.param("teamId");
     const session = await dashboardSession(c, teamId);
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const form = await c.req.raw.formData();
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
     const response = await handleApiTokens(proxyJsonRequest(c.req.raw, "/__api/v1/api-tokens", "POST", {
       name: String(form.get("name") ?? ""),
       teamId,
@@ -138,12 +144,14 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/dashboard/:teamId/settings/api-tokens/revoke", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
     const teamId = c.req.param("teamId");
     const session = await dashboardSession(c, teamId);
     if (session instanceof Response) return session;
     if (!session.team) return c.text("Not found", 404);
-    const form = await c.req.raw.formData();
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
     const tokenId = String(form.get("tokenId") ?? "");
     const response = await handleRevokeApiToken(proxyRequest(c.req.raw, `/__api/v1/api-tokens/${encodeURIComponent(tokenId)}`, "DELETE"), c.env, tokenId);
     if (response.status === 204) return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/api-tokens?revoked=1`, 303);
@@ -160,12 +168,14 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/dashboard/:teamId/settings/devices/revoke", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
     const teamId = c.req.param("teamId");
     const session = await dashboardSession(c, teamId);
     if (session instanceof Response) return session;
     if (!session.team) return c.text("Not found", 404);
-    const form = await c.req.raw.formData();
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
     const tokenId = String(form.get("tokenId") ?? "");
     const response = await handleRevokeApiToken(proxyRequest(c.req.raw, `/__api/v1/api-tokens/${encodeURIComponent(tokenId)}`, "DELETE"), c.env, tokenId);
     if (response.status === 204) return c.redirect(`/dashboard/${encodeURIComponent(session.team.id)}/settings/devices?revoked=1`, 303);
@@ -180,11 +190,13 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/auth/device", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
     const session = await dashboardSession(c);
     if (session instanceof Response) return session;
     if (!session.teams.length) return c.redirect("/dashboard", 302);
-    const form = await c.req.raw.formData();
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
     const userCode = String(form.get("userCode") ?? "").toUpperCase();
     const response = await handleDeviceApprove(proxyJsonRequest(c.req.raw, "/__api/v1/device/approve", "POST", {
       userCode,
@@ -196,7 +208,12 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   });
 
   app.post("/auth/logout", async (c) => {
-    if (!sameOrigin(c.req.raw)) return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    if (isOpaqueOrigin(c.req.raw)) {
+      const form = await c.req.raw.formData();
+      const webSession = await getWebSession(c.req.raw, c.env);
+      if (!webSession || !isDashboardMutationAllowed(c.req.raw, form, webSession.csrfToken)) return forbidden(c);
+    }
     const authResponse = withNoStore(await createWebAuth(c.env).handler(proxyJsonRequest(c.req.raw, "/__api/auth/sign-out", "POST", { disableRedirect: true })));
     const headers = new Headers({ Location: "/auth/login", "Cache-Control": "no-store", Pragma: "no-cache" });
     authResponse.headers.forEach((value, name) => {
@@ -239,9 +256,17 @@ function proxyRequest(request: Request, path: string, method: string, options: {
   return new Request(new URL(path, request.url), { method, headers, body: options.body });
 }
 
-function sameOrigin(request: Request): boolean {
+function forbidden(c: DashboardContext): Response {
+  return c.text("Forbidden", 403, Object.fromEntries(noStoreHeaders()));
+}
+
+function hasForeignOrigin(request: Request): boolean {
   const origin = request.headers.get("Origin");
-  return !origin || origin === new URL(request.url).origin;
+  return Boolean(origin && origin !== "null" && origin !== new URL(request.url).origin);
+}
+
+function isOpaqueOrigin(request: Request): boolean {
+  return request.headers.get("Origin") === "null";
 }
 
 function safeUserCode(value: string | undefined): string {

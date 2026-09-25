@@ -5,7 +5,7 @@ import { authError } from "../auth/middleware.ts";
 import { safePermissions } from "../auth/permissions.ts";
 import { isValidTeamSlug, TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug.ts";
 import type { GatewayEnv } from "../auth/types.ts";
-import { getWebIdentity, type WebIdentity } from "../auth/web-session.ts";
+import { getWebSession, type WebIdentity } from "../auth/web-session.ts";
 
 export type TeamRole = "owner" | "admin" | "member";
 export type DashboardLayout = "sidebar" | "topnav";
@@ -19,6 +19,7 @@ export interface DashboardTeam {
 
 export interface DashboardSession {
   identity: WebIdentity;
+  csrfToken: string;
   teams: DashboardTeam[];
   team?: DashboardTeam;
   layout: DashboardLayout;
@@ -80,13 +81,14 @@ export async function requireDashboardSession(
   env: GatewayEnv,
   teamId?: string,
 ): Promise<DashboardSession | Response> {
-  const identity = await getWebIdentity(request, env).catch(() => null);
-  if (!identity) return authError(401, "web_session_required");
-  const teams = await listUserTeams(identity.id, env);
+  const webSession = await getWebSession(request, env).catch(() => null);
+  if (!webSession) return authError(401, "web_session_required");
+  const teams = await listUserTeams(webSession.identity.id, env);
   const team = teamId ? teams.find((candidate) => candidate.id === teamId) : teams[0];
   if (teamId && !team) return authError(404, "team_not_found");
   return {
-    identity,
+    identity: webSession.identity,
+    csrfToken: webSession.csrfToken,
     teams,
     team,
     layout: dashboardLayout(env),

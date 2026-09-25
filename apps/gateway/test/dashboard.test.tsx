@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { renderToString } from "hono/jsx/dom/server";
-import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
+import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
 import { listDashboardArtifactFiles, listDashboardArtifacts, type DashboardSession } from "../src/web/dashboard-service.ts";
 
 const team = {
@@ -13,6 +13,7 @@ const team = {
 function session(layout: "sidebar" | "topnav"): DashboardSession {
   return {
     identity: { id: "user-1", name: "Ashutosh Kumar", email: "ashutosh@w3.dev" },
+    csrfToken: "csrf-token",
     teams: [team],
     team,
     layout,
@@ -31,6 +32,7 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('class="sidebar"');
     expect(html).toContain("W3Dev");
     expect(html).toContain('action="/auth/logout"');
+    expect(html).toContain('name="csrfToken" value="csrf-token"');
     expect(html).toContain('href="/dashboard/team-1/artifacts"');
     expect(html).toContain("Workspace content");
     const footer = html.slice(html.indexOf('class="sidebar-foot"'), html.indexOf("</aside>"));
@@ -194,6 +196,34 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("Created once");
     expect(html).toContain("w3dev");
     expect(html).toContain("Revoke");
+    expect(html).toContain('name="csrfToken" value="csrf-token"');
+  });
+
+  it("adds the session CSRF field to device revocation forms", async () => {
+    const html = await renderToString(
+      <DevicesPage
+        session={session("sidebar")}
+        scope="mine"
+        page={{
+          items: [{
+            id: "device-1",
+            tokenId: "api-1",
+            name: "Laptop",
+            platform: "linux",
+            clientVersion: "0.1.2",
+            owner: { id: "user-1", name: "Ashutosh Kumar", email: "ashutosh@w3.dev" },
+            createdAt: "2026-09-24T10:00:00.000Z",
+            lastUsedAt: "2026-09-24T11:00:00.000Z",
+            expiresAt: "2026-12-23T10:00:00.000Z",
+            revokedAt: null,
+          }],
+          nextCursor: null,
+        }}
+      />,
+    );
+
+    expect(html).toContain("Laptop");
+    expect(html).toContain('name="csrfToken" value="csrf-token"');
   });
 
   it("renders slug history, cooldown state, and device approval", async () => {
@@ -215,10 +245,12 @@ describe("dashboard server rendering", () => {
     expect(settingsHtml).toContain("Next change available");
     expect(settingsHtml).toContain("http://127.0.0.1:8787/w3dev/");
     expect(settingsHtml).toContain('data-copy-target="artifact-base-url"');
+    expect(settingsHtml).toContain('name="csrfToken" value="csrf-token"');
 
     const approvalHtml = await renderToString(<DeviceApprovalPage session={session("sidebar")} code="ABCD2345" />);
     expect(approvalHtml).toContain("ABCD2345");
     expect(approvalHtml).toContain("W3Dev · w3dev");
     expect(approvalHtml).toContain("Approve device");
+    expect(approvalHtml).toContain('name="csrfToken" value="csrf-token"');
   });
 });

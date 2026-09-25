@@ -302,6 +302,17 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
       body: "tokenId=api_12345678-1234-4234-9234-123456789abc",
     }), env);
     expect(mutation.status).toBe(403);
+
+    const opaque = await worker.fetch(request("/dashboard/team-1/settings/api-tokens/revoke", {
+      method: "POST",
+      headers: {
+        Origin: "null",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: "tokenId=api_12345678-1234-4234-9234-123456789abc",
+    }), env);
+    expect(opaque.status).toBe(403);
+    expect(await opaque.text()).toBe("Forbidden");
   });
 
   it("replaces untrusted return paths with the safe dashboard fallback", async () => {
