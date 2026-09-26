@@ -23,6 +23,7 @@ interface DashboardDocumentProps {
   active: DashboardSection;
   children: Child;
   bodyClass?: string;
+  accountShell?: boolean;
 }
 
 interface PageHeaderProps {
@@ -79,18 +80,19 @@ function navigation(teamId: string) {
   ];
 }
 
-export function DashboardDocument({ session, title, active, children, bodyClass = "" }: DashboardDocumentProps) {
+export function DashboardDocument({ session, title, active, children, bodyClass = "", accountShell = false }: DashboardDocumentProps) {
   const team = session.team;
   const items = team ? navigation(team.id) : [];
+  const layout = accountShell ? "account" : session.layout;
   return (
     <html
       lang="en"
-      data-layout={session.layout}
+      data-layout={layout}
       data-theme={session.theme}
       data-theme-state={resolvedTheme(session.theme)}
-      data-sidebar-width={session.layout === "sidebar" ? String(session.sidebar.width) : undefined}
-      data-sidebar-last-expanded={session.layout === "sidebar" ? String(session.sidebar.lastExpanded) : undefined}
-      data-sidebar-collapsed={session.layout === "sidebar" && session.sidebar.collapsed ? "true" : "false"}
+      data-sidebar-width={!accountShell && session.layout === "sidebar" ? String(session.sidebar.width) : undefined}
+      data-sidebar-last-expanded={!accountShell && session.layout === "sidebar" ? String(session.sidebar.lastExpanded) : undefined}
+      data-sidebar-collapsed={!accountShell && session.layout === "sidebar" ? (session.sidebar.collapsed ? "true" : "false") : undefined}
     >
       <head>
         <meta charset="utf-8" />
@@ -102,26 +104,29 @@ export function DashboardDocument({ session, title, active, children, bodyClass 
         <script src="/assets/dashboard.js" defer />
       </head>
       <body class={bodyClass}>
-        <div class={`dashboard-frame layout-${session.layout}`}>
+        <div class={`dashboard-frame layout-${layout}`}>
           <header class="context-bar">
             <a class="brand" href={team ? `/dashboard/${team.id}` : "/dashboard"} aria-label="Artifact Sync dashboard">
               <span class="brand-mark" aria-hidden="true">A</span>
               <span class="brand-name">Artifact Sync</span>
             </a>
-            {team ? <TeamSwitcher session={session} /> : <span class="context-spacer" />}
+            {team && !accountShell ? <TeamSwitcher session={session} /> : <span class="context-spacer" />}
             <div class="context-actions">
               <a class="quiet-link" href="/auth/device">Connect device</a>
               <AccountMenu session={session} />
             </div>
           </header>
 
-          {session.layout === "topnav" && team ? <TopNavigation active={active} items={items} /> : null}
+          {session.layout === "topnav" && team && !accountShell ? <TopNavigation active={active} items={items} /> : null}
           <div class="dashboard-body">
-            {session.layout === "sidebar" && team ? <Sidebar session={session} active={active} items={items} /> : null}
-            <main class="dashboard-main" id="main-content">{children}</main>
+            {accountShell ? <AccountSidebar session={session} /> : session.layout === "sidebar" && team ? <Sidebar session={session} active={active} items={items} /> : null}
+            <main class={`dashboard-main${accountShell ? " account-main" : ""}`} id="main-content">
+              {accountShell ? <a class="account-mobile-back" href={team ? `/dashboard/${team.id}` : "/dashboard"}><AccountIcon name="arrow-left" /><span>Back to dashboard</span></a> : null}
+              {children}
+            </main>
           </div>
 
-          {team ? <MobileNavigation session={session} active={active} items={items} /> : null}
+          {team && !accountShell ? <MobileNavigation session={session} active={active} items={items} /> : null}
         </div>
       </body>
     </html>
@@ -166,7 +171,31 @@ function TeamSwitcher({ session }: { session: DashboardSession }) {
   );
 }
 
+type AccountIconName = "arrow-left" | "dashboard" | "device" | "logout" | "moon" | "settings" | "sun" | "system";
+
+function AccountIcon({ name, className = "account-menu-icon" }: { name: AccountIconName; className?: string }) {
+  const icon = name === "arrow-left" ? (
+    <path d="M13 8H3.5m0 0L7 4.5M3.5 8 7 11.5" />
+  ) : name === "dashboard" ? (
+    <><rect x="2.5" y="2.5" width="4" height="4" rx=".7" /><rect x="9.5" y="2.5" width="4" height="4" rx=".7" /><rect x="2.5" y="9.5" width="4" height="4" rx=".7" /><rect x="9.5" y="9.5" width="4" height="4" rx=".7" /></>
+  ) : name === "device" ? (
+    <><rect x="3.5" y="2" width="9" height="12" rx="1.5" /><path d="M6.5 11.5h3" /></>
+  ) : name === "logout" ? (
+    <><path d="M7 2.5H3.5v11H7M9 5.5 11.5 8 9 10.5M11.5 8H5.5" /></>
+  ) : name === "moon" ? (
+    <path d="M11.8 10.9A5 5 0 0 1 5.1 4.2 5.2 5.2 0 1 0 11.8 10.9Z" />
+  ) : name === "settings" ? (
+    <><path d="m8 2 .7 1.3 1.5.4 1.3-.7 1.5 1.5-.7 1.3.4 1.5L14 8l-1.3.7-.4 1.5.7 1.3-1.5 1.5-1.3-.7-1.5.4L8 14l-.7-1.3-1.5-.4-1.3.7L3 11.5l.7-1.3-.4-1.5L2 8l1.3-.7.4-1.5L3 4.5 4.5 3l1.3.7 1.5-.4Z" /><circle cx="8" cy="8" r="2" /></>
+  ) : name === "sun" ? (
+    <><circle cx="8" cy="8" r="2.7" /><path d="M8 1.5v1.3M8 13.2v1.3M1.5 8h1.3M13.2 8h1.3M3.4 3.4l.9.9M11.7 11.7l.9.9M12.6 3.4l-.9.9M4.3 11.7l-.9.9" /></>
+  ) : (
+    <><rect x="2.5" y="3" width="11" height="7.5" rx="1.2" /><path d="M6 13h4M8 10.5V13" /></>
+  );
+  return <svg class={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icon}</svg>;
+}
+
 function AccountMenu({ session, variant = "header" }: { session: DashboardSession; variant?: "header" | "sidebar" }) {
+  const dashboardHref = session.team ? `/dashboard/${session.team.id}` : "/dashboard";
   return (
     <details class={`account-menu${variant === "sidebar" ? " sidebar-account" : ""}`}>
       <summary aria-label="Account menu">
@@ -175,15 +204,26 @@ function AccountMenu({ session, variant = "header" }: { session: DashboardSessio
         <span class="chevron" aria-hidden="true">⌄</span>
       </summary>
       <div class="account-popover">
-        <p>Signed in as</p>
-        <strong>{session.identity.email}</strong>
-        <a href="/account/settings">Account settings</a>
-        <a href="/auth/device">Connect another device</a>
-        <ThemePicker theme={session.theme} compact />
-        <form method="post" action="/auth/logout">
-          <CsrfField token={session.csrfToken} />
-          <button type="submit">Sign out</button>
-        </form>
+        <div class="account-popover-head">
+          <div class="account-popover-identity">
+            <span class="avatar" aria-hidden="true">{initial(session.identity.name)}</span>
+            <span class="account-copy"><strong>{session.identity.name}</strong><small>{session.identity.email}</small></span>
+          </div>
+          <a class="account-settings-link" href="/account/settings" aria-label="Account settings" title="Account settings">
+            <AccountIcon name="settings" />
+          </a>
+        </div>
+        <div class="account-menu-separator" />
+        <div class="account-menu-list">
+          <a class="account-menu-item" href={dashboardHref}><span>Dashboard</span><AccountIcon name="dashboard" /></a>
+          <a class="account-menu-item" href="/auth/device"><span>Connect another device</span><AccountIcon name="device" /></a>
+          <ThemePicker theme={session.theme} compact />
+          <div class="account-menu-separator" />
+          <form method="post" action="/auth/logout" class="account-menu-form">
+            <CsrfField token={session.csrfToken} />
+            <button class="account-menu-item" type="submit"><span>Sign out</span><AccountIcon name="logout" /></button>
+          </form>
+        </div>
       </div>
     </details>
   );
@@ -235,6 +275,26 @@ function Sidebar({ session, active, items }: { session: DashboardSession; active
         aria-valuetext={session.sidebar.collapsed ? "Collapsed" : `${session.sidebar.width} pixels`}
         title="Resize sidebar"
       />
+    </aside>
+  );
+}
+
+function AccountSidebar({ session }: { session: DashboardSession }) {
+  const dashboardHref = session.team ? `/dashboard/${session.team.id}` : "/dashboard";
+  return (
+    <aside class="account-sidebar" aria-label="Account navigation">
+      <div class="account-sidebar-head">
+        <a class="account-back-link" href={dashboardHref}><AccountIcon name="arrow-left" /><span>Back to dashboard</span></a>
+      </div>
+      <div class="account-sidebar-body">
+        <p class="account-sidebar-title">Account</p>
+        <nav class="account-sidebar-nav" aria-label="Account settings navigation">
+          <a href="/account/settings" aria-current="page"><AccountIcon name="settings" /><span>Account settings</span></a>
+        </nav>
+      </div>
+      <div class="account-sidebar-foot">
+        <AccountMenu session={session} variant="sidebar" />
+      </div>
     </aside>
   );
 }
@@ -303,12 +363,13 @@ function MobileNavigation({ session, active, items }: { session: DashboardSessio
 
 function ThemePicker({ theme, compact = false }: { theme: ThemePreference; compact?: boolean }) {
   return (
-    <div class={`theme-picker${compact ? " theme-picker-compact" : ""}`} data-theme-picker role="group" aria-label="Appearance">
-      {!compact ? <p class="theme-picker-label">Appearance</p> : null}
+    <div class={`theme-picker${compact ? " theme-picker-compact account-menu-theme" : ""}`} data-theme-picker role="group" aria-label="Appearance">
+      {compact ? <span class="theme-picker-compact-label">Theme</span> : <p class="theme-picker-label">Appearance</p>}
       <div class="theme-picker-options">
         {(["system", "light", "dark"] as const).map((choice) => (
-          <button type="button" data-theme-choice={choice} aria-pressed={theme === choice ? "true" : "false"}>
-            {choice[0].toUpperCase() + choice.slice(1)}
+          <button type="button" data-theme-choice={choice} aria-label={`Use ${choice} theme`} title={choice[0].toUpperCase() + choice.slice(1)} aria-pressed={theme === choice ? "true" : "false"}>
+            <AccountIcon name={choice === "system" ? "system" : choice === "light" ? "sun" : "moon"} />
+            {!compact ? <span class="theme-choice-label">{choice[0].toUpperCase() + choice.slice(1)}</span> : null}
           </button>
         ))}
       </div>
@@ -1040,7 +1101,7 @@ export function NoTeamsPage({ session }: { session: DashboardSession }) {
 
 export function AccountSettingsPage({ session }: { session: DashboardSession }) {
   return (
-    <DashboardDocument session={session} title="Account settings" active="account" bodyClass="account-page">
+    <DashboardDocument session={session} title="Account settings" active="account" bodyClass="account-page" accountShell>
       <PageHeader
         eyebrow="Account"
         title="Account settings"

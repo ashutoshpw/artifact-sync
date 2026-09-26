@@ -148,10 +148,30 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("Account settings");
     expect(html).toContain("Ashutosh Kumar");
     expect(html).toContain("ashutosh@w3.dev");
+    expect(html).toContain('class="dashboard-frame layout-account"');
+    expect(html).toContain('class="account-sidebar"');
+    expect(html).toContain("Back to dashboard");
     expect(html).toContain('data-theme="light"');
-    expect(html).toContain('data-theme-choice="light" aria-pressed="true"');
+    expect(html).toContain('data-theme-choice="light"');
+    expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("Your verified sign-in supplies these details.");
     expect(html).not.toContain("Team settings");
+    expect(html).not.toContain('class="team-switcher"');
+  });
+
+  it("keeps account settings outside the team shell for team members", async () => {
+    const html = await renderToString(<AccountSettingsPage session={session("sidebar")} />);
+
+    expect(html).toContain('class="dashboard-frame layout-account"');
+    expect(html).toContain('class="account-sidebar"');
+    expect(html).toContain('href="/dashboard/team-1"');
+    expect(html).toContain('href="/account/settings" aria-current="page"');
+    expect(html).toContain('aria-label="Account settings"');
+    expect(html).toContain('data-theme-choice="system"');
+    expect(html).toContain('data-theme-choice="light"');
+    expect(html).toContain('data-theme-choice="dark"');
+    expect(html).not.toContain('class="team-switcher"');
+    expect(html).not.toContain('<aside class="sidebar"');
   });
 
   it("renders the top navigation variant with equivalent resource links", async () => {
