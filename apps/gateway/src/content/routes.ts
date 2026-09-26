@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { authenticate, authError, noStoreHeaders } from "../auth/middleware.ts";
-import { EMBED_COOKIE, embedCookieHeader, findEmbedCredential, issueEmbedToken } from "../auth/embed.ts";
+import { EMBED_COOKIE, embedCookieHeader, findEmbedCredential, issueArtifactEmbedToken, issueEmbedToken } from "../auth/embed.ts";
 import { isValidTeamSlug } from "../auth/team-slug.ts";
 import { PUBLISH_PERMISSION, READ_PERMISSION } from "../auth/types.ts";
 import type { GatewayEnv, PublisherIdentity } from "../auth/types.ts";
@@ -142,6 +142,7 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   let access: { teamId: string; team: string } | Response;
   let embedCookie: string | null = null;
   let embedToken: string | null = null;
+  let embedCredential: Awaited<ReturnType<typeof findEmbedCredential>> = null;
   if (request.headers.has("Authorization")) {
     access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION);
     if (access instanceof Response) {
@@ -161,29 +162,29 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
     }
     access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION, scope.teamId);
     if (access instanceof Response) {
-      // Cross-site embeds withhold the session cookie from subresource requests
-      // (third-party cookie enforcement), so an embedded artifact document can
-      // load while its relative assets get 401s. Accept a short-lived embed
-      // credential minted for this team instead.
-      const credential = await findEmbedCredential(request, env, scope.teamId);
-      if (!credential) return access;
+      // Cross-site embeds may withhold the dashboard session cookie from
+      // subresources. Accept an explicit team token or a credential scoped to
+      // this artifact instead.
+      embedCredential = await findEmbedCredential(request, env, scope.teamId, artifactSlug);
+      if (!embedCredential) return access;
       access = { teamId: scope.teamId, team: scope.currentSlug };
-      if (credential === "query") {
-        embedToken = requestUrl.searchParams.get("token");
-        if (embedToken) embedCookie = embedToken;
-      }
-    } else {
-      const credential = await findEmbedCredential(request, env, scope.teamId);
-      if (credential === "query") {
-        embedToken = requestUrl.searchParams.get("token");
-        if (embedToken) embedCookie = embedToken;
-      } else if (!credential) {
-        // Any session-authenticated artifact request that did not present a
-        // valid embed credential seeds one, so assets requested from embed
-        // contexts the browser grants document access to keep working.
-        embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
-      }
     }
+  }
+
+  if (access instanceof Response) return access;
+  embedCredential ??= await findEmbedCredential(request, env, access.teamId, artifactSlug);
+  if (embedCredential?.source === "query") {
+    // An explicit share token remains authoritative, as before.
+    embedToken = embedCredential.token;
+    embedCookie = embedCredential.token;
+  } else if (embedCredential?.artifactSlug === artifactSlug) {
+    embedToken = embedCredential.token;
+  } else {
+    // Give a session or team-cookie authorized page a short-lived credential
+    // for this artifact only. The HTML/CSS rewriters attach it to same-artifact
+    // helpers so those requests do not depend on third-party cookies.
+    embedToken = (await issueArtifactEmbedToken(env, access.teamId, artifactSlug)).token;
+    if (!request.headers.has("Authorization") && !embedCredential) embedCookie = embedToken;
   }
 
   try {

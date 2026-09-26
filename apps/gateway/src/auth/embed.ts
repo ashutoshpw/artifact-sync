@@ -1,4 +1,5 @@
 import { signingKey } from "./jwt.ts";
+import { isValidTeamSlug } from "./team-slug.ts";
 import type { GatewayEnv } from "./types.ts";
 
 const EMBED_ISSUER = "artifact-sync";
@@ -15,8 +16,14 @@ interface EmbedClaims {
   aud: string;
   scope: string;
   teamId: string;
+  artifactSlug?: string;
   iat: number;
   exp: number;
+}
+
+export interface VerifiedEmbedToken {
+  teamId: string;
+  artifactSlug?: string;
 }
 
 export interface EmbedToken {
@@ -39,11 +46,28 @@ export function issueEmbedToken(
   });
 }
 
+export function issueArtifactEmbedToken(
+  env: GatewayEnv,
+  teamId: string,
+  artifactSlug: string,
+  now = Math.floor(Date.now() / 1000),
+): Promise<EmbedToken> {
+  return signEmbedClaims(env, {
+    iss: EMBED_ISSUER,
+    aud: EMBED_AUDIENCE,
+    scope: EMBED_SCOPE,
+    teamId,
+    artifactSlug,
+    iat: now,
+    exp: now + EMBED_TTL_SECONDS,
+  });
+}
+
 export async function verifyEmbedToken(
   env: GatewayEnv,
   token: string,
   now = Math.floor(Date.now() / 1000),
-): Promise<string | null> {
+): Promise<VerifiedEmbedToken | null> {
   if (!token || token.length > 4096) return null;
   const parts = token.split(".");
   if (parts.length !== 3 || parts.some((part) => !URL_SAFE.test(part))) return null;
@@ -66,7 +90,10 @@ export async function verifyEmbedToken(
       toArrayBuffer(signature),
       toArrayBuffer(new TextEncoder().encode(`${parts[0]}.${parts[1]}`)),
     );
-    return valid ? claims.teamId : null;
+    if (!valid) return null;
+    return claims.artifactSlug === undefined
+      ? { teamId: claims.teamId }
+      : { teamId: claims.teamId, artifactSlug: claims.artifactSlug };
   } catch {
     return null;
   }
@@ -89,6 +116,7 @@ function validEmbedClaims(value: unknown, now: number): value is EmbedClaims {
     && claims.aud === EMBED_AUDIENCE
     && claims.scope === EMBED_SCOPE
     && typeof claims.teamId === "string" && claims.teamId.length > 0
+    && (claims.artifactSlug === undefined || (typeof claims.artifactSlug === "string" && isValidTeamSlug(claims.artifactSlug)))
     && typeof claims.iat === "number" && Number.isSafeInteger(claims.iat) && claims.iat <= now + 60
     && typeof claims.exp === "number" && Number.isSafeInteger(claims.exp) && claims.exp > now
     && claims.exp - claims.iat <= EMBED_TTL_SECONDS;
@@ -100,11 +128,17 @@ export function embedCookieHeader(token: string): string {
 
 export type EmbedCredentialSource = "cookie" | "query";
 
+export interface EmbedCredential extends VerifiedEmbedToken {
+  source: EmbedCredentialSource;
+  token: string;
+}
+
 export async function findEmbedCredential(
   request: Request,
   env: GatewayEnv,
   expectedTeamId: string,
-): Promise<EmbedCredentialSource | null> {
+  expectedArtifactSlug: string,
+): Promise<EmbedCredential | null> {
   // Keep an explicit share URL authoritative when the browser also sends a
   // session or partitioned cookie; HTML/CSS responses propagate this token.
   const candidates: Array<{ source: EmbedCredentialSource; value: string | null }> = [
@@ -113,8 +147,12 @@ export async function findEmbedCredential(
   ];
   for (const { source, value } of candidates) {
     if (!value) continue;
-    const teamId = await verifyEmbedToken(env, value).catch(() => null);
-    if (teamId !== null && teamId === expectedTeamId) return source;
+    const claims = await verifyEmbedToken(env, value).catch(() => null);
+    if (
+      claims !== null
+      && claims.teamId === expectedTeamId
+      && (claims.artifactSlug === undefined || claims.artifactSlug === expectedArtifactSlug)
+    ) return { ...claims, source, token: value };
   }
   return null;
 }

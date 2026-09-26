@@ -10,6 +10,7 @@ Use the supplied HAR to fix authenticated published artifact subresources and re
 - HAR request 0 loads `.../index.html` with HTTP 200; its relative `site.css` request gets HTTP 401 with no body.
 - The same report also includes a failed external Google Fonts request; verify whether this is a separate browser/network issue.
 - The dashboard's sign-out form posts to `/auth/logout`.
+- Follow-up report: `/ashutosh-kumar-yaaawkla/w3dev-us-design-proposal/schemes/01-editorial/index.html` loads under a session, but linked `site.css` gets HTTP 401 without a query token.
 
 ## Approach
 - Trace artifact embed-token issuance and validation across document and relative asset requests.
@@ -22,10 +23,13 @@ Use the supplied HAR to fix authenticated published artifact subresources and re
 - [x] Review changes and run applicable checks.
 - [x] Commit and push to `origin/main`.
 - [x] Confirm the matching GitHub Actions deployment and report when retesting is ready.
+- [x] Add an artifact-scoped resource token for session-authenticated artifact pages that do not have an explicit `?token=`.
+- [ ] Deploy the follow-up and report retest readiness.
 
 ## Acceptance criteria
 - [x] Relative helper assets for a published artifact load under the same access conditions as its HTML document.
 - [x] Dashboard sign-out invalidates the browser session and returns the user to a signed-out page.
+- [x] A resource token minted without an explicit share URL authenticates same-artifact CSS and cannot access a sibling artifact.
 - [x] The `origin/main` commit's production deployment succeeds, or the blocking failed workflow step is reported precisely.
 
 ## References
