@@ -42,22 +42,25 @@ export async function uploadArtifact(request: Request, env: GatewayEnv): Promise
   }
   // Best-effort metadata sync: R2 remains the source of truth, so a metadata
   // failure never fails the upload. The dashboard reconciles missing rows.
-  try {
-    const now = new Date();
-    await createDatabase(env.DB).insert(artifacts)
-      .values({
-        id: crypto.randomUUID(),
-        teamId: context.identity.teamId,
-        slug: artifactSlug,
-        createdAt: now,
-        lastActivityAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [artifacts.teamId, artifacts.slug],
-        set: { lastActivityAt: now },
-      });
-  } catch (error) {
-    console.error("artifact metadata sync failed", error);
+  const db = env.DB;
+  if (db && typeof (db as { prepare?: unknown }).prepare === "function") {
+    try {
+      const now = new Date();
+      await createDatabase(db).insert(artifacts)
+        .values({
+          id: crypto.randomUUID(),
+          teamId: context.identity.teamId,
+          slug: artifactSlug,
+          createdAt: now,
+          lastActivityAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [artifacts.teamId, artifacts.slug],
+          set: { lastActivityAt: now },
+        });
+    } catch (error) {
+      console.error("artifact metadata sync failed", error);
+    }
   }
   return Response.json({ artifact: artifactSlug, path: relativePath }, { status: 201, headers: noStoreHeaders() });
 }

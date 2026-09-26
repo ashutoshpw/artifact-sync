@@ -287,7 +287,9 @@ async function loadArtifactMetadata(
     })
       .from(artifactProjects)
       .innerJoin(artifacts, eq(artifactProjects.artifactId, artifacts.id))
-      .where(eq(artifacts.teamId, teamId));
+      .innerJoin(projects, eq(artifactProjects.projectId, projects.id))
+      .where(eq(artifacts.teamId, teamId))
+      .orderBy(projects.name);
     return { artifactRows: rows, memberships, projects: projectRows };
   } catch (error) {
     console.error("artifact metadata load failed", error);
