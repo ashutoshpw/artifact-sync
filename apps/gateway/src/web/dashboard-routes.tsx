@@ -9,7 +9,7 @@ import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
 import { handleTeam } from "../auth/team-routes.ts";
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebSession } from "../auth/web-session.ts";
-import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, ProjectsPage, TokensPage } from "./dashboard.tsx";
+import { AccountSettingsPage, ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, ProjectsPage, TokensPage } from "./dashboard.tsx";
 import { artifactShareStyles, dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
 import {
   createDashboardProject,
@@ -39,6 +39,12 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   app.get("/assets/dashboard.css", (c) => c.body(dashboardStyles, 200, assetHeaders("text/css; charset=utf-8")));
   app.get("/assets/dashboard-share.css", (c) => c.body(artifactShareStyles, 200, assetHeaders("text/css; charset=utf-8")));
   app.get("/assets/dashboard.js", (c) => c.body(dashboardScript, 200, assetHeaders("text/javascript; charset=utf-8")));
+
+  app.get("/account/settings", async (c) => {
+    const session = await dashboardSession(c);
+    if (session instanceof Response) return session;
+    return dashboardHtml(c, <AccountSettingsPage session={session} />);
+  });
 
   app.get("/settings/api-tokens", async (c) => {
     const session = await dashboardSession(c);

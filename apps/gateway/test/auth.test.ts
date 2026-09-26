@@ -274,6 +274,17 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(lookups).toEqual([]);
   });
 
+  it("reserves account routes from artifact fallback", async () => {
+    const { env, lookups } = makeEnv();
+    const token = await accessToken();
+    const response = await worker.fetch(request("/account/reports/today.json", {
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+
+    expect(response.status).toBe(404);
+    expect(lookups).toEqual([]);
+  });
+
   it("rejects traversal and provides team-bounded listing", async () => {
     const { env, lookups } = makeEnv();
     const token = await accessToken();
@@ -363,6 +374,41 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const root = await worker.fetch(request("/"), env);
     expect(root.status).toBe(302);
     expect(root.headers.get("Location")).toContain("returnTo=%2Fdashboard");
+  });
+
+  it("protects account settings and allows a verified user without a team to view it", async () => {
+    const { sqlite, db } = createMigratedDb();
+    const { env } = makeEnv(db);
+    (env as unknown as Record<string, unknown>).EMAIL = { send: async () => {} };
+    const auth = createWebAuth(env);
+    const signUp = await auth.api.signUpEmail({
+      body: { name: "No Team User", email: "no-team@example.test", password: "sync-test-password" },
+    });
+    if (!signUp) throw new Error("expected signup to succeed");
+    sqlite.exec("UPDATE user SET email_verified = 1 WHERE email = 'no-team@example.test'");
+    const signIn = await auth.api.signInEmail({
+      body: { email: "no-team@example.test", password: "sync-test-password" },
+      asResponse: true,
+    });
+    const sessionCookie = signIn.headers.getSetCookie()
+      .find((cookie) => cookie.startsWith("better-auth.session_token=") || cookie.startsWith("__Secure-better-auth.session_token="));
+    if (!sessionCookie) throw new Error("expected a session cookie from sign-in");
+    const sessionCookiePair = sessionCookie.split(";")[0];
+
+    const page = await worker.fetch(request("/account/settings", { headers: { Cookie: sessionCookiePair } }), env);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("Account settings");
+    expect(html).toContain("No Team User");
+    expect(html).toContain("no-team@example.test");
+    expect(html).toContain("Appearance");
+    expect(html).toContain('data-theme="system"');
+    expect(page.headers.get("Cache-Control")).toBe("no-store");
+    expect(page.headers.get("Content-Security-Policy")).not.toContain("unsafe-inline");
+
+    const unauthenticated = await worker.fetch(request("/account/settings"), env);
+    expect(unauthenticated.status).toBe(302);
+    expect(unauthenticated.headers.get("Location")).toContain("/auth/login?returnTo=%2Faccount%2Fsettings");
   });
 
   it("signs out through Better Auth and rejects cross-origin dashboard mutations", async () => {

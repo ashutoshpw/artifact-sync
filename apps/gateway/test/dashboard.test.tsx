@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { renderToString } from "hono/jsx/dom/server";
 import { createMigratedDb } from "./d1.ts";
-import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, ProjectsPage, TokensPage } from "../src/web/dashboard.tsx";
+import { AccountSettingsPage, ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, ProjectsPage, TokensPage } from "../src/web/dashboard.tsx";
 import {
   createDashboardProject,
   backfillArtifactMetadata,
@@ -18,6 +18,8 @@ import {
   type DashboardArtifact,
   type DashboardSession,
 } from "../src/web/dashboard-service.ts";
+import { defaultSidebarPreference, parseSidebarCookieValue, parseThemeCookieValue, readDashboardPreferences, serializeSidebarCookie, serializeThemeCookie } from "../src/web/dashboard-preferences.ts";
+import { artifactShareStyles, dashboardScript, dashboardStyles } from "../src/web/dashboard-assets.ts";
 
 const team = {
   id: "team-1",
@@ -35,6 +37,8 @@ function session(layout: "sidebar" | "topnav"): DashboardSession {
     team,
     layout,
     timeZone: "UTC",
+    theme: "system",
+    sidebar: defaultSidebarPreference(),
   };
 }
 
@@ -107,6 +111,47 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("Workspace content");
     const footer = html.slice(html.indexOf('class="sidebar-foot"'), html.indexOf("</aside>"));
     expect(footer).toContain('class="account-menu sidebar-account"');
+  });
+
+  it("renders theme metadata, the full mobile destination surface, and sidebar controls", async () => {
+    const html = await renderToString(
+      <DashboardDocument session={session("sidebar")} title="Overview" active="overview">
+        <p>Workspace content</p>
+      </DashboardDocument>,
+    );
+
+    expect(html).toContain('data-theme="system"');
+    expect(html).toContain('data-theme-state="system"');
+    expect(html).toContain('data-sidebar-width="236"');
+    expect(html).toContain('data-sidebar-last-expanded="236"');
+    expect(html).toContain('role="separator"');
+    expect(html).toContain('aria-valuemin="140"');
+    expect(html).toContain('aria-valuemax="320"');
+    expect(html).toContain('data-mobile-nav-open');
+    expect(html).toContain('id="mobile-dashboard-navigation"');
+    expect(html).toContain('href="/dashboard/team-1/settings/general"');
+    expect(html).toContain('href="/account/settings"');
+    expect(html).toContain('data-theme-choice="light"');
+    expect(html).toContain('data-theme-choice="dark"');
+    expect(html).not.toContain(" style=");
+  });
+
+  it("renders a no-team account page with read-only identity and appearance controls", async () => {
+    const noTeamSession: DashboardSession = {
+      ...session("sidebar"),
+      teams: [],
+      team: undefined,
+      theme: "light",
+    };
+    const html = await renderToString(<AccountSettingsPage session={noTeamSession} />);
+
+    expect(html).toContain("Account settings");
+    expect(html).toContain("Ashutosh Kumar");
+    expect(html).toContain("ashutosh@w3.dev");
+    expect(html).toContain('data-theme="light"');
+    expect(html).toContain('data-theme-choice="light" aria-pressed="true"');
+    expect(html).toContain("Your verified sign-in supplies these details.");
+    expect(html).not.toContain("Team settings");
   });
 
   it("renders the top navigation variant with equivalent resource links", async () => {
@@ -471,6 +516,47 @@ describe("dashboard server rendering", () => {
     expect(approvalHtml).toContain("W3Dev · w3dev");
     expect(approvalHtml).toContain("Approve device");
     expect(approvalHtml).toContain('name="csrfToken" value="csrf-token"');
+    expect(approvalHtml).toContain('data-theme="system"');
+    expect(approvalHtml).toContain('name="color-scheme" content="light dark"');
+  });
+});
+
+describe("dashboard preference contracts", () => {
+  it("emits a parseable external dashboard script", () => {
+    expect(() => new Function(dashboardScript)).not.toThrow();
+  });
+
+  it("emits bounded external selectors for the sidebar rail and widths", () => {
+    expect(dashboardStyles).toContain('html[data-layout="sidebar"][data-sidebar-width="64"]{--sidebar:64px}');
+    expect(dashboardStyles).toContain('html[data-layout="sidebar"][data-sidebar-width="140"]{--sidebar:140px}');
+    expect(dashboardStyles).toContain('html[data-layout="sidebar"][data-sidebar-width="320"]{--sidebar:320px}');
+  });
+
+  it("keeps artifact sharing surfaces on theme tokens", () => {
+    expect(artifactShareStyles).toContain("background:var(--panel)");
+    expect(artifactShareStyles).toContain("border-color:var(--accent);background:var(--panel-hover)");
+    expect(artifactShareStyles).not.toContain("background:#121613");
+    expect(artifactShareStyles).not.toContain("background:#182111");
+  });
+
+  it("validates theme and sidebar cookies at the SSR boundary", () => {
+    expect(parseThemeCookieValue("dark")).toBe("dark");
+    expect(parseThemeCookieValue("invalid")).toBe("system");
+    expect(parseSidebarCookieValue("v1.c0.w280.e240")).toEqual({ collapsed: false, width: 280, lastExpanded: 240 });
+    expect(parseSidebarCookieValue("v1.c1.w999.e130")).toEqual({ collapsed: true, width: 64, lastExpanded: 140 });
+    expect(parseSidebarCookieValue("v1.c0.wnot-a-width.e236")).toEqual(defaultSidebarPreference());
+    expect(serializeThemeCookie("light")).toContain("theme=light; Path=/; Max-Age=31536000; SameSite=Lax");
+    expect(serializeSidebarCookie({ collapsed: true, width: 64, lastExpanded: 280 })).toContain("artifact_sync_dashboard_sidebar=v1.c1.w64.e280");
+  });
+
+  it("reads only the namespaced preference cookies from a request", () => {
+    const request = new Request("https://artifact.w3dev.app/account/settings", {
+      headers: { Cookie: "theme=light; artifact_sync_dashboard_sidebar=v1.c0.w310.e270; theme=dark" },
+    });
+    expect(readDashboardPreferences(request)).toEqual({
+      theme: "light",
+      sidebar: { collapsed: false, width: 310, lastExpanded: 270 },
+    });
   });
 });
 

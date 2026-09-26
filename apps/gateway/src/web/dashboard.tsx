@@ -13,8 +13,9 @@ import {
   type DashboardSettings,
   type DashboardToken,
 } from "./dashboard-service.ts";
+import { resolvedTheme, themeColor, type ThemePreference } from "./dashboard-preferences.ts";
 
-export type DashboardSection = "overview" | "artifacts" | "projects" | "general" | "tokens" | "devices";
+export type DashboardSection = "overview" | "artifacts" | "projects" | "general" | "tokens" | "devices" | "account";
 
 interface DashboardDocumentProps {
   session: DashboardSession;
@@ -82,12 +83,19 @@ export function DashboardDocument({ session, title, active, children, bodyClass 
   const team = session.team;
   const items = team ? navigation(team.id) : [];
   return (
-    <html lang="en" data-layout={session.layout}>
+    <html
+      lang="en"
+      data-layout={session.layout}
+      data-theme={session.theme}
+      data-theme-state={resolvedTheme(session.theme)}
+      data-sidebar-width={session.layout === "sidebar" ? String(session.sidebar.width) : undefined}
+      data-sidebar-last-expanded={session.layout === "sidebar" ? String(session.sidebar.lastExpanded) : undefined}
+      data-sidebar-collapsed={session.layout === "sidebar" && session.sidebar.collapsed ? "true" : "false"}
+    >
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <meta name="color-scheme" content="dark" />
-        <meta name="theme-color" content="#0a0c0b" />
+        <ThemeMetadata theme={session.theme} />
         <title>{title} · Artifact Sync</title>
         <link rel="stylesheet" href="/assets/dashboard.css" />
         <link rel="stylesheet" href="/assets/dashboard-share.css" />
@@ -113,10 +121,21 @@ export function DashboardDocument({ session, title, active, children, bodyClass 
             <main class="dashboard-main" id="main-content">{children}</main>
           </div>
 
-          {team ? <MobileNavigation active={active} items={items.slice(0, 4)} /> : null}
+          {team ? <MobileNavigation session={session} active={active} items={items} /> : null}
         </div>
       </body>
     </html>
+  );
+}
+
+function ThemeMetadata({ theme }: { theme: ThemePreference }) {
+  return (
+    <>
+      <meta name="color-scheme" content={theme === "system" ? "light dark" : theme} />
+      <meta name="theme-color" data-theme-color="active" media={theme === "system" ? "not all" : undefined} content={themeColor(theme)} />
+      <meta name="theme-color" data-theme-color="system-light" media={theme === "system" ? "(prefers-color-scheme: light)" : "not all"} content="#f5f8f3" />
+      <meta name="theme-color" data-theme-color="system-dark" media={theme === "system" ? "(prefers-color-scheme: dark)" : "not all"} content="#090b0a" />
+    </>
   );
 }
 
@@ -158,7 +177,9 @@ function AccountMenu({ session, variant = "header" }: { session: DashboardSessio
       <div class="account-popover">
         <p>Signed in as</p>
         <strong>{session.identity.email}</strong>
+        <a href="/account/settings">Account settings</a>
         <a href="/auth/device">Connect another device</a>
+        <ThemePicker theme={session.theme} compact />
         <form method="post" action="/auth/logout">
           <CsrfField token={session.csrfToken} />
           <button type="submit">Sign out</button>
@@ -170,18 +191,50 @@ function AccountMenu({ session, variant = "header" }: { session: DashboardSessio
 
 function Sidebar({ session, active, items }: { session: DashboardSession; active: DashboardSection; items: ReturnType<typeof navigation> }) {
   return (
-    <aside class="sidebar" aria-label="Dashboard navigation">
-      <nav>
+    <aside
+      class={`sidebar${session.sidebar.collapsed ? " is-collapsed" : ""}`}
+      id="dashboard-sidebar"
+      aria-label="Dashboard navigation"
+      data-sidebar-collapsed={session.sidebar.collapsed ? "true" : "false"}
+    >
+      <div class="sidebar-head">
+        <span class="sidebar-title">Navigation</span>
+        <button
+          class="sidebar-toggle icon-button"
+          type="button"
+          data-sidebar-toggle
+          aria-controls="sidebar-nav"
+          aria-expanded={session.sidebar.collapsed ? "false" : "true"}
+          aria-label={session.sidebar.collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={session.sidebar.collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >{session.sidebar.collapsed ? "→" : "←"}</button>
+      </div>
+      <nav id="sidebar-nav">
         {items.map((item) => (
-          <a href={item.href} aria-current={active === item.id ? "page" : undefined}>
+          <a href={item.href} aria-current={active === item.id ? "page" : undefined} title={item.label}>
             <span class="nav-glyph" aria-hidden="true">{item.short}</span>
-            <span>{item.label}</span>
+            <span class="nav-label">{item.label}</span>
           </a>
         ))}
       </nav>
       <div class="sidebar-foot">
         <AccountMenu session={session} variant="sidebar" />
       </div>
+      <div
+        class="sidebar-resize"
+        data-sidebar-resize
+        role="separator"
+        tabIndex={0}
+        aria-orientation="vertical"
+        aria-controls="dashboard-sidebar"
+        aria-label="Resize sidebar"
+        aria-expanded={session.sidebar.collapsed ? "false" : "true"}
+        aria-valuemin="140"
+        aria-valuemax="320"
+        aria-valuenow={String(session.sidebar.collapsed ? session.sidebar.lastExpanded : session.sidebar.width)}
+        aria-valuetext={session.sidebar.collapsed ? "Collapsed" : `${session.sidebar.width} pixels`}
+        title="Resize sidebar"
+      />
     </aside>
   );
 }
@@ -196,16 +249,70 @@ function TopNavigation({ active, items }: { active: DashboardSection; items: Ret
   );
 }
 
-function MobileNavigation({ active, items }: { active: DashboardSection; items: ReturnType<typeof navigation> }) {
+function MobileNavigation({ session, active, items }: { session: DashboardSession; active: DashboardSection; items: ReturnType<typeof navigation> }) {
   return (
-    <nav class="mobile-navigation" aria-label="Mobile dashboard navigation">
-      {items.map((item) => (
-        <a href={item.href} aria-current={active === item.id ? "page" : undefined}>
-          <span class="nav-glyph" aria-hidden="true">{item.short}</span>
-          <span>{item.label}</span>
-        </a>
-      ))}
-    </nav>
+    <>
+      <nav class="mobile-navigation" aria-label="Mobile dashboard navigation">
+        {items.slice(0, 4).map((item) => (
+          <a href={item.href} aria-current={active === item.id ? "page" : undefined} title={item.label}>
+            <span class="nav-glyph" aria-hidden="true">{item.short}</span>
+            <span>{item.label}</span>
+          </a>
+        ))}
+        <button
+          class="mobile-navigation-more"
+          type="button"
+          data-mobile-nav-open
+          aria-expanded="false"
+          aria-controls="mobile-dashboard-navigation"
+          aria-haspopup="dialog"
+        >
+          <span class="nav-glyph" aria-hidden="true">••</span>
+          <span>More</span>
+        </button>
+      </nav>
+      <dialog class="mobile-nav-dialog" id="mobile-dashboard-navigation" data-mobile-nav-dialog aria-labelledby="mobile-dashboard-navigation-title">
+        <div class="mobile-nav-dialog-panel">
+          <div class="mobile-nav-dialog-head">
+            <h2 id="mobile-dashboard-navigation-title">Dashboard menu</h2>
+            <button class="icon-button" type="button" data-mobile-nav-close aria-label="Close dashboard menu">×</button>
+          </div>
+          <nav class="mobile-nav-dialog-links" aria-label="All dashboard destinations">
+            {items.map((item) => (
+              <a href={item.href} aria-current={active === item.id ? "page" : undefined}>
+                <span class="nav-glyph" aria-hidden="true">{item.short}</span>
+                <span>{item.label}</span>
+              </a>
+            ))}
+          </nav>
+          <section class="mobile-account-actions" aria-labelledby="mobile-account-actions-title">
+            <h3 id="mobile-account-actions-title">Account</h3>
+            <a href="/account/settings">Account settings</a>
+            <a href="/auth/device">Connect another device</a>
+            <ThemePicker theme={session.theme} />
+            <form method="post" action="/auth/logout">
+              <CsrfField token={session.csrfToken} />
+              <button type="submit">Sign out</button>
+            </form>
+          </section>
+        </div>
+      </dialog>
+    </>
+  );
+}
+
+function ThemePicker({ theme, compact = false }: { theme: ThemePreference; compact?: boolean }) {
+  return (
+    <div class={`theme-picker${compact ? " theme-picker-compact" : ""}`} data-theme-picker role="group" aria-label="Appearance">
+      {!compact ? <p class="theme-picker-label">Appearance</p> : null}
+      <div class="theme-picker-options">
+        {(["system", "light", "dark"] as const).map((choice) => (
+          <button type="button" data-theme-choice={choice} aria-pressed={theme === choice ? "true" : "false"}>
+            {choice[0].toUpperCase() + choice.slice(1)}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -835,11 +942,38 @@ export function NoTeamsPage({ session }: { session: DashboardSession }) {
   );
 }
 
+export function AccountSettingsPage({ session }: { session: DashboardSession }) {
+  return (
+    <DashboardDocument session={session} title="Account settings" active="account" bodyClass="account-page">
+      <PageHeader
+        eyebrow="Account"
+        title="Account settings"
+        description="Review your identity and choose how the dashboard should look."
+      />
+      <div class="account-settings-grid">
+        <section class="settings-section" aria-labelledby="profile-heading">
+          <div class="section-heading"><div><h2 id="profile-heading">Profile</h2><p>These fields come from your verified sign-in.</p></div></div>
+          <dl class="profile-details">
+            <div><dt>Name</dt><dd>{session.identity.name}</dd></div>
+            <div><dt>Email</dt><dd>{session.identity.email}</dd></div>
+          </dl>
+          <p class="permission-note">Your verified sign-in supplies these details.</p>
+        </section>
+        <section class="settings-section" aria-labelledby="appearance-heading">
+          <div class="section-heading"><div><h2 id="appearance-heading">Appearance</h2><p>Choose a theme for this browser.</p></div></div>
+          <ThemePicker theme={session.theme} />
+          <p class="permission-note">System follows your operating system preference. The choice applies to the dashboard and device approval page.</p>
+        </section>
+      </div>
+    </DashboardDocument>
+  );
+}
+
 export function DeviceApprovalPage({ session, code, success, error }: { session: DashboardSession; code: string; success?: boolean; error?: string | null }) {
   const identity = session.identity;
   return (
-    <html lang="en">
-      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><meta name="color-scheme" content="dark" /><meta name="theme-color" content="#0a0c0b" /><title>Authorize device · Artifact Sync</title><link rel="stylesheet" href="/assets/dashboard.css" /><script src="/assets/dashboard.js" defer /></head>
+    <html lang="en" data-theme={session.theme} data-theme-state={resolvedTheme(session.theme)}>
+      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><ThemeMetadata theme={session.theme} /><title>Authorize device · Artifact Sync</title><link rel="stylesheet" href="/assets/dashboard.css" /><script src="/assets/dashboard.js" defer /></head>
       <body class="approval-page">
         <header class="approval-header"><a class="brand" href="/dashboard"><span class="brand-mark">A</span><span>Artifact Sync</span></a><span>{identity.email}</span></header>
         <main class="approval-main">

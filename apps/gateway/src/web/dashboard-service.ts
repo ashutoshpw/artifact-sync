@@ -7,6 +7,7 @@ import { isValidTeamSlug, TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebSession, type WebIdentity } from "../auth/web-session.ts";
 import { createArtifactShareToken } from "../content/share.ts";
+import { readDashboardPreferences, type SidebarPreference, type ThemePreference } from "./dashboard-preferences.ts";
 
 export type TeamRole = "owner" | "admin" | "member";
 export type DashboardLayout = "sidebar" | "topnav";
@@ -30,6 +31,8 @@ export interface DashboardSession {
   team?: DashboardTeam;
   layout: DashboardLayout;
   timeZone: string;
+  theme: ThemePreference;
+  sidebar: SidebarPreference;
 }
 
 export interface DashboardArtifact {
@@ -127,6 +130,7 @@ export async function requireDashboardSession(
     team,
     layout: dashboardLayout(env),
     timeZone: viewerTimeZone(request),
+    ...readDashboardPreferences(request),
   };
 }
 

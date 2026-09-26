@@ -21,7 +21,7 @@ import { registerDashboardRoutes } from "./web/dashboard-routes.tsx";
 import { assetHeaders, pageSecurityHeaders, safeLocalPath } from "./web/http.ts";
 
 const DEFAULT_AUTH_RETURN = "/dashboard";
-const reservedFirstSegments = new Set(["__api", "auth", "dashboard", "settings", "favicon.ico", "robots.txt"]);
+const reservedFirstSegments = new Set(["__api", "account", "auth", "dashboard", "settings", "favicon.ico", "robots.txt"]);
 const app = new Hono<{ Bindings: GatewayEnv }>();
 
 app.all("/__api/auth", (c) => createWebAuth(c.env).handler(c.req.raw).then(withNoStore));
