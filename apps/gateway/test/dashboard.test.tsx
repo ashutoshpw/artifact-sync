@@ -1,7 +1,22 @@
 import { describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { renderToString } from "hono/jsx/dom/server";
-import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, TokensPage } from "../src/web/dashboard.tsx";
-import { listDashboardArtifactFiles, listDashboardArtifacts, type DashboardSession } from "../src/web/dashboard-service.ts";
+import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, ProjectsPage, TokensPage } from "../src/web/dashboard.tsx";
+import {
+  createDashboardProject,
+  groupArtifacts,
+  listDashboardArtifactFiles,
+  listDashboardArtifacts,
+  listDashboardProjects,
+  mergeArtifacts,
+  reconcileArtifacts,
+  setArtifactProjects,
+  toggleArtifactPin,
+  type DashboardArtifact,
+  type DashboardSession,
+} from "../src/web/dashboard-service.ts";
 
 const team = {
   id: "team-1",
@@ -17,7 +32,86 @@ function session(layout: "sidebar" | "topnav"): DashboardSession {
     teams: [team],
     team,
     layout,
+    timeZone: "UTC",
   };
+}
+
+function artifact(slug: string, overrides: Partial<DashboardArtifact> = {}) {
+  return { slug, createdAt: null, lastActivityAt: null, pinnedAt: null, projects: [], ...overrides };
+}
+
+function createD1Shim(sqlite: Database): D1Database {
+  const client = {
+    prepare(query: string) {
+      const statement = sqlite.prepare(query);
+      return {
+        bind(...parameters: unknown[]) {
+          const args = parameters as never[];
+          return {
+            all: async () => ({ results: statement.all(...args) }),
+            // bun:sqlite's raw() yields BLOB-style values, so emulate D1's raw
+            // mode with plain values in the statement's column order.
+            raw: async () => {
+              const rows = statement.all(...args) as Array<Record<string, unknown>>;
+              const columns = (statement as unknown as { columnNames: string[] }).columnNames;
+              return rows.map((row) => columns.map((column) => row[column]));
+            },
+            run: async () => {
+              statement.run(...args);
+              return { success: true, meta: {} };
+            },
+            first: async () => statement.get(...args) ?? null,
+          };
+        },
+      };
+    },
+    async batch() {
+      throw new Error("batch is not supported by the test shim");
+    },
+  };
+  return client as unknown as D1Database;
+}
+
+function applyMigrations(sqlite: Database): void {
+  const directory = join(import.meta.dir, "..", "drizzle");
+  const files = readdirSync(directory).filter((name) => name.endsWith(".sql")).sort();
+  for (const file of files) {
+    const sql = readFileSync(join(directory, file), "utf8");
+    for (const statement of sql.split("--> statement-breakpoint")) {
+      const trimmed = statement.trim();
+      if (trimmed) sqlite.exec(trimmed);
+    }
+  }
+}
+
+function createTestEnv(files: Record<string, Array<{ key: string; uploaded: Date }>> = {}) {
+  const sqlite = new Database(":memory:");
+  applyMigrations(sqlite);
+  sqlite.exec(`INSERT INTO teams (id, name, slug, created_at) VALUES ('team-1', 'W3Dev', 'w3dev', 0)`);
+  const bucket = {
+    async list(options: R2ListOptions) {
+      const prefix = options.prefix ?? "";
+      if (options.delimiter === "/") {
+        return {
+          objects: [],
+          delimitedPrefixes: Object.keys(files).filter((key) => key.startsWith(prefix)),
+          truncated: false,
+        };
+      }
+      const entries = files[prefix] ?? [];
+      return {
+        objects: entries.map((entry) => ({
+          key: `${prefix}${entry.key}`,
+          size: 1,
+          uploaded: entry.uploaded,
+          httpEtag: '"etag"',
+        })),
+        delimitedPrefixes: [],
+        truncated: false,
+      };
+    },
+  };
+  return { env: { DB: createD1Shim(sqlite), ARTIFACTS_BUCKET: bucket }, sqlite };
 }
 
 describe("dashboard server rendering", () => {
@@ -34,6 +128,7 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('action="/auth/logout"');
     expect(html).toContain('name="csrfToken" value="csrf-token"');
     expect(html).toContain('href="/dashboard/team-1/artifacts"');
+    expect(html).toContain('href="/dashboard/team-1/projects"');
     expect(html).toContain("Workspace content");
     const footer = html.slice(html.indexOf('class="sidebar-foot"'), html.indexOf("</aside>"));
     expect(footer).toContain('class="account-menu sidebar-account"');
@@ -55,28 +150,46 @@ describe("dashboard server rendering", () => {
     expect(html).not.toContain('<aside class="sidebar"');
   });
 
-  it("lists each artifact directory as one entry", async () => {
+  it("groups artifacts into sections with pinned first and mutation forms", async () => {
     const html = await renderToString(
       <ArtifactsPage
         session={session("sidebar")}
-        nextCursor="next-page"
-        artifacts={[{ slug: "reports" }, { slug: "notes" }]}
+        activeProjectId={null}
+        list={{
+          items: [
+            artifact("reports", { pinnedAt: "2026-01-02T10:00:00.000Z", lastActivityAt: "2026-01-05T10:00:00.000Z" }),
+            artifact("notes", { lastActivityAt: "2026-01-04T10:00:00.000Z" }),
+          ],
+          total: 2,
+          nextCursor: "2",
+          projects: [{ id: "p1", name: "Relay" }],
+        }}
       />,
     );
 
     expect(html).toContain("Published artifacts");
-    expect(html).toContain("Each immediate folder under the publishing root is one artifact");
     expect(html).toContain("reports");
     expect(html).toContain("notes");
     expect(html).toContain("/dashboard/team-1/artifacts/reports");
+    expect(html).toContain(">Pinned<");
+    expect(html).toContain(">Older<");
+    expect(html).toContain(">Pin<");
+    expect(html).toContain(">Unpin<");
+    expect(html).toContain('value="csrf-token"');
+    expect(html).toContain('action="/dashboard/team-1/artifacts/notes/pin"');
+    expect(html).toContain('aria-label="Filter by project"');
+    expect(html).toContain("Relay");
     expect(html).toContain("Next page");
+    expect(html).toContain("after=2");
   });
 
-  it("browses nested files within a single artifact", async () => {
+  it("browses nested files within a single artifact and offers project assignment", async () => {
     const html = await renderToString(
       <ArtifactDetailPage
         session={session("sidebar")}
         artifact="reports"
+        artifactMeta={artifact("reports", { pinnedAt: "2026-01-02T10:00:00.000Z", projects: [{ id: "p1", name: "Relay" }] })}
+        projects={[{ id: "p1", name: "Relay" }, { id: "p2", name: "Scratch" }]}
         nextCursor="next-page"
         files={[{ path: "daily/today.json", size: 16, uploadedAt: "2026-09-24T10:00:00.000Z" }]}
       />,
@@ -85,14 +198,18 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("daily/today.json");
     expect(html).toContain('href="/w3dev/reports/daily/today.json"');
     expect(html).toContain("cursor=next-page");
+    expect(html).toContain('id="projects"');
+    expect(html).toContain('name="projectIds"');
+    expect(html).toContain("Unpin");
+    expect(html).toContain('value="csrf-token"');
   });
 
   it("shows an explicit empty state when the team has no artifact directories", async () => {
     const html = await renderToString(
       <ArtifactsPage
         session={session("sidebar")}
-        nextCursor={null}
-        artifacts={[]}
+        activeProjectId={null}
+        list={{ items: [], total: 0, nextCursor: null, projects: [] }}
       />,
     );
 
@@ -100,48 +217,68 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("Create a non-empty folder under ~/.agents/artifacts");
   });
 
-  it("shows artifact directories on the overview and drops the base URL panel", async () => {
+  it("renders the overview as a two-column summary without the role metric", async () => {
     const html = await renderToString(
       <OverviewPage
         session={session("sidebar")}
-        artifacts={[{ slug: "reports" }, { slug: "notes" }]}
+        artifacts={[artifact("reports"), artifact("notes")]}
+        artifactsTotal={2}
         counts={{ tokens: 2, devices: 1 }}
       />,
     );
 
-    expect(html).not.toContain("Private artifact base URL");
-    expect(html).not.toContain("8+");
+    expect(html).toContain('aria-label="Workspace summary"');
+    expect(html).not.toContain("Your role");
+    expect(html).toContain("Connected devices");
+    expect(html).toContain("API credentials");
+    expect(html).toContain("Quick actions");
     expect(html).toContain("View all artifacts");
-    expect(html).toContain("Each directory is one artifact with its own files");
-    expect(html.indexOf('aria-label="Workspace summary"')).toBeGreaterThan(html.indexOf("Each directory is one artifact"));
+    expect(html).toContain('href="/dashboard/team-1/settings/devices"');
+    expect(html).toContain('href="/dashboard/team-1/settings/api-tokens"');
+    expect(html).toContain("reports");
   });
 
-  it("paginates R2 artifact prefixes and excludes invalid and root-level entries", async () => {
+  it("paginates R2 artifact prefixes, excludes invalid entries, and follows R2 cursors", async () => {
     const calls: R2ListOptions[] = [];
     const env = {
       ARTIFACTS_BUCKET: {
         async list(options: R2ListOptions) {
           calls.push(options);
+          if (!options.cursor) {
+            return {
+              objects: [],
+              delimitedPrefixes: [
+                `${options.prefix}alpha/`,
+                `${options.prefix}beta/`,
+                `${options.prefix}bad_name/`,
+                "uploads/another-team/artifacts/foreign/",
+              ],
+              truncated: true,
+              cursor: "page-2",
+            };
+          }
           return {
-            objects: [{ key: `${options.prefix}loose.txt`, size: 1, uploaded: new Date(), httpEtag: '"loose"' }],
-            delimitedPrefixes: [
-              `${options.prefix}alpha/`,
-              `${options.prefix}beta/`,
-              `${options.prefix}bad_name/`,
-              "uploads/another-team/artifacts/foreign/",
-            ],
-            truncated: true,
-            cursor: "page-2",
+            objects: [],
+            delimitedPrefixes: [`${options.prefix}gamma/`],
+            truncated: false,
           };
         },
       },
     };
 
-    const result = await listDashboardArtifacts(env as never, "team-1", null, 10);
+    const result = await listDashboardArtifacts(env as never, "team-1", null, { limit: 2 });
     if (result instanceof Response) throw new Error("expected artifact page");
-    expect(result.items).toEqual([{ slug: "alpha" }, { slug: "beta" }]);
-    expect(result.nextCursor).toBe("page-2");
-    expect(calls[0]).toMatchObject({ prefix: "uploads/team-1/artifacts/", delimiter: "/", limit: 10 });
+    expect(result.items.map((item) => item.slug)).toEqual(["alpha", "beta"]);
+    expect(result.total).toBe(3);
+    expect(result.nextCursor).toBe("2");
+    expect(result.missingSlugs).toEqual(["alpha", "beta", "gamma"]);
+    expect(calls[0]).toMatchObject({ prefix: "uploads/team-1/artifacts/", delimiter: "/", limit: 1000 });
+    expect(calls[1]).toMatchObject({ cursor: "page-2" });
+
+    const secondPage = await listDashboardArtifacts(env as never, "team-1", "2", { limit: 2 });
+    if (secondPage instanceof Response) throw new Error("expected second artifact page");
+    expect(secondPage.items.map((item) => item.slug)).toEqual(["gamma"]);
+    expect(secondPage.nextCursor).toBeNull();
   });
 
   it("lists nested files relative to one artifact prefix", async () => {
@@ -169,6 +306,53 @@ describe("dashboard server rendering", () => {
       uploadedAt: "2026-09-24T10:00:00.000Z",
       etag: '"file"',
     }]);
+  });
+
+  it("orders merged artifacts pinned first, then by last activity", () => {
+    const at = (hours: number) => new Date(Date.UTC(2026, 8, 20, hours)).toISOString();
+    const merged = mergeArtifacts(
+      ["a", "b", "c", "d"],
+      [
+        { slug: "a", createdAt: new Date(0), lastActivityAt: new Date(at(5)), pinnedAt: null },
+        { slug: "b", createdAt: new Date(0), lastActivityAt: new Date(at(9)), pinnedAt: null },
+        { slug: "c", createdAt: new Date(0), lastActivityAt: new Date(at(2)), pinnedAt: new Date(at(12)) },
+        { slug: "d", createdAt: new Date(0), lastActivityAt: new Date(at(7)), pinnedAt: null },
+      ],
+      [{ slug: "b", projectId: "p1" }],
+      [{ id: "p1", name: "Relay" }],
+    );
+
+    expect(merged.map((item) => item.slug)).toEqual(["c", "b", "d", "a"]);
+    expect(merged[1].projects).toEqual([{ id: "p1", name: "Relay" }]);
+  });
+
+  it("buckets artifacts by viewer timezone boundaries", () => {
+    const now = new Date("2026-09-26T12:00:00.000Z");
+    const sections = groupArtifacts(
+      [
+        artifact("pinned-old", { pinnedAt: "2026-01-01T00:00:00.000Z", lastActivityAt: "2026-01-01T00:00:00.000Z" }),
+        artifact("today-utc", { lastActivityAt: "2026-09-26T08:00:00.000Z" }),
+        artifact("yesterday-utc", { lastActivityAt: "2026-09-25T20:00:00.000Z" }),
+        artifact("this-week", { lastActivityAt: "2026-09-22T00:00:00.000Z" }),
+        artifact("older", { lastActivityAt: "2026-08-01T00:00:00.000Z" }),
+        artifact("unknown"),
+      ],
+      "UTC",
+      now,
+    );
+
+    const byId = new Map(sections.map((section) => [section.id, section]));
+    expect(sections.map((section) => section.label)).toEqual(["Pinned", "Today", "Yesterday", "This week", "Older"]);
+    expect(byId.get("today")!.artifacts.map((item) => item.slug)).toEqual(["today-utc"]);
+    expect(byId.get("yesterday")!.artifacts.map((item) => item.slug)).toEqual(["yesterday-utc"]);
+    expect(byId.get("week")!.artifacts.map((item) => item.slug)).toEqual(["this-week"]);
+    expect(byId.get("older")!.artifacts.map((item) => item.slug)).toEqual(["older", "unknown"]);
+
+    // 2026-09-26T01:00Z is "today" in UTC, but still "yesterday" in UTC+14.
+    const utc = groupArtifacts([artifact("edge", { lastActivityAt: "2026-09-26T01:00:00.000Z" })], "UTC", now);
+    expect(utc.map((section) => section.id)).toEqual(["today"]);
+    const ahead = groupArtifacts([artifact("edge", { lastActivityAt: "2026-09-26T01:00:00.000Z" })], "Pacific/Kiritimati", now);
+    expect(ahead.map((section) => section.id)).toEqual(["yesterday"]);
   });
 
   it("shows one-time token material and team-wide credential scope", async () => {
@@ -226,6 +410,23 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('name="csrfToken" value="csrf-token"');
   });
 
+  it("renders projects with create and delete affordances", async () => {
+    const html = await renderToString(
+      <ProjectsPage
+        session={session("sidebar")}
+        projects={[{ id: "p1", name: "Relay", artifactCount: 3, createdAt: "2026-09-24T10:00:00.000Z" }]}
+      />,
+    );
+
+    expect(html).toContain("Relay");
+    expect(html).toContain('href="/dashboard/team-1/artifacts?project=p1"');
+    expect(html).toContain("3 artifacts");
+    expect(html).toContain('action="/dashboard/team-1/projects/p1/delete"');
+    expect(html).toContain('action="/dashboard/team-1/projects"');
+    expect(html).toContain('data-dialog-open="create-project"');
+    expect(html).toContain('name="csrfToken" value="csrf-token"');
+  });
+
   it("renders slug history, cooldown state, and device approval", async () => {
     const settingsHtml = await renderToString(
       <GeneralSettingsPage
@@ -252,5 +453,72 @@ describe("dashboard server rendering", () => {
     expect(approvalHtml).toContain("W3Dev · w3dev");
     expect(approvalHtml).toContain("Approve device");
     expect(approvalHtml).toContain('name="csrfToken" value="csrf-token"');
+  });
+});
+
+describe("artifact organization services", () => {
+  it("pins artifacts to the top and reconciles legacy metadata from R2", async () => {
+    const { env } = createTestEnv({
+      "uploads/team-1/artifacts/reports/": [{ key: "a.txt", uploaded: new Date("2026-09-20T10:00:00.000Z") }],
+      "uploads/team-1/artifacts/notes/": [
+        { key: "old.txt", uploaded: new Date("2026-09-21T09:00:00.000Z") },
+        { key: "new.txt", uploaded: new Date("2026-09-24T10:00:00.000Z") },
+      ],
+    });
+
+    expect(await toggleArtifactPin(env as never, "team-1", "reports", true)).toBe(true);
+
+    const first = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
+    if (first instanceof Response) throw new Error("expected artifact list");
+    expect(first.items.map((item) => item.slug)).toEqual(["reports", "notes"]);
+    expect(first.items[0].pinnedAt).not.toBeNull();
+    expect(first.missingSlugs).toEqual(["notes"]);
+
+    await reconcileArtifacts(env as never, "team-1", first.missingSlugs);
+    const second = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
+    if (second instanceof Response) throw new Error("expected artifact list");
+    expect(second.missingSlugs).toEqual([]);
+    expect(second.items.map((item) => item.slug)).toEqual(["reports", "notes"]);
+    expect(second.items[1].lastActivityAt).toBe("2026-09-24T10:00:00.000Z");
+    expect(second.items[1].createdAt).toBe("2026-09-21T09:00:00.000Z");
+
+    expect(await toggleArtifactPin(env as never, "team-1", "reports", false)).toBe(true);
+    const third = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
+    if (third instanceof Response) throw new Error("expected artifact list");
+    expect(third.items.map((item) => item.slug)).toEqual(["notes", "reports"]);
+    expect(third.items[1].pinnedAt).toBeNull();
+  });
+
+  it("creates projects, assigns artifacts to several, and filters by project", async () => {
+    const { env } = createTestEnv({
+      "uploads/team-1/artifacts/reports/": [{ key: "a.txt", uploaded: new Date("2026-09-20T10:00:00.000Z") }],
+      "uploads/team-1/artifacts/notes/": [{ key: "b.txt", uploaded: new Date("2026-09-24T10:00:00.000Z") }],
+    });
+
+    const relay = await createDashboardProject(env as never, "team-1", "Relay");
+    const scratch = await createDashboardProject(env as never, "team-1", "Scratch");
+    if (!relay.ok || !scratch.ok) throw new Error("expected project creation to succeed");
+    const duplicate = await createDashboardProject(env as never, "team-1", "Relay");
+    const invalid = await createDashboardProject(env as never, "team-1", "");
+    expect(!duplicate.ok && duplicate.error).toBe("project_name_taken");
+    expect(!invalid.ok && invalid.error).toBe("invalid_project_name");
+
+    expect(await setArtifactProjects(env as never, "team-1", "reports", [relay.project.id, scratch.project.id])).toBe(true);
+    expect(await setArtifactProjects(env as never, "team-1", "notes", [scratch.project.id])).toBe(true);
+
+    const all = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
+    if (all instanceof Response) throw new Error("expected artifact list");
+    expect(all.items.find((item) => item.slug === "reports")!.projects.map((project) => project.name)).toEqual(["Relay", "Scratch"]);
+
+    const filtered = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10, projectId: relay.project.id });
+    if (filtered instanceof Response) throw new Error("expected filtered list");
+    expect(filtered.items.map((item) => item.slug)).toEqual(["reports"]);
+    expect(filtered.total).toBe(1);
+
+    expect(await listDashboardArtifacts(env as never, "team-1", null, { projectId: "missing" }) instanceof Response).toBe(true);
+
+    const projects = await listDashboardProjects(env as never, "team-1");
+    expect(projects.map((project) => [project.name, project.artifactCount])).toEqual([["Relay", 1], ["Scratch", 2]]);
+    expect(projects[0].createdAt).toBeTypeOf("string");
   });
 });

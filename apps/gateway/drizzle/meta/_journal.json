@@ -15,6 +15,13 @@
       "when": 1790236974005,
       "tag": "0001_green_iron_monger",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790430323852,
+      "tag": "0002_noisy_crusher_hogan",
+      "breakpoints": true
     }
   ]
 }

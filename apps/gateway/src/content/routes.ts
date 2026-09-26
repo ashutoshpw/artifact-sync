@@ -5,7 +5,7 @@ import { PUBLISH_PERMISSION, READ_PERMISSION } from "../auth/types.ts";
 import type { GatewayEnv, PublisherIdentity } from "../auth/types.ts";
 import { getWebIdentity } from "../auth/web-session.ts";
 import { createDatabase } from "../db/client.ts";
-import { teamMemberships, teamSlugs, teams } from "../db/schema.ts";
+import { artifacts, teamMemberships, teamSlugs, teams } from "../db/schema.ts";
 const MAX_PATH_LENGTH = 1024;
 const ARTIFACT_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
@@ -37,10 +37,29 @@ export async function uploadArtifact(request: Request, env: GatewayEnv): Promise
     await env.ARTIFACTS_BUCKET.put(key, request.body, {
       httpMetadata: { contentType: contentTypeForPath(relativePath) },
     });
-    return Response.json({ artifact: artifactSlug, path: relativePath }, { status: 201, headers: noStoreHeaders() });
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
+  // Best-effort metadata sync: R2 remains the source of truth, so a metadata
+  // failure never fails the upload. The dashboard reconciles missing rows.
+  try {
+    const now = new Date();
+    await createDatabase(env.DB).insert(artifacts)
+      .values({
+        id: crypto.randomUUID(),
+        teamId: context.identity.teamId,
+        slug: artifactSlug,
+        createdAt: now,
+        lastActivityAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [artifacts.teamId, artifacts.slug],
+        set: { lastActivityAt: now },
+      });
+  } catch (error) {
+    console.error("artifact metadata sync failed", error);
+  }
+  return Response.json({ artifact: artifactSlug, path: relativePath }, { status: 201, headers: noStoreHeaders() });
 }
 
 export async function listArtifacts(request: Request, env: GatewayEnv): Promise<Response> {

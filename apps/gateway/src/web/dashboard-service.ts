@@ -1,6 +1,6 @@
-import { and, count, desc, eq, gt, isNotNull, isNull, lt, or, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, isNotNull, isNull, lt, or, type SQL } from "drizzle-orm";
 import { createDatabase } from "../db/client.ts";
-import { apiTokens, deviceAuthorizations, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
+import { apiTokens, artifactProjects, artifacts, deviceAuthorizations, projects, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
 import { authError } from "../auth/middleware.ts";
 import { safePermissions } from "../auth/permissions.ts";
 import { isValidTeamSlug, TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug.ts";
@@ -9,6 +9,11 @@ import { getWebSession, type WebIdentity } from "../auth/web-session.ts";
 
 export type TeamRole = "owner" | "admin" | "member";
 export type DashboardLayout = "sidebar" | "topnav";
+
+const R2_PAGE_LIMIT = 1000;
+const ARTIFACT_FETCH_CAP = 2000;
+const RECONCILIATION_BATCH = 20;
+const BACKFILL_PAGE_CAP = 10;
 
 export interface DashboardTeam {
   id: string;
@@ -23,10 +28,30 @@ export interface DashboardSession {
   teams: DashboardTeam[];
   team?: DashboardTeam;
   layout: DashboardLayout;
+  timeZone: string;
 }
 
 export interface DashboardArtifact {
   slug: string;
+  createdAt: string | null;
+  lastActivityAt: string | null;
+  pinnedAt: string | null;
+  projects: Array<{ id: string; name: string }>;
+}
+
+export interface DashboardProject {
+  id: string;
+  name: string;
+  artifactCount: number;
+  createdAt: string;
+}
+
+export interface ArtifactList {
+  items: DashboardArtifact[];
+  total: number;
+  nextCursor: string | null;
+  missingSlugs: string[];
+  projects: Array<{ id: string; name: string }>;
 }
 
 export interface DashboardArtifactFile {
@@ -92,7 +117,65 @@ export async function requireDashboardSession(
     teams,
     team,
     layout: dashboardLayout(env),
+    timeZone: viewerTimeZone(request),
   };
+}
+
+export type ArtifactGroupId = "pinned" | "today" | "yesterday" | "week" | "older";
+
+export interface ArtifactSection {
+  id: ArtifactGroupId;
+  label: string;
+  artifacts: DashboardArtifact[];
+}
+
+const GROUP_LABELS: Record<ArtifactGroupId, string> = {
+  pinned: "Pinned",
+  today: "Today",
+  yesterday: "Yesterday",
+  week: "This week",
+  older: "Older",
+};
+
+const DAY = 24 * 60 * 60 * 1000;
+
+export function groupArtifacts(items: DashboardArtifact[], timeZone: string, now = new Date()): ArtifactSection[] {
+  const dayKey = zoneDayKey(timeZone);
+  const today = dayKey(now);
+  const yesterday = dayKey(new Date(now.getTime() - DAY));
+  const weekStart = now.getTime() - 7 * DAY;
+  const buckets: Record<ArtifactGroupId, DashboardArtifact[]> = {
+    pinned: [], today: [], yesterday: [], week: [], older: [],
+  };
+  for (const artifact of items) {
+    if (artifact.pinnedAt) {
+      buckets.pinned.push(artifact);
+      continue;
+    }
+    const activity = artifact.lastActivityAt ? Date.parse(artifact.lastActivityAt) : NaN;
+    if (Number.isNaN(activity)) {
+      buckets.older.push(artifact);
+      continue;
+    }
+    const key = dayKey(new Date(activity));
+    if (key === today) buckets.today.push(artifact);
+    else if (key === yesterday) buckets.yesterday.push(artifact);
+    else if (activity >= weekStart) buckets.week.push(artifact);
+    else buckets.older.push(artifact);
+  }
+  return (Object.keys(buckets) as ArtifactGroupId[])
+    .filter((id) => buckets[id].length > 0)
+    .map((id) => ({ id, label: GROUP_LABELS[id], artifacts: buckets[id] }));
+}
+
+function zoneDayKey(timeZone: string): (date: Date) => string {
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+  } catch {
+    formatter = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year: "numeric", month: "2-digit", day: "2-digit" });
+  }
+  return (date: Date) => formatter.format(date);
 }
 
 export function dashboardLayout(env: GatewayEnv): DashboardLayout {
@@ -118,27 +201,352 @@ export async function listDashboardArtifacts(
   env: GatewayEnv,
   teamId: string,
   cursor: string | null,
-  limit = 50,
-): Promise<DashboardPage<DashboardArtifact> | Response> {
-  if (!safeCursor(cursor)) return authError(400, "invalid_cursor");
+  options: { limit?: number; projectId?: string | null } = {},
+): Promise<ArtifactList | Response> {
+  const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+  const offset = decodeOffset(cursor);
+  if (offset === null) return authError(400, "invalid_cursor");
+  const slugs = await listArtifactSlugs(env, teamId);
+  if (slugs instanceof Response) return slugs;
+  const metadata = await loadArtifactMetadata(env, teamId);
+  const merged = mergeArtifacts(slugs, metadata.artifactRows, metadata.memberships, metadata.projects);
+  const missingSlugs = merged.filter((artifact) => artifact.lastActivityAt === null).map((artifact) => artifact.slug);
+  let visible = merged;
+  if (options.projectId) {
+    if (!metadata.projects.some((project) => project.id === options.projectId)) return authError(404, "project_not_found");
+    visible = merged.filter((artifact) => artifact.projects.some((project) => project.id === options.projectId));
+  }
+  const page = visible.slice(offset, offset + limit);
+  return {
+    items: page,
+    total: visible.length,
+    nextCursor: offset + limit < visible.length ? String(offset + limit) : null,
+    missingSlugs,
+    projects: metadata.projects.map(({ id, name }) => ({ id, name })),
+  };
+}
+
+async function listArtifactSlugs(env: GatewayEnv, teamId: string): Promise<string[] | Response> {
   const artifactRoot = `uploads/${teamId}/artifacts/`;
+  const slugs: string[] = [];
+  let cursor: string | undefined;
   try {
-    const result = await env.ARTIFACTS_BUCKET.list({
-      prefix: artifactRoot,
-      delimiter: "/",
-      cursor: cursor ?? undefined,
-      limit: Math.min(Math.max(limit, 1), 1000),
-    });
-    return {
-      items: result.delimitedPrefixes.flatMap((delimitedPrefix) => {
-        if (!delimitedPrefix.startsWith(artifactRoot)) return [];
+    do {
+      const result = await env.ARTIFACTS_BUCKET.list({
+        prefix: artifactRoot,
+        delimiter: "/",
+        cursor,
+        limit: R2_PAGE_LIMIT,
+      });
+      for (const delimitedPrefix of result.delimitedPrefixes) {
+        if (!delimitedPrefix.startsWith(artifactRoot)) continue;
         const slug = delimitedPrefix.slice(artifactRoot.length).replace(/\/$/u, "");
-        return isValidTeamSlug(slug) ? [{ slug }] : [];
-      }),
-      nextCursor: result.truncated ? result.cursor ?? null : null,
-    };
+        if (isValidTeamSlug(slug) && !slugs.includes(slug)) slugs.push(slug);
+      }
+      cursor = result.truncated ? result.cursor ?? undefined : undefined;
+    } while (cursor && slugs.length < ARTIFACT_FETCH_CAP);
   } catch {
     return authError(503, "artifact_storage_unavailable");
+  }
+  return slugs;
+}
+
+interface ArtifactMetaRow {
+  slug: string;
+  createdAt: Date;
+  lastActivityAt: Date;
+  pinnedAt: Date | null;
+}
+
+async function loadArtifactMetadata(
+  env: GatewayEnv,
+  teamId: string,
+): Promise<{
+  artifactRows: ArtifactMetaRow[];
+  memberships: Array<{ slug: string; projectId: string }>;
+  projects: Array<{ id: string; name: string }>;
+}> {
+  if (!env.DB) return { artifactRows: [], memberships: [], projects: [] };
+  try {
+    const db = createDatabase(env.DB);
+    const [rows, projectRows] = await Promise.all([
+      db.select({
+        slug: artifacts.slug,
+        createdAt: artifacts.createdAt,
+        lastActivityAt: artifacts.lastActivityAt,
+        pinnedAt: artifacts.pinnedAt,
+      }).from(artifacts).where(eq(artifacts.teamId, teamId)),
+      db.select({ id: projects.id, name: projects.name })
+        .from(projects)
+        .where(eq(projects.teamId, teamId))
+        .orderBy(projects.name),
+    ]);
+    const memberships = await db.select({
+      slug: artifacts.slug,
+      projectId: artifactProjects.projectId,
+    })
+      .from(artifactProjects)
+      .innerJoin(artifacts, eq(artifactProjects.artifactId, artifacts.id))
+      .where(eq(artifacts.teamId, teamId));
+    return { artifactRows: rows, memberships, projects: projectRows };
+  } catch (error) {
+    console.error("artifact metadata load failed", error);
+    return { artifactRows: [], memberships: [], projects: [] };
+  }
+}
+
+export function mergeArtifacts(
+  slugs: string[],
+  rows: ArtifactMetaRow[],
+  memberships: Array<{ slug: string; projectId: string }>,
+  teamProjects: Array<{ id: string; name: string }>,
+): DashboardArtifact[] {
+  const rowsBySlug = new Map(rows.map((row) => [row.slug, row]));
+  const namesById = new Map(teamProjects.map((project) => [project.id, project.name]));
+  const projectsBySlug = new Map<string, Array<{ id: string; name: string }>>();
+  for (const membership of memberships) {
+    const name = namesById.get(membership.projectId);
+    if (!name) continue;
+    const list = projectsBySlug.get(membership.slug) ?? [];
+    list.push({ id: membership.projectId, name });
+    projectsBySlug.set(membership.slug, list);
+  }
+  return slugs.map((slug) => {
+    const row = rowsBySlug.get(slug);
+    return {
+      slug,
+      createdAt: row ? row.createdAt.toISOString() : null,
+      lastActivityAt: row ? row.lastActivityAt.toISOString() : null,
+      pinnedAt: row && row.pinnedAt ? row.pinnedAt.toISOString() : null,
+      projects: projectsBySlug.get(slug) ?? [],
+    };
+  }).sort(compareArtifacts);
+}
+
+export function compareArtifacts(a: DashboardArtifact, b: DashboardArtifact): number {
+  if (Boolean(a.pinnedAt) !== Boolean(b.pinnedAt)) return a.pinnedAt ? -1 : 1;
+  if (a.pinnedAt && b.pinnedAt) {
+    const pinnedDelta = Date.parse(b.pinnedAt) - Date.parse(a.pinnedAt);
+    if (pinnedDelta) return pinnedDelta;
+  }
+  const activityDelta = timestampValue(b.lastActivityAt) - timestampValue(a.lastActivityAt);
+  if (activityDelta) return activityDelta;
+  return a.slug.localeCompare(b.slug);
+}
+
+function timestampValue(value: string | null): number {
+  const parsed = value ? Date.parse(value) : NaN;
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+export async function getDashboardArtifact(env: GatewayEnv, teamId: string, slug: string): Promise<DashboardArtifact | null> {
+  if (!isValidTeamSlug(slug) || !env.DB) return null;
+  try {
+    const db = createDatabase(env.DB);
+    const [row] = await db.select({
+      id: artifacts.id,
+      createdAt: artifacts.createdAt,
+      lastActivityAt: artifacts.lastActivityAt,
+      pinnedAt: artifacts.pinnedAt,
+    })
+      .from(artifacts)
+      .where(and(eq(artifacts.teamId, teamId), eq(artifacts.slug, slug)))
+      .limit(1);
+    if (!row) return null;
+    const memberships = await db.select({ id: projects.id, name: projects.name })
+      .from(artifactProjects)
+      .innerJoin(projects, eq(artifactProjects.projectId, projects.id))
+      .where(eq(artifactProjects.artifactId, row.id))
+      .orderBy(projects.name);
+    return {
+      slug,
+      createdAt: row.createdAt.toISOString(),
+      lastActivityAt: row.lastActivityAt.toISOString(),
+      pinnedAt: row.pinnedAt?.toISOString() ?? null,
+      projects: memberships.map((membership) => ({ id: membership.id, name: membership.name })),
+    };
+  } catch (error) {
+    console.error("artifact metadata load failed", error);
+    return null;
+  }
+}
+
+export async function toggleArtifactPin(env: GatewayEnv, teamId: string, slug: string, pinned: boolean): Promise<boolean> {
+  if (!isValidTeamSlug(slug) || !env.DB) return false;
+  try {
+    if (!await ensureArtifactRow(env, teamId, slug)) return false;
+    await createDatabase(env.DB).update(artifacts)
+      .set({ pinnedAt: pinned ? new Date() : null })
+      .where(and(eq(artifacts.teamId, teamId), eq(artifacts.slug, slug)));
+    return true;
+  } catch (error) {
+    console.error("artifact pin failed", error);
+    return false;
+  }
+}
+
+export async function setArtifactProjects(env: GatewayEnv, teamId: string, slug: string, projectIds: string[]): Promise<boolean> {
+  if (!isValidTeamSlug(slug) || !env.DB) return false;
+  const selected = [...new Set(projectIds)];
+  try {
+    const db = createDatabase(env.DB);
+    const artifactId = await ensureArtifactId(env, teamId, slug);
+    if (!artifactId) return false;
+    const valid = selected.length
+      ? await db.select({ id: projects.id }).from(projects).where(and(eq(projects.teamId, teamId), inArray(projects.id, selected)))
+      : [];
+    if (valid.length !== selected.length) return false;
+    await db.delete(artifactProjects).where(eq(artifactProjects.artifactId, artifactId));
+    if (selected.length) {
+      await db.insert(artifactProjects).values(selected.map((projectId) => ({
+        artifactId,
+        projectId,
+        createdAt: new Date(),
+      })));
+    }
+    return true;
+  } catch (error) {
+    console.error("artifact project update failed", error);
+    return false;
+  }
+}
+
+export async function listDashboardProjects(env: GatewayEnv, teamId: string): Promise<DashboardProject[]> {
+  if (!env.DB) return [];
+  try {
+    const db = createDatabase(env.DB);
+    const rows = await db.select({
+      id: projects.id,
+      name: projects.name,
+      createdAt: projects.createdAt,
+      artifactCount: count(artifactProjects.artifactId),
+    })
+      .from(projects)
+      .leftJoin(artifactProjects, eq(artifactProjects.projectId, projects.id))
+      .where(eq(projects.teamId, teamId))
+      .groupBy(projects.id)
+      .orderBy(projects.name);
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      artifactCount: row.artifactCount,
+      createdAt: row.createdAt.toISOString(),
+    }));
+  } catch (error) {
+    console.error("project list failed", error);
+    return [];
+  }
+}
+
+export type CreateProjectError = "invalid_project_name" | "project_name_taken" | "project_service_unavailable";
+
+export async function createDashboardProject(env: GatewayEnv, teamId: string, name: string): Promise<{ ok: true; project: { id: string; name: string } } | { ok: false; error: CreateProjectError }> {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > 64) return { ok: false, error: "invalid_project_name" };
+  try {
+    const project = { id: crypto.randomUUID(), name: trimmed };
+    await createDatabase(env.DB).insert(projects).values({ ...project, teamId, createdAt: new Date() });
+    return { ok: true, project };
+  } catch (error) {
+    if (isUniqueConstraintError(error)) return { ok: false, error: "project_name_taken" };
+    console.error("project create failed", error);
+    return { ok: false, error: "project_service_unavailable" };
+  }
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    if (current instanceof Error) {
+      if ((current as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") return true;
+      if (current.message.includes("UNIQUE constraint failed")) return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+export async function deleteDashboardProject(env: GatewayEnv, teamId: string, projectId: string): Promise<boolean> {
+  if (!projectId) return false;
+  try {
+    const deleted = await createDatabase(env.DB).delete(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.teamId, teamId)))
+      .returning({ id: projects.id });
+    return deleted.length > 0;
+  } catch (error) {
+    console.error("project delete failed", error);
+    return false;
+  }
+}
+
+export async function reconcileArtifacts(env: GatewayEnv, teamId: string, slugs: string[]): Promise<void> {
+  if (!env.DB) return;
+  for (const slug of slugs.slice(0, RECONCILIATION_BATCH)) {
+    await backfillArtifactMetadata(env, teamId, slug);
+  }
+}
+
+export async function backfillArtifactMetadata(env: GatewayEnv, teamId: string, slug: string): Promise<boolean> {
+  if (!env.DB || !isValidTeamSlug(slug)) return false;
+  let created: Date | null = null;
+  let last: Date | null = null;
+  let cursor: string | undefined;
+  let pages = 0;
+  try {
+    const prefix = `uploads/${teamId}/artifacts/${slug}/`;
+    do {
+      const result = await env.ARTIFACTS_BUCKET.list({ prefix, cursor, limit: R2_PAGE_LIMIT });
+      for (const object of result.objects) {
+        if (!created || object.uploaded < created) created = object.uploaded;
+        if (!last || object.uploaded > last) last = object.uploaded;
+      }
+      cursor = result.truncated ? result.cursor ?? undefined : undefined;
+      pages += 1;
+    } while (cursor && pages < BACKFILL_PAGE_CAP);
+    if (!created || !last) return false;
+    await createDatabase(env.DB).insert(artifacts)
+      .values({ id: crypto.randomUUID(), teamId, slug, createdAt: created, lastActivityAt: last })
+      .onConflictDoNothing();
+    return true;
+  } catch (error) {
+    console.error("artifact reconciliation failed", error);
+    return false;
+  }
+}
+
+async function ensureArtifactRow(env: GatewayEnv, teamId: string, slug: string): Promise<boolean> {
+  return Boolean(await ensureArtifactId(env, teamId, slug));
+}
+
+async function ensureArtifactId(env: GatewayEnv, teamId: string, slug: string): Promise<string | null> {
+  const db = createDatabase(env.DB);
+  const existing = await artifactIdFor(db, teamId, slug);
+  if (existing) return existing;
+  const backfilled = await backfillArtifactMetadata(env, teamId, slug);
+  if (!backfilled) return null;
+  return artifactIdFor(db, teamId, slug);
+}
+
+async function artifactIdFor(db: ReturnType<typeof createDatabase>, teamId: string, slug: string): Promise<string | null> {
+  const [row] = await db.select({ id: artifacts.id })
+    .from(artifacts)
+    .where(and(eq(artifacts.teamId, teamId), eq(artifacts.slug, slug)))
+    .limit(1);
+  return row?.id ?? null;
+}
+
+const TIMEZONE_COOKIE = /(?:^|;\s*)tz=([^;]*)/u;
+
+export function viewerTimeZone(request: Request): string {
+  const match = TIMEZONE_COOKIE.exec(request.headers.get("Cookie") ?? "");
+  if (!match) return "UTC";
+  const candidate = decodeURIComponent(match[1]).trim();
+  if (!candidate || candidate.length > 64) return "UTC";
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: candidate });
+    return candidate;
+  } catch {
+    return "UTC";
   }
 }
 
@@ -365,6 +773,12 @@ export function formatBytes(bytes: number): string {
 
 function safeCursor(value: string | null): boolean {
   return !value || value.length <= 1024;
+}
+
+function decodeOffset(value: string | null): number | null {
+  if (!value) return 0;
+  if (!/^\d{1,9}$/u.test(value)) return null;
+  return Number(value);
 }
 
 type Cursor = { createdAt: Date; id: string };

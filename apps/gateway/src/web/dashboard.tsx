@@ -1,17 +1,19 @@
-import type { Child, FC } from "hono/jsx";
+import { Fragment, type Child } from "hono/jsx";
 import {
   artifactHref,
   formatBytes,
+  groupArtifacts,
   type DashboardArtifact,
   type DashboardArtifactFile,
   type DashboardDevice,
   type DashboardPage,
+  type DashboardProject,
   type DashboardSession,
   type DashboardSettings,
   type DashboardToken,
 } from "./dashboard-service.ts";
 
-export type DashboardSection = "overview" | "artifacts" | "general" | "tokens" | "devices";
+export type DashboardSection = "overview" | "artifacts" | "projects" | "general" | "tokens" | "devices";
 
 interface DashboardDocumentProps {
   session: DashboardSession;
@@ -33,16 +35,27 @@ interface ActionFeedback {
   notice?: string | null;
 }
 
-const dateFormatter = new Intl.DateTimeFormat("en", {
-  dateStyle: "medium",
-  timeStyle: "short",
-  timeZone: "UTC",
-});
+const dateFormatterCache = new Map<string, Intl.DateTimeFormat>();
 
-function formatDate(value: string | null): string {
+function dateFormatterFor(timeZone: string): Intl.DateTimeFormat {
+  let formatter = dateFormatterCache.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone,
+    });
+    dateFormatterCache.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
+function formatDate(value: string | null, timeZone = "UTC"): string {
   if (!value) return "Never";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Unknown" : `${dateFormatter.format(date)} UTC`;
+  if (Number.isNaN(date.getTime())) return "Unknown";
+  const text = dateFormatterFor(timeZone).format(date);
+  return timeZone === "UTC" ? `${text} UTC` : text;
 }
 
 function initial(value: string): string {
@@ -57,6 +70,7 @@ function navigation(teamId: string) {
   return [
     { id: "overview" as const, label: "Overview", short: "OV", href: `/dashboard/${teamId}` },
     { id: "artifacts" as const, label: "Artifacts", short: "AR", href: `/dashboard/${teamId}/artifacts` },
+    { id: "projects" as const, label: "Projects", short: "PR", href: `/dashboard/${teamId}/projects` },
     { id: "tokens" as const, label: "API tokens", short: "KE", href: `/dashboard/${teamId}/settings/api-tokens` },
     { id: "devices" as const, label: "Devices", short: "DE", href: `/dashboard/${teamId}/settings/devices` },
     { id: "general" as const, label: "Team settings", short: "ST", href: `/dashboard/${teamId}/settings/general` },
@@ -214,74 +228,124 @@ export function Feedback({ error, notice }: ActionFeedback) {
 export function OverviewPage({
   session,
   artifacts,
+  artifactsTotal,
   counts,
   storageError,
 }: {
   session: DashboardSession;
   artifacts: DashboardArtifact[];
+  artifactsTotal: number;
   counts: { tokens: number; devices: number };
   storageError?: string | null;
 }) {
   const team = session.team!;
+  const sections = groupArtifacts(artifacts, session.timeZone);
   return (
     <DashboardDocument session={session} title={`${team.name} overview`} active="overview">
       <PageHeader
         eyebrow="Team overview"
         title={team.name}
         description={`Private artifacts and credentials for ${team.slug}.`}
-        actions={
-          <>
-            <a class="button secondary" href={`/dashboard/${team.id}/settings/api-tokens`}>Create token</a>
-            <a class="button primary" href="/auth/device">Connect device</a>
-          </>
-        }
       />
-
-      <section class="content-section">
-        <div class="section-heading">
-          <div><h2>Artifacts</h2><p>Each directory is one artifact with its own files.</p></div>
-          <a href={`/dashboard/${team.id}/artifacts`}>View all artifacts →</a>
-        </div>
-        <Feedback error={storageError} />
-        {artifacts.length ? <ArtifactDirectoryTable teamId={team.id} artifacts={artifacts} /> : <EmptyState title="No artifacts published yet" body="Create a folder under ~/.agents/artifacts and run the Artifact Sync daemon to publish it." actionHref="/auth/device" actionLabel="Connect a device" />}
-      </section>
-
-      <section class="metric-grid" aria-label="Workspace summary">
-        <Metric label="Connected devices" value={String(counts.devices)} detail={counts.devices === 1 ? "Active record" : "Active records"} />
-        <Metric label="API credentials" value={String(counts.tokens)} detail="Team-scoped" />
-        <Metric label="Your role" value={team.role} detail="Access level" />
-      </section>
+      <div class="overview-grid">
+        <aside class="overview-side" aria-label="Workspace summary">
+          <section class="side-panel">
+            <h2>Summary</h2>
+            <div class="summary-rows">
+              <a class="summary-row" href={`/dashboard/${team.id}/artifacts`}>
+                <span>Artifacts</span>
+                <strong>{artifactsTotal}</strong>
+              </a>
+              <a class="summary-row" href={`/dashboard/${team.id}/settings/devices`}>
+                <span>Connected devices</span>
+                <strong>{counts.devices}</strong>
+              </a>
+              <a class="summary-row" href={`/dashboard/${team.id}/settings/api-tokens`}>
+                <span>API credentials</span>
+                <strong>{counts.tokens}</strong>
+              </a>
+            </div>
+          </section>
+          <section class="side-panel">
+            <h2>Quick actions</h2>
+            <div class="quick-actions">
+              <a class="button secondary" href="/auth/device">Connect device</a>
+              <a class="button secondary" href={`/dashboard/${team.id}/settings/api-tokens`}>Create token</a>
+            </div>
+          </section>
+        </aside>
+        <section class="overview-main">
+          <div class="section-heading">
+            <div><h2>Artifacts</h2><p>Newest activity first. Pin and organize from the artifacts page.</p></div>
+            <a href={`/dashboard/${team.id}/artifacts`}>View all artifacts →</a>
+          </div>
+          <Feedback error={storageError} />
+          {artifacts.length ? (
+            <ArtifactDirectoryTable teamId={team.id} sections={sections} timeZone={session.timeZone} manageable={false} csrfToken={session.csrfToken} />
+          ) : (
+            <EmptyState title="No artifacts published yet" body="Create a folder under ~/.agents/artifacts and run the Artifact Sync daemon to publish it." actionHref="/auth/device" actionLabel="Connect a device" />
+          )}
+        </section>
+      </div>
     </DashboardDocument>
   );
 }
 
-function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return <article class="metric"><p>{label}</p><strong>{value}</strong><span>{detail}</span></article>;
-}
-
 export function ArtifactsPage({
   session,
-  artifacts,
-  nextCursor,
+  list,
+  activeProjectId,
   storageError,
+  feedback,
 }: {
   session: DashboardSession;
-  artifacts: DashboardArtifact[];
-  nextCursor: string | null;
+  list: { items: DashboardArtifact[]; total: number; nextCursor: string | null; projects: Array<{ id: string; name: string }> };
+  activeProjectId: string | null;
   storageError?: string | null;
+  feedback?: ActionFeedback;
 }) {
   const team = session.team!;
+  const sections = groupArtifacts(list.items, session.timeZone);
+  const activeProject = list.projects.find((project) => project.id === activeProjectId);
+  const pageHref = (query: string) => {
+    const params = new URLSearchParams(query);
+    if (activeProjectId) params.set("project", activeProjectId);
+    const search = params.toString();
+    return `/dashboard/${team.id}/artifacts${search ? `?${search}` : ""}`;
+  };
   return (
     <DashboardDocument session={session} title={`${team.name} artifacts`} active="artifacts">
       <PageHeader
-        eyebrow="Artifacts"
-        title="Published artifacts"
-        description="Each immediate folder under the publishing root is one artifact. Open one to browse its files."
+        eyebrow={activeProject ? "Project" : "Artifacts"}
+        title={activeProject ? activeProject.name : "Published artifacts"}
+        description={activeProject ? "Artifacts grouped into this project. Newest activity first." : "Each immediate folder under the publishing root is one artifact. Open one to browse its files."}
         actions={<button class="button secondary" type="button" data-refresh>Refresh</button>}
       />
-      <Feedback error={storageError} />
-      {artifacts.length ? <ArtifactDirectoryTable teamId={team.id} artifacts={artifacts} /> : <EmptyState title="No artifacts found" body="Create a non-empty folder under ~/.agents/artifacts and run the Artifact Sync daemon." actionHref="/auth/device" actionLabel="Connect a device" />}
-      {nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/artifacts?cursor=${encodeURIComponent(nextCursor)}`}>Next page</a> : null}
+      {list.projects.length ? (
+        <nav class="scope-tabs" aria-label="Filter by project">
+          <a href={`/dashboard/${team.id}/artifacts`} aria-current={activeProjectId ? undefined : "page"}>All artifacts</a>
+          {list.projects.map((project) => (
+            <a
+              href={`/dashboard/${team.id}/artifacts?project=${encodeURIComponent(project.id)}`}
+              aria-current={project.id === activeProjectId ? "page" : undefined}
+            >
+              {project.name}
+            </a>
+          ))}
+        </nav>
+      ) : null}
+      <Feedback error={storageError} notice={feedback?.notice} />
+      {list.items.length ? (
+        <ArtifactDirectoryTable teamId={team.id} sections={sections} timeZone={session.timeZone} manageable csrfToken={session.csrfToken} activeProjectId={activeProjectId} />
+      ) : (
+        <EmptyState
+          title={activeProject ? "No artifacts in this project" : "No artifacts found"}
+          body={activeProject ? "Use Organize on an artifact to add it to this project." : "Create a non-empty folder under ~/.agents/artifacts and run the Artifact Sync daemon."}
+          actionHref={activeProject ? `/dashboard/${team.id}/artifacts` : "/auth/device"}
+          actionLabel={activeProject ? "All artifacts" : "Connect a device"}
+        />
+      )}
+      {list.nextCursor ? <a class="button secondary pagination-next" href={pageHref(`after=${encodeURIComponent(list.nextCursor)}`)}>Next page</a> : null}
     </DashboardDocument>
   );
 }
@@ -289,51 +353,168 @@ export function ArtifactsPage({
 export function ArtifactDetailPage({
   session,
   artifact,
+  artifactMeta,
+  projects,
   files,
   nextCursor,
   storageError,
+  feedback,
 }: {
   session: DashboardSession;
   artifact: string;
+  artifactMeta: DashboardArtifact | null;
+  projects: Array<{ id: string; name: string }>;
   files: DashboardArtifactFile[];
   nextCursor: string | null;
   storageError?: string | null;
+  feedback?: ActionFeedback;
 }) {
   const team = session.team!;
+  const pinned = Boolean(artifactMeta?.pinnedAt);
+  const detailPath = `/dashboard/${team.id}/artifacts/${encodeURIComponent(artifact)}`;
   return (
     <DashboardDocument session={session} title={`${artifact} · ${team.name}`} active="artifacts">
       <PageHeader
         eyebrow="Artifact"
         title={artifact}
-        description="Files and nested folders published as one artifact."
-        actions={<a class="button secondary" href={`/dashboard/${team.id}/artifacts`}>All artifacts</a>}
+        description={artifactMeta?.lastActivityAt ? `Last upload ${formatDate(artifactMeta.lastActivityAt, session.timeZone)}. Files and nested folders publish as one artifact.` : "Files and nested folders published as one artifact."}
+        actions={
+          <>
+            <form method="post" action={`${detailPath}/pin`}>
+              <CsrfField token={session.csrfToken} />
+              <input type="hidden" name="action" value={pinned ? "unpin" : "pin"} />
+              <input type="hidden" name="context" value="detail" />
+              <button class="button secondary" type="submit">{pinned ? "Unpin" : "Pin"}</button>
+            </form>
+            <a class="button secondary" href={`/dashboard/${team.id}/artifacts`}>All artifacts</a>
+          </>
+        }
       />
-      <Feedback error={storageError} />
-      {files.length ? <ArtifactFileTable teamSlug={team.slug} artifactSlug={artifact} files={files} /> : <EmptyState title="No files in this artifact" body="The artifact may have been removed or has not finished uploading." actionHref={`/dashboard/${team.id}/artifacts`} actionLabel="Back to artifacts" />}
-      {nextCursor ? <a class="button secondary pagination-next" href={`/dashboard/${team.id}/artifacts/${encodeURIComponent(artifact)}?cursor=${encodeURIComponent(nextCursor)}`}>Next page</a> : null}
+      <Feedback error={storageError ?? feedback?.error} notice={feedback?.notice} />
+      <section class="content-section" id="projects">
+        <div class="section-heading">
+          <div><h2>Projects</h2><p>Group this artifact into one or more team projects.</p></div>
+        </div>
+        <div class="table-panel project-panel">
+          {projects.length ? (
+            <form method="post" action={`${detailPath}/projects`} class="project-checks">
+              <CsrfField token={session.csrfToken} />
+              {projects.map((project) => (
+                <label>
+                  <input type="checkbox" name="projectIds" value={project.id} checked={artifactMeta?.projects.some((member) => member.id === project.id) ?? false} />
+                  <span>{project.name}</span>
+                </label>
+              ))}
+              <div class="project-form-actions"><button class="button primary" type="submit">Save projects</button></div>
+            </form>
+          ) : (
+            <p class="permission-note">No projects yet. Create one from the <a href={`/dashboard/${team.id}/projects`}>Projects</a> page.</p>
+          )}
+        </div>
+      </section>
+      <section class="content-section">
+        <div class="section-heading">
+          <div><h2>Files</h2><p>Browse everything published under this artifact.</p></div>
+        </div>
+        {files.length ? <ArtifactFileTable teamSlug={team.slug} artifactSlug={artifact} files={files} timeZone={session.timeZone} /> : <EmptyState title="No files in this artifact" body="The artifact may have been removed or has not finished uploading." actionHref={`/dashboard/${team.id}/artifacts`} actionLabel="Back to artifacts" />}
+        {nextCursor ? <a class="button secondary pagination-next" href={`${detailPath}?cursor=${encodeURIComponent(nextCursor)}`}>Next page</a> : null}
+      </section>
     </DashboardDocument>
   );
 }
 
-function ArtifactDirectoryTable({ teamId, artifacts }: { teamId: string; artifacts: DashboardArtifact[] }) {
+function ArtifactDirectoryTable({
+  teamId,
+  sections,
+  timeZone,
+  manageable,
+  csrfToken,
+  activeProjectId,
+}: {
+  teamId: string;
+  sections: ReturnType<typeof groupArtifacts>;
+  timeZone: string;
+  manageable: boolean;
+  csrfToken: string;
+  activeProjectId?: string | null;
+}) {
   return (
     <div class="table-panel">
       <div class="data-table artifact-table" role="table" aria-label="Published artifacts">
-        <div class="table-row table-head" role="row"><span>Artifact</span><span>Kind</span><span>Contents</span><span>Action</span></div>
-        {artifacts.map((artifact) => (
-          <div class="table-row" role="row">
-            <span class="file-cell"><span class="file-kind directory">DIR</span><code>{artifact.slug}</code></span>
-            <span>Directory</span>
-            <span>Files and nested folders</span>
-            <a class="row-action" href={`/dashboard/${teamId}/artifacts/${encodeURIComponent(artifact.slug)}`}>Browse →</a>
-          </div>
+        <div class="table-row table-head" role="row"><span>Artifact</span><span>Last upload</span><span>Projects</span><span>Actions</span></div>
+        {sections.map((section) => (
+          <Fragment key={section.id}>
+            <div class="table-row table-section" role="row"><span>{section.label}</span></div>
+            {section.artifacts.map((artifact) => (
+              <ArtifactRow
+                key={artifact.slug}
+                teamId={teamId}
+                artifact={artifact}
+                timeZone={timeZone}
+                manageable={manageable}
+                csrfToken={csrfToken}
+                activeProjectId={activeProjectId}
+              />
+            ))}
+          </Fragment>
         ))}
       </div>
     </div>
   );
 }
 
-function ArtifactFileTable({ teamSlug, artifactSlug, files }: { teamSlug: string; artifactSlug: string; files: DashboardArtifactFile[] }) {
+function ArtifactRow({
+  teamId,
+  artifact,
+  timeZone,
+  manageable,
+  csrfToken,
+  activeProjectId,
+}: {
+  teamId: string;
+  artifact: DashboardArtifact;
+  timeZone: string;
+  manageable: boolean;
+  csrfToken: string;
+  activeProjectId?: string | null;
+}) {
+  const detailHref = `/dashboard/${teamId}/artifacts/${encodeURIComponent(artifact.slug)}`;
+  return (
+    <div class="table-row" role="row">
+      <span class="file-cell">
+        <span class="file-kind directory">DIR</span>
+        <code>{artifact.slug}</code>
+        {artifact.pinnedAt ? <span class="pin-mark" role="img" aria-label="Pinned">◆</span> : null}
+      </span>
+      <span>
+        {artifact.lastActivityAt
+          ? <time datetime={artifact.lastActivityAt}>{formatDate(artifact.lastActivityAt, timeZone)}</time>
+          : <span class="muted">—</span>}
+      </span>
+      <span>
+        {artifact.projects.length
+          ? <span class="chip-row">{artifact.projects.map((project) => <span class="chip" key={project.id}>{project.name}</span>)}</span>
+          : <span class="muted">—</span>}
+      </span>
+      <span class="row-actions">
+        <a class="row-action" href={detailHref}>Browse →</a>
+        {manageable ? (
+          <>
+            <a class="row-action" href={`${detailHref}#projects`}>Organize</a>
+            <form method="post" action={`${detailHref}/pin`}>
+              <CsrfField token={csrfToken} />
+              <input type="hidden" name="action" value={artifact.pinnedAt ? "unpin" : "pin"} />
+              {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
+              <button class="row-action" type="submit">{artifact.pinnedAt ? "Unpin" : "Pin"}</button>
+            </form>
+          </>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+function ArtifactFileTable({ teamSlug, artifactSlug, files, timeZone }: { teamSlug: string; artifactSlug: string; files: DashboardArtifactFile[]; timeZone: string }) {
   return (
     <div class="table-panel">
       <div class="data-table artifact-table" role="table" aria-label={`Files in ${artifactSlug}`}>
@@ -342,7 +523,7 @@ function ArtifactFileTable({ teamSlug, artifactSlug, files }: { teamSlug: string
           <div class="table-row" role="row">
             <span class="file-cell"><span class={`file-kind ${fileKind(file.path)}`}>{fileKind(file.path)}</span><code>{file.path}</code></span>
             <span>{formatBytes(file.size)}</span>
-            <span><time datetime={file.uploadedAt}>{formatDate(file.uploadedAt)}</time></span>
+            <span><time datetime={file.uploadedAt}>{formatDate(file.uploadedAt, timeZone)}</time></span>
             <a class="row-action" href={artifactHref(teamSlug, `${artifactSlug}/${file.path}`)} target="_blank" rel="noreferrer">Open ↗</a>
           </div>
         ))}
@@ -427,6 +608,53 @@ export function TokensPage({ session, page, createdToken, feedback }: { session:
           <div class="field"><label for="token-name">Token name</label><input id="token-name" name="name" maxlength={64} placeholder="Production publisher" required /><p>Use a name that identifies where the secret is stored.</p></div>
           <div class="scope-preview"><span>Scope</span><code>{team.slug}</code><small>artifacts:publish · artifacts:read</small></div>
           <div class="modal-actions"><button class="button secondary" type="button" data-dialog-close>Cancel</button><button class="button primary" type="submit">Create token</button></div>
+        </form>
+      </dialog>
+    </DashboardDocument>
+  );
+}
+
+export function ProjectsPage({ session, projects, feedback }: { session: DashboardSession; projects: DashboardProject[]; feedback?: ActionFeedback }) {
+  const team = session.team!;
+  return (
+    <DashboardDocument session={session} title={`${team.name} projects`} active="projects">
+      <PageHeader
+        eyebrow="Projects"
+        title="Team projects"
+        description="Organize artifacts into named groups. An artifact can belong to several projects."
+        actions={<button class="button primary" type="button" data-dialog-open="create-project">New project</button>}
+      />
+      <Feedback error={feedback?.error} notice={feedback?.notice} />
+      <div class="table-panel">
+        <div class="table-toolbar"><h2>Projects</h2><span>{projects.length} total</span></div>
+        {projects.length ? (
+          <div class="data-table project-table" role="table" aria-label="Team projects">
+            <div class="table-row table-head" role="row"><span>Project</span><span>Artifacts</span><span>Created</span><span>Action</span></div>
+            {projects.map((project) => (
+              <div class="table-row" role="row" key={project.id}>
+                <span><strong>{project.name}</strong></span>
+                <span><a class="row-action" href={`/dashboard/${team.id}/artifacts?project=${encodeURIComponent(project.id)}`}>{project.artifactCount} {project.artifactCount === 1 ? "artifact" : "artifacts"}</a></span>
+                <span>{formatDate(project.createdAt, session.timeZone)}</span>
+                <span>
+                  <form method="post" action={`/dashboard/${team.id}/projects/${encodeURIComponent(project.id)}/delete`} data-confirm={`Delete ${project.name}? Artifacts remain, but leave this project.`}>
+                    <CsrfField token={session.csrfToken} />
+                    <button class="danger-link" type="submit">Delete</button>
+                  </form>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="No projects yet" body="Create a project to group related artifacts, then use Organize on any artifact to add it." />
+        )}
+      </div>
+
+      <dialog id="create-project" class="modal">
+        <div class="modal-head"><div><p class="section-label">New project</p><h2>Create project</h2></div><button class="icon-button" type="button" data-dialog-close aria-label="Close">×</button></div>
+        <form method="post" action={`/dashboard/${team.id}/projects`} class="modal-form">
+          <CsrfField token={session.csrfToken} />
+          <div class="field"><label for="project-name">Project name</label><input id="project-name" name="name" maxlength={64} placeholder="Release bundles" required /><p>Use a short name your team recognizes.</p></div>
+          <div class="modal-actions"><button class="button secondary" type="button" data-dialog-close>Cancel</button><button class="button primary" type="submit">Create project</button></div>
         </form>
       </dialog>
     </DashboardDocument>

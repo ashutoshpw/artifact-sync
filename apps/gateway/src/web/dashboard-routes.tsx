@@ -8,16 +8,23 @@ import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
 import { handleTeam } from "../auth/team-routes.ts";
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebSession } from "../auth/web-session.ts";
-import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, TokensPage } from "./dashboard.tsx";
+import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, ProjectsPage, TokensPage } from "./dashboard.tsx";
 import { dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
 import {
+  createDashboardProject,
   dashboardCounts,
   dashboardSettings,
+  deleteDashboardProject,
+  getDashboardArtifact,
   listDashboardArtifactFiles,
   listDashboardArtifacts,
   listDashboardDevices,
+  listDashboardProjects,
   listDashboardTokens,
+  reconcileArtifacts,
   requireDashboardSession,
+  setArtifactProjects,
+  toggleArtifactPin,
   type DashboardSession,
 } from "./dashboard-service.ts";
 import { assetHeaders, pageSecurityHeaders } from "./http.ts";
@@ -46,42 +53,117 @@ export function registerDashboardRoutes(app: DashboardApp): void {
   app.get("/dashboard/:teamId", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const [artifacts, counts] = await Promise.all([
-      listDashboardArtifacts(c.env, session.team.id, null, 8),
+    const [list, counts] = await Promise.all([
+      listDashboardArtifacts(c.env, session.team.id, null, { limit: 8 }),
       dashboardCounts(c.env, session.identity, session.team),
     ]);
-    if (artifacts instanceof Response) {
-      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} counts={counts} storageError={actionMessage("artifact_storage_unavailable")} />);
+    if (list instanceof Response) {
+      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} artifactsTotal={0} counts={counts} storageError={actionMessage("artifact_storage_unavailable")} />);
     }
-    return dashboardHtml(c, <OverviewPage session={session} artifacts={artifacts.items} counts={counts} />);
+    scheduleArtifactReconciliation(c, session.team.id, list.missingSlugs);
+    return dashboardHtml(c, <OverviewPage session={session} artifacts={list.items} artifactsTotal={list.total} counts={counts} />);
   });
 
   app.get("/dashboard/:teamId/artifacts", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
-    const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("cursor") ?? null);
+    const activeProjectId = c.req.query("project") || null;
+    const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("after") ?? null, { projectId: activeProjectId });
     if (result instanceof Response) {
-      return dashboardHtml(c, <ArtifactsPage session={session} artifacts={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
+      if (result.status === 404) return c.text("Not found", 404);
+      return dashboardHtml(c, <ArtifactsPage session={session} list={{ items: [], total: 0, nextCursor: null, projects: [] }} activeProjectId={activeProjectId} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
     }
-    return dashboardHtml(c, <ArtifactsPage session={session} artifacts={result.items} nextCursor={result.nextCursor} />);
+    scheduleArtifactReconciliation(c, session.team.id, result.missingSlugs);
+    return dashboardHtml(c, <ArtifactsPage session={session} list={result} activeProjectId={activeProjectId} feedback={artifactFeedback(c)} />);
+  });
+
+  app.post("/dashboard/:teamId/artifacts/:artifactSlug/pin", async (c) => {
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
+    const slug = c.req.param("artifactSlug");
+    const pinned = String(form.get("action") ?? "pin") === "pin";
+    const pinnedResult = await toggleArtifactPin(c.env, session.team.id, slug, pinned);
+    const pinState = `pin=${pinnedResult ? (pinned ? "1" : "0") : "error"}`;
+    if (String(form.get("context") ?? "") === "detail") {
+      return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/artifacts/${encodeURIComponent(slug)}?${pinState}`, 303);
+    }
+    const project = typeof form.get("project") === "string" && form.get("project") ? `project=${encodeURIComponent(String(form.get("project")))}` : "";
+    const query = [project, pinState].filter(Boolean).join("&");
+    return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/artifacts${query ? `?${query}` : ""}`, 303);
+  });
+
+  app.post("/dashboard/:teamId/artifacts/:artifactSlug/projects", async (c) => {
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
+    const slug = c.req.param("artifactSlug");
+    const projectIds = form.getAll("projectIds").filter((value): value is string => typeof value === "string");
+    const saved = await setArtifactProjects(c.env, session.team.id, slug, projectIds);
+    return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/artifacts/${encodeURIComponent(slug)}?projects=${saved ? "saved" : "error"}`, 303);
   });
 
   app.get("/dashboard/:teamId/artifacts/:artifactSlug", async (c) => {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
     const artifactSlug = c.req.param("artifactSlug");
-    const result = await listDashboardArtifactFiles(
-      c.env,
-      session.team.id,
-      artifactSlug,
-      c.req.query("cursor") ?? null,
-    );
-    if (result instanceof Response) {
-      if (result.status === 404) return c.text("Not found", 404);
-      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
+    const [filesResult, artifactMeta, projects] = await Promise.all([
+      listDashboardArtifactFiles(c.env, session.team.id, artifactSlug, c.req.query("cursor") ?? null),
+      getDashboardArtifact(c.env, session.team.id, artifactSlug),
+      listDashboardProjects(c.env, session.team.id),
+    ]);
+    if (filesResult instanceof Response) {
+      if (filesResult.status === 404) return c.text("Not found", 404);
+      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, filesResult.status as ContentfulStatusCode);
     }
-    if (!c.req.query("cursor") && result.items.length === 0) return c.text("Not found", 404);
-    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} files={result.items} nextCursor={result.nextCursor} />);
+    if (!c.req.query("cursor") && filesResult.items.length === 0) return c.text("Not found", 404);
+    if (!artifactMeta) scheduleArtifactReconciliation(c, session.team.id, [artifactSlug]);
+    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} files={filesResult.items} nextCursor={filesResult.nextCursor} feedback={artifactFeedback(c)} />);
+  });
+
+  app.get("/dashboard/:teamId/projects", async (c) => {
+    const session = await dashboardSession(c, c.req.param("teamId"));
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    const projects = await listDashboardProjects(c.env, session.team.id);
+    return dashboardHtml(c, <ProjectsPage session={session} projects={projects} feedback={projectFeedback(c)} />);
+  });
+
+  app.post("/dashboard/:teamId/projects", async (c) => {
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
+    const result = await createDashboardProject(c.env, teamId, String(form.get("name") ?? ""));
+    if (result.ok) return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/projects?created=1`, 303);
+    const feedback = result.error === "project_name_taken"
+      ? { error: "That project name is already used in this team." }
+      : result.error === "invalid_project_name"
+        ? { error: "Enter a project name between 1 and 64 characters." }
+        : { error: actionMessage("project_service_unavailable") };
+    return dashboardHtml(c, <ProjectsPage session={session} projects={await listDashboardProjects(c.env, teamId)} feedback={feedback} />, 422);
+  });
+
+  app.post("/dashboard/:teamId/projects/:projectId/delete", async (c) => {
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    if (!isDashboardMutationAllowed(c.req.raw, form, session.csrfToken)) return forbidden(c);
+    const deleted = await deleteDashboardProject(c.env, teamId, c.req.param("projectId"));
+    return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/projects?${deleted ? "deleted=1" : "error=delete"}`, 303);
   });
 
   app.get("/dashboard/:teamId/settings/general", async (c) => {
@@ -278,6 +360,33 @@ function queryFeedback(c: DashboardContext): { error?: string; notice?: string }
   if (c.req.query("revoked")) return { notice: "Credential revoked. Future refresh attempts are blocked." };
   if (c.req.query("revokeError")) return { error: "Credential could not be revoked." };
   return undefined;
+}
+
+function artifactFeedback(c: DashboardContext): { error?: string; notice?: string } | undefined {
+  const pin = c.req.query("pin");
+  if (pin === "1") return { notice: "Artifact pinned. It stays at the top of every artifact list." };
+  if (pin === "0") return { notice: "Artifact unpinned." };
+  if (pin === "error") return { error: "The artifact could not be pinned." };
+  if (c.req.query("projects") === "saved") return { notice: "Project membership updated." };
+  if (c.req.query("projects") === "error") return { error: "Project membership could not be updated." };
+  return undefined;
+}
+
+function projectFeedback(c: DashboardContext): { error?: string; notice?: string } | undefined {
+  if (c.req.query("created")) return { notice: "Project created. Use Organize on an artifact to add it." };
+  if (c.req.query("deleted")) return { notice: "Project deleted. Artifacts remain untouched." };
+  if (c.req.query("error") === "delete") return { error: "The project could not be deleted." };
+  return undefined;
+}
+
+function scheduleArtifactReconciliation(c: DashboardContext, teamId: string, slugs: string[]): void {
+  if (!slugs.length) return;
+  const work = reconcileArtifacts(c.env, teamId, slugs).catch(() => {});
+  try {
+    c.executionCtx.waitUntil(work);
+  } catch {
+    // No execution context (tests, local tooling): let the work settle detached.
+  }
 }
 
 function actionMessage(code: string, nextAvailableAt = ""): string {

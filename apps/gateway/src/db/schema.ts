@@ -147,6 +147,31 @@ export const deviceAuthorizations = sqliteTable("device_authorizations", {
   index("device_authorizations_expiry_idx").on(table.expiresAt),
 ]);
 
+export const artifacts = sqliteTable("artifacts", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => teams.id, { onDelete: "cascade" }),
+  slug: text("slug").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  lastActivityAt: integer("last_activity_at", { mode: "timestamp_ms" }).notNull(),
+  pinnedAt: integer("pinned_at", { mode: "timestamp_ms" }),
+}, (table) => [
+  uniqueIndex("artifacts_team_slug_unique").on(table.teamId, table.slug),
+  index("artifacts_team_activity_idx").on(table.teamId, table.lastActivityAt),
+]);
+
+export const projects = sqliteTable("projects", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => teams.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [uniqueIndex("projects_team_name_unique").on(table.teamId, table.name)]);
+
+export const artifactProjects = sqliteTable("artifact_projects", {
+  artifactId: text("artifact_id").notNull().references(() => artifacts.id, { onDelete: "cascade" }),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [primaryKey({ columns: [table.artifactId, table.projectId] })]);
+
 export const teamRelations = relations(teams, ({ many }) => ({
   memberships: many(teamMemberships),
   slugs: many(teamSlugs),
