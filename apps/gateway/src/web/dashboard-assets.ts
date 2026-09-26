@@ -122,6 +122,9 @@ ${dashboardThemeStyles}
 
 export const artifactShareStyles = `
 .share-control{position:relative;display:inline-block;min-width:0}.share-control>summary{display:flex;align-items:center;gap:6px;list-style:none;cursor:pointer;color:var(--muted);font-size:10px}.share-control>summary::-webkit-details-marker{display:none}.share-control>summary:hover,.share-control[open]>summary{color:var(--text)}.share-control-compact .status{max-width:106px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.share-popover{position:absolute;right:0;z-index:40;width:min(390px,calc(100vw - 34px));margin-top:9px;padding:14px;border:1px solid var(--line-strong);border-radius:10px;background:var(--panel);box-shadow:var(--shadow)}.share-popover .share-explanation{margin:0 0 12px;color:var(--muted);font-size:10px;line-height:1.55}.share-explanation code{color:var(--text);font:10px ui-monospace,SFMono-Regular,Menlo,monospace}.share-choices{display:grid;gap:7px}.share-choice{display:grid;gap:4px;width:100%;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);text-align:left}.share-choice:hover:not(:disabled),.share-choice.selected{border-color:var(--accent);background:var(--panel-hover)}.share-choice strong{font-size:11px}.share-choice small{color:var(--subtle);font-size:9px;line-height:1.4}.share-link{display:flex;align-items:center;gap:7px;margin-top:11px;padding-top:11px;border-top:1px solid var(--line)}.share-link code{min-width:0;flex:1;overflow:hidden;color:var(--text);font:9px ui-monospace,SFMono-Regular,Menlo,monospace;text-overflow:ellipsis;white-space:nowrap}.share-link .button{min-height:30px;padding:0 9px;font-size:10px}.share-popover>form:last-child{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}.share-popover>.permission-note{margin-top:11px}.status.private{color:var(--muted)}.share-panel{overflow:visible;padding:14px}.share-panel .share-control{display:block}.share-panel .share-control>summary{justify-content:space-between;padding:5px 0}.share-panel .share-popover{position:static;width:auto;margin-top:12px;padding:0;border:0;box-shadow:none;background:transparent}.share-panel .share-control>summary{pointer-events:none}.share-panel .share-control[open]>summary{color:var(--text)}
+.artifact-directory-panel{overflow:visible}.row-actions{position:relative;display:flex;align-items:center;justify-content:flex-end;min-width:0}.row-action-menu{position:relative;display:block}.row-action-trigger{width:30px;height:30px;padding:0;font-size:18px;line-height:1}.row-action-trigger::-webkit-details-marker{display:none}.row-action-menu>summary{list-style:none}.row-action-menu>summary:hover,.row-action-menu[open]>summary{border-color:var(--line-strong);background:var(--panel-hover);color:var(--text)}.row-menu{position:absolute;top:calc(100% + 7px);right:0;z-index:60;display:grid;width:min(230px,calc(100vw - 24px));max-height:min(420px,calc(100vh - 24px));overflow:auto;padding:5px;border:1px solid var(--line-strong);border-radius:9px;background:var(--panel);box-shadow:var(--shadow)}.row-menu-item{display:flex;align-items:center;gap:9px;width:100%;min-height:34px;padding:8px;border:0;border-radius:6px;background:transparent;color:var(--text);font-size:11px;text-align:left;text-decoration:none}.row-menu-item:hover,.row-menu-item:focus-visible{background:var(--panel-hover);color:var(--text)}.row-menu-item .status{margin-left:auto;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-menu-form{margin:0}.row-menu-icon{display:block;width:16px;height:16px;flex:0 0 auto;color:var(--muted)}.row-menu-trigger-icon{display:block;width:16px;height:16px}.share-dialog{width:min(520px,calc(100% - 28px));max-height:calc(100dvh - 28px);overflow:auto}.share-dialog .share-popover{position:static;width:auto;margin:0;padding:18px;border:0;box-shadow:none;background:transparent}
+.row-actions .row-menu-item{padding:8px;border:0;background:transparent}.row-actions .row-menu-form{display:block;margin:0}.project-table .table-row{display:grid;grid-template-columns:minmax(220px,1.6fr) minmax(90px,.65fr) minmax(150px,1fr) auto}.project-table .table-row>span:last-child{display:flex;align-items:center;justify-content:flex-end}.project-cell-label{display:none}.project-delete{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px}.project-action-icon{display:block;width:14px;height:14px;flex:0 0 auto}@media(max-width:820px){.project-table .table-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"project action" "artifacts created";row-gap:4px;padding:10px 12px}.project-table .table-row>*:first-child{grid-area:project}.project-table .table-row>*:nth-child(2){display:flex;grid-area:artifacts;align-items:baseline;gap:5px}.project-table .table-row>*:nth-child(3){display:flex;grid-area:created;align-items:baseline;justify-content:flex-end;gap:5px}.project-table .table-row>*:last-child{grid-area:action}.project-cell-label{display:inline;color:var(--subtle);font:600 9px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.05em;text-transform:uppercase}}
+.share-panel .share-control>summary{pointer-events:auto}
 `;
 
 export const dashboardScript = `
@@ -292,6 +295,7 @@ export const dashboardScript = `
     syncSidebarMarkup();
   }
 
+  const dialogTriggers = new WeakMap();
   const dialogs = {
     createToken: document.querySelector("#create-token"),
   };
@@ -351,7 +355,11 @@ export const dashboardScript = `
     button.addEventListener("click", () => {
       const id = button.getAttribute("data-dialog-open");
       const dialog = id ? document.querySelector("#" + id) : null;
-      if (dialog instanceof HTMLDialogElement && !dialog.open) dialog.showModal();
+      if (!(dialog instanceof HTMLDialogElement)) return;
+      const rowMenu = button.closest("[data-row-menu]");
+      if (rowMenu instanceof HTMLDetailsElement) rowMenu.removeAttribute("open");
+      dialogTriggers.set(dialog, rowMenu?.querySelector("summary") ?? button);
+      if (!dialog.open) dialog.showModal();
     });
   });
   all("[data-dialog-close]").forEach((button) => {
@@ -360,6 +368,10 @@ export const dashboardScript = `
   all("dialog").forEach((dialog) => {
     dialog.addEventListener("click", (event) => {
       if (event.target === dialog) dialog.close();
+    });
+    dialog.addEventListener("close", () => {
+      const trigger = dialogTriggers.get(dialog);
+      if (trigger instanceof HTMLElement && document.contains(trigger)) trigger.focus();
     });
   });
 
@@ -405,20 +417,34 @@ export const dashboardScript = `
     button.addEventListener("click", () => location.reload());
   });
 
+  const rowMenus = all("details[data-row-menu]");
+  const closeDetails = (details, restoreFocus) => {
+    if (!details.open) return;
+    details.removeAttribute("open");
+    if (restoreFocus) details.querySelector("summary")?.focus();
+  };
   all("details").forEach((details) => {
     const summary = details.querySelector("summary");
     const syncExpanded = () => {
       if (summary) summary.setAttribute("aria-expanded", details.open ? "true" : "false");
     };
-    details.addEventListener("toggle", syncExpanded);
+    details.addEventListener("toggle", () => {
+      syncExpanded();
+      if (details.open && details.matches("[data-row-menu]")) {
+        rowMenus.forEach((other) => {
+          if (other !== details) closeDetails(other, false);
+        });
+      }
+    });
     details.addEventListener("keydown", (event) => {
       if (event.key !== "Escape" || !details.open) return;
-      details.removeAttribute("open");
-      if (summary) summary.focus();
+      closeDetails(details, true);
     });
     syncExpanded();
     document.addEventListener("click", (event) => {
-      if (details.open && !details.contains(event.target)) details.removeAttribute("open");
+      if (!details.open || details.contains(event.target)) return;
+      const clickedRowMenu = event.target instanceof Element && event.target.closest("[data-row-menu]");
+      closeDetails(details, details.matches("[data-row-menu]") && !clickedRowMenu);
     });
   });
 

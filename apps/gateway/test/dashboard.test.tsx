@@ -203,9 +203,43 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('value="csrf-token"');
     expect(html).toContain('action="/dashboard/team-1/artifacts/notes/pin"');
     expect(html).toContain('aria-label="Filter by project"');
+    expect(html).toContain('aria-label="Actions for reports"');
+    expect(html).toContain('data-dialog-open="share-dialog-team-1-reports"');
+    expect(html).toContain(">Shared<");
+    expect(html).toContain('<dialog id="share-dialog-team-1-reports"');
+    expect(html).toContain('aria-labelledby="share-dialog-team-1-reports-heading"');
+    expect(html).toContain('name="context" value="list"');
+    expect(html).toContain('aria-label="Close share dialog"');
     expect(html).toContain("Relay");
     expect(html).toContain("Next page");
     expect(html).toContain("after=2");
+  });
+
+  it("keeps list share mutations scoped to the project and disables them for members", async () => {
+    const memberSession: DashboardSession = {
+      ...session("sidebar"),
+      team: { ...team, role: "member" },
+      teams: [{ ...team, role: "member" }],
+    };
+    const html = await renderToString(
+      <ArtifactsPage
+        session={memberSession}
+        activeProjectId="p1"
+        list={{
+          items: [artifact("reports", { share: { active: true, token: shareToken, createdAt: "2026-01-05T10:00:00.000Z", revokedAt: null } })],
+          total: 1,
+          nextCursor: null,
+          projects: [{ id: "p1", name: "Relay" }],
+        }}
+        origin="https://artifact.w3dev.app"
+      />,
+    );
+
+    expect(html).toContain('data-dialog-open="share-dialog-team-1-reports"');
+    expect(html).toContain('name="context" value="list"');
+    expect(html).toContain('name="project" value="p1"');
+    expect(html).toContain('disabled=""');
+    expect(html).not.toContain('name="action" value="regenerate"');
   });
 
   it("browses nested files within a single artifact and offers project assignment", async () => {
@@ -235,6 +269,7 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('id="embed-token"');
     expect(html).toContain("?token=embed-token-value");
     expect(html).toContain("Copy token");
+    expect(html).toContain('class="share-control" open=""');
     expect(html).toContain("Anyone with the link");
     expect(html).toContain(`https://artifact.w3dev.app/w3dev/reports/index.html?share=${shareToken}`);
     expect(html).toContain("Regenerate link");
@@ -486,6 +521,11 @@ describe("dashboard server rendering", () => {
     expect(html).toContain("3 artifacts");
     expect(html).toContain('action="/dashboard/team-1/projects/p1/delete"');
     expect(html).toContain('action="/dashboard/team-1/projects"');
+    expect(html).toContain('class="data-table project-table"');
+    expect(html).toContain('class="project-action-cell"');
+    expect(html).toContain('class="danger-link project-delete"');
+    expect(html).toContain('class="project-cell-label">Artifacts</span>');
+    expect(html).toContain('class="project-cell-label">Created</span>');
     expect(html).toContain('data-dialog-open="create-project"');
     expect(html).toContain('name="csrfToken" value="csrf-token"');
   });

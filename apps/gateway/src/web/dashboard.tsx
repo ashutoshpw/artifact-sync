@@ -581,7 +581,7 @@ function ArtifactDirectoryTable({
   activeProjectId?: string | null;
 }) {
   return (
-    <div class="table-panel">
+    <div class="table-panel artifact-directory-panel">
       <div class="data-table artifact-table" role="table" aria-label="Published artifacts">
         <div class="table-row table-head" role="row"><span>Artifact</span><span>Last upload</span><span>Projects</span><span>Actions</span></div>
         {sections.map((section) => (
@@ -642,23 +642,67 @@ function ArtifactRow({
           ? <span class="chip-row">{artifact.projects.map((project) => <span class="chip" key={project.id}>{project.name}</span>)}</span>
           : <span class="muted">—</span>}
       </span>
-      <span class="row-actions">
-        <a class="row-action" href={detailHref}>Browse →</a>
-        <ArtifactShareControl team={team} artifact={artifact} origin={origin} csrfToken={csrfToken} context="list" activeProjectId={activeProjectId} />
-        {manageable ? (
-          <>
-            <a class="row-action" href={`${detailHref}#projects`}>Organize</a>
-            <form method="post" action={`${detailHref}/pin`}>
-              <CsrfField token={csrfToken} />
-              <input type="hidden" name="action" value={artifact.pinnedAt ? "unpin" : "pin"} />
-              {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
-              <button class="row-action" type="submit">{artifact.pinnedAt ? "Unpin" : "Pin"}</button>
-            </form>
-          </>
-        ) : null}
-      </span>
+      <div class="row-actions">
+        <details class="row-action-menu" data-row-menu>
+          <summary class="icon-button row-action-trigger" aria-label={`Actions for ${artifact.slug}`} aria-haspopup="menu">
+            <svg class="row-menu-trigger-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <circle cx="3" cy="8" r="1.2" /><circle cx="8" cy="8" r="1.2" /><circle cx="13" cy="8" r="1.2" />
+            </svg>
+          </summary>
+          <div class="row-menu">
+            <a class="row-menu-item" href={detailHref}>
+              <ActionIcon name="browse" /><span>Browse</span>
+            </a>
+            <button class="row-menu-item" type="button" data-dialog-open={`share-dialog-${teamId}-${artifact.slug}`} aria-controls={`share-dialog-${teamId}-${artifact.slug}`} aria-haspopup="dialog">
+              <ActionIcon name="share" /><span>Share</span>
+              <span class={`status ${artifact.share.active ? "active" : "private"}`}>{artifact.share.active ? "Shared" : "Private"}</span>
+            </button>
+            {manageable ? (
+              <>
+                <a class="row-menu-item" href={`${detailHref}#projects`}>
+                  <ActionIcon name="organize" /><span>Organize</span>
+                </a>
+                <form class="row-menu-form" method="post" action={`${detailHref}/pin`}>
+                  <CsrfField token={csrfToken} />
+                  <input type="hidden" name="action" value={artifact.pinnedAt ? "unpin" : "pin"} />
+                  {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
+                  <button class="row-menu-item" type="submit">
+                    <ActionIcon name="pin" /><span>{artifact.pinnedAt ? "Unpin" : "Pin"}</span>
+                  </button>
+                </form>
+              </>
+            ) : null}
+          </div>
+        </details>
+        <ArtifactShareDialog team={team} artifact={artifact} origin={origin} csrfToken={csrfToken} context="list" activeProjectId={activeProjectId} />
+      </div>
     </div>
   );
+}
+
+function ActionIcon({ name }: { name: "browse" | "share" | "organize" | "pin" }) {
+  const icon = name === "browse" ? (
+    <>
+      <path d="M2 4.5h4l1.3 1.4H14v6.6H2z" />
+      <path d="M8.5 9.3h3.8m-1.8-1.8 1.8 1.8-1.8 1.8" />
+    </>
+  ) : name === "share" ? (
+    <>
+      <path d="m5.2 8.3 5.1-3.1m-5.1 2.5 5.1 3.1" />
+      <circle cx="3.5" cy="8" r="1.6" /><circle cx="12.5" cy="4" r="1.6" /><circle cx="12.5" cy="12" r="1.6" />
+    </>
+  ) : name === "organize" ? (
+    <>
+      <path d="M2 4.5h4l1.3 1.4H14v6.6H2z" />
+      <path d="M2 7.2h12" />
+    </>
+  ) : (
+    <>
+      <path d="m5 2.5 6 2-1.5 3 2 2-1 1-2-2-3 1.5z" />
+      <path d="m8 10-2 3.5" />
+    </>
+  );
+  return <svg class="row-menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icon}</svg>;
 }
 
 function artifactWithPrivateShare(slug: string): DashboardArtifact {
@@ -672,7 +716,58 @@ function artifactWithPrivateShare(slug: string): DashboardArtifact {
   };
 }
 
+function ArtifactShareDialog({
+  team,
+  artifact,
+  origin,
+  csrfToken,
+  context,
+  activeProjectId,
+}: {
+  team: NonNullable<DashboardSession["team"]>;
+  artifact: DashboardArtifact;
+  origin?: string;
+  csrfToken: string;
+  context: "list" | "detail";
+  activeProjectId?: string | null;
+}) {
+  const dialogId = `share-dialog-${team.id}-${artifact.slug}`;
+  const headingId = `${dialogId}-heading`;
+  return (
+    <dialog id={dialogId} class="modal share-dialog" aria-labelledby={headingId}>
+      <div class="modal-head">
+        <div><p class="section-label">Share artifact</p><h2 id={headingId}>{artifact.slug}</h2></div>
+        <button class="icon-button" type="button" data-dialog-close aria-label="Close share dialog">×</button>
+      </div>
+      <ArtifactSharePanel team={team} artifact={artifact} origin={origin} csrfToken={csrfToken} context={context} activeProjectId={activeProjectId} />
+    </dialog>
+  );
+}
+
 function ArtifactShareControl({
+  team,
+  artifact,
+  origin,
+  csrfToken,
+  context,
+  activeProjectId,
+}: {
+  team: NonNullable<DashboardSession["team"]>;
+  artifact: DashboardArtifact;
+  origin?: string;
+  csrfToken: string;
+  context: "list" | "detail";
+  activeProjectId?: string | null;
+}) {
+  return (
+    <details class={`share-control${context === "list" ? " share-control-compact" : ""}`} open={context === "detail"}>
+      <summary><span>Share</span><span class={`status ${artifact.share.active ? "active" : "private"}`}>{artifact.share.active ? "Anyone with the link" : "Only me"}</span></summary>
+      <ArtifactSharePanel team={team} artifact={artifact} origin={origin} csrfToken={csrfToken} context={context} activeProjectId={activeProjectId} />
+    </details>
+  );
+}
+
+function ArtifactSharePanel({
   team,
   artifact,
   origin,
@@ -693,42 +788,38 @@ function ArtifactShareControl({
     : null;
   const shareId = `share-url-${team.id}-${artifact.slug}`;
   const actionPath = `/dashboard/${team.id}/artifacts/${encodeURIComponent(artifact.slug)}/share`;
-  const stateLabel = artifact.share.active ? "Anyone with the link" : "Only me";
   return (
-    <details class={`share-control${context === "list" ? " share-control-compact" : ""}`}>
-      <summary><span>Share</span><span class={`status ${artifact.share.active ? "active" : "private"}`}>{stateLabel}</span></summary>
-      <div class="share-popover">
-        <p class="share-explanation">Only me keeps access with authenticated members of this team. Anyone with the link can open the shared artifact without a dashboard session. Existing embedding tokens are a separate 24-hour capability and remain valid until expiry; Only me does not revoke them.</p>
-        <form method="post" action={actionPath}>
+    <div class="share-popover">
+      <p class="share-explanation">Only me keeps access with authenticated members of this team. Anyone with the link can open the shared artifact without a dashboard session. Existing embedding tokens are a separate 24-hour capability and remain valid until expiry; Only me does not revoke them.</p>
+      <form method="post" action={actionPath}>
+        <CsrfField token={csrfToken} />
+        <input type="hidden" name="context" value={context} />
+        {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
+        <div class="share-choices" role="group" aria-label="Artifact sharing">
+          <button class={`share-choice${!artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="revoke" disabled={!canManage} aria-pressed={!artifact.share.active ? "true" : "false"}>
+            <strong>Only me</strong><small>Authenticated team members keep their existing access.</small>
+          </button>
+          <button class={`share-choice${artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="enable" disabled={!canManage} aria-pressed={artifact.share.active ? "true" : "false"}>
+            <strong>Anyone with the link</strong><small>Share the artifact URL with people outside the team.</small>
+          </button>
+        </div>
+      </form>
+      {shareUrl ? (
+        <div class="share-link">
+          <code id={shareId}>{shareUrl}</code>
+          <button class="button secondary" type="button" data-copy-target={shareId}>Copy link</button>
+        </div>
+      ) : null}
+      {canManage && artifact.share.active ? (
+        <form method="post" action={actionPath} data-confirm="Regenerate this link? The current link will stop working immediately.">
           <CsrfField token={csrfToken} />
           <input type="hidden" name="context" value={context} />
           {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
-          <div class="share-choices" role="group" aria-label="Artifact sharing">
-            <button class={`share-choice${!artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="revoke" disabled={!canManage} aria-pressed={!artifact.share.active ? "true" : "false"}>
-              <strong>Only me</strong><small>Authenticated team members keep their existing access.</small>
-            </button>
-            <button class={`share-choice${artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="enable" disabled={!canManage} aria-pressed={artifact.share.active ? "true" : "false"}>
-              <strong>Anyone with the link</strong><small>Share the artifact URL with people outside the team.</small>
-            </button>
-          </div>
+          <button class="danger-link" type="submit" name="action" value="regenerate">Regenerate link</button>
         </form>
-        {shareUrl ? (
-          <div class="share-link">
-            <code id={shareId}>{shareUrl}</code>
-            <button class="button secondary" type="button" data-copy-target={shareId}>Copy link</button>
-          </div>
-        ) : null}
-        {canManage && artifact.share.active ? (
-          <form method="post" action={actionPath} data-confirm="Regenerate this link? The current link will stop working immediately.">
-            <CsrfField token={csrfToken} />
-            <input type="hidden" name="context" value={context} />
-            {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
-            <button class="danger-link" type="submit" name="action" value="regenerate">Regenerate link</button>
-          </form>
-        ) : null}
-        {!canManage ? <p class="permission-note">Only a team owner can change this sharing setting.</p> : null}
-      </div>
-    </details>
+      ) : null}
+      {!canManage ? <p class="permission-note">Only a team owner can change this sharing setting.</p> : null}
+    </div>
   );
 }
 
@@ -851,12 +942,17 @@ export function ProjectsPage({ session, projects, feedback }: { session: Dashboa
             {projects.map((project) => (
               <div class="table-row" role="row" key={project.id}>
                 <span><strong>{project.name}</strong></span>
-                <span><a class="row-action" href={`/dashboard/${team.id}/artifacts?project=${encodeURIComponent(project.id)}`}>{project.artifactCount} {project.artifactCount === 1 ? "artifact" : "artifacts"}</a></span>
-                <span>{formatDate(project.createdAt, session.timeZone)}</span>
-                <span>
+                <span><span class="project-cell-label">Artifacts</span><a class="row-action" href={`/dashboard/${team.id}/artifacts?project=${encodeURIComponent(project.id)}`}>{project.artifactCount} {project.artifactCount === 1 ? "artifact" : "artifacts"}</a></span>
+                <span><span class="project-cell-label">Created</span>{formatDate(project.createdAt, session.timeZone)}</span>
+                <span class="project-action-cell">
                   <form method="post" action={`/dashboard/${team.id}/projects/${encodeURIComponent(project.id)}/delete`} data-confirm={`Delete ${project.name}? Artifacts remain, but leave this project.`}>
                     <CsrfField token={session.csrfToken} />
-                    <button class="danger-link" type="submit">Delete</button>
+                    <button class="danger-link project-delete" type="submit">
+                      <svg class="project-action-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" aria-hidden="true">
+                        <path d="M3.5 5.2h9m-7.8 0 .5 8h5.6l.5-8M6.2 5.2V3.5h3.6v1.7" />
+                      </svg>
+                      <span>Delete</span>
+                    </button>
                   </form>
                 </span>
               </div>
