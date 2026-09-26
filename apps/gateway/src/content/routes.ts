@@ -168,10 +168,10 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
       if (!credential) return access;
       access = { teamId: scope.teamId, team: scope.currentSlug };
       if (credential === "query") embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
-    } else if (isDocumentNavigation(request) && !(await findEmbedCredential(request, env, scope.teamId))) {
-      // The document navigation still carries the session cookie even when the
-      // browser blocks it for the page's subresources. Seed a partitioned embed
-      // cookie so asset requests authenticate within the same embed context.
+    } else if (!(await findEmbedCredential(request, env, scope.teamId))) {
+      // Any session-authenticated artifact request that did not present a valid
+      // embed credential seeds one, so assets requested from embed contexts the
+      // browser grants document access to keep working for their subresources.
       embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
     }
   }
@@ -193,9 +193,12 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   }
 }
 
-function isDocumentNavigation(request: Request): boolean {
-  const destination = request.headers.get("Sec-Fetch-Dest");
-  return !destination || destination === "document";
+export async function createEmbedToken(request: Request, env: GatewayEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const access = await resolveTeamAccess(request, env, url.searchParams.get("team"), READ_PERMISSION);
+  if (access instanceof Response) return access;
+  const { token, expiresAt } = await issueEmbedToken(env, access.teamId);
+  return Response.json({ team: access.team, token, expiresAt }, { headers: noStoreHeaders() });
 }
 
 async function lookupTeamSlugScope(

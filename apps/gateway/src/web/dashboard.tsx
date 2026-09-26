@@ -355,6 +355,7 @@ export function ArtifactDetailPage({
   artifact,
   artifactMeta,
   projects,
+  embedToken,
   files,
   nextCursor,
   storageError,
@@ -364,6 +365,7 @@ export function ArtifactDetailPage({
   artifact: string;
   artifactMeta: DashboardArtifact | null;
   projects: Array<{ id: string; name: string }>;
+  embedToken: string | null;
   files: DashboardArtifactFile[];
   nextCursor: string | null;
   storageError?: string | null;
@@ -391,6 +393,21 @@ export function ArtifactDetailPage({
         }
       />
       <Feedback error={storageError ?? feedback?.error} notice={feedback?.notice} />
+      <section class="content-section">
+        <div class="section-heading">
+          <div><h2>Embedding</h2><p>Browsers block session cookies for artifact assets loaded from other sites. Append this token to artifact URLs used outside the dashboard; it grants read access to this team's artifacts for 24 hours.</p></div>
+        </div>
+        <div class="table-panel">
+          {embedToken ? (
+            <div class="secret-row">
+              <code id="embed-token">?token={embedToken}</code>
+              <button class="button secondary" type="button" data-copy-target="embed-token">Copy token</button>
+            </div>
+          ) : (
+            <p class="permission-note">The embed token could not be created right now. Reload to try again.</p>
+          )}
+        </div>
+      </section>
       <section class="content-section" id="projects">
         <div class="section-heading">
           <div><h2>Projects</h2><p>Group this artifact into one or more team projects.</p></div>

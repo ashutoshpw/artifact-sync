@@ -145,6 +145,7 @@ describe("dashboard server rendering", () => {
         artifact="reports"
         artifactMeta={artifact("reports", { pinnedAt: "2026-01-02T10:00:00.000Z", projects: [{ id: "p1", name: "Relay" }] })}
         projects={[{ id: "p1", name: "Relay" }, { id: "p2", name: "Scratch" }]}
+        embedToken="embed-token-value"
         nextCursor="next-page"
         files={[{ path: "daily/today.json", size: 16, uploadedAt: "2026-09-24T10:00:00.000Z" }]}
       />,
@@ -156,6 +157,9 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('id="projects"');
     expect(html).toContain('name="projectIds"');
     expect(html).toContain("Unpin");
+    expect(html).toContain('id="embed-token"');
+    expect(html).toContain("?token=embed-token-value");
+    expect(html).toContain("Copy token");
     expect(html).toContain('value="csrf-token"');
   });
 

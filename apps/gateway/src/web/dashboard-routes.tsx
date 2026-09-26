@@ -3,6 +3,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HtmlEscapedString } from "hono/utils/html";
 import { createWebAuth } from "../auth/better-auth.ts";
 import { isDashboardMutationAllowed } from "../auth/csrf.ts";
+import { issueEmbedToken } from "../auth/embed.ts";
 import { handleApiTokens, handleDeviceApprove, handleRevokeApiToken } from "../auth/routes.ts";
 import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
 import { handleTeam } from "../auth/team-routes.ts";
@@ -115,18 +116,19 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     const session = await dashboardSession(c, c.req.param("teamId"));
     if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
     const artifactSlug = c.req.param("artifactSlug");
-    const [filesResult, artifactMeta, projects] = await Promise.all([
+    const [filesResult, artifactMeta, projects, embed] = await Promise.all([
       listDashboardArtifactFiles(c.env, session.team.id, artifactSlug, c.req.query("cursor") ?? null),
       getDashboardArtifact(c.env, session.team.id, artifactSlug),
       listDashboardProjects(c.env, session.team.id),
+      issueEmbedToken(c.env, session.team.id),
     ]);
     if (filesResult instanceof Response) {
       if (filesResult.status === 404) return c.text("Not found", 404);
-      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, filesResult.status as ContentfulStatusCode);
+      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, filesResult.status as ContentfulStatusCode);
     }
     if (!c.req.query("cursor") && filesResult.items.length === 0) return c.text("Not found", 404);
     if (!artifactMeta) scheduleArtifactReconciliation(c, session.team.id, [artifactSlug]);
-    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} files={filesResult.items} nextCursor={filesResult.nextCursor} feedback={artifactFeedback(c)} />);
+    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} files={filesResult.items} nextCursor={filesResult.nextCursor} feedback={artifactFeedback(c)} />);
   });
 
   app.get("/dashboard/:teamId/projects", async (c) => {

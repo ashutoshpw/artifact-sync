@@ -344,7 +344,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(html).toContain('data-return-to="/dashboard"');
   });
 
-  it("seeds a partitioned embed cookie on session-authenticated artifact documents", async () => {
+  it("seeds a partitioned embed cookie on session-authenticated iframe artifact loads", async () => {
     const { sqlite, db } = createMigratedDb();
     const { env: baseEnv } = makeEnv(db);
     const env = baseEnv as unknown as Record<string, unknown>;
@@ -375,7 +375,7 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const response = await serveArtifact(request("/w3dev/reports/today.json", {
       headers: {
         Cookie: sessionCookiePair,
-        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Dest": "iframe",
       },
     }), env as never, "w3dev");
 
@@ -439,6 +439,24 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const anonymous = await serveArtifact(request("/w3dev/reports/today.json"), env, "w3dev");
     expect(anonymous.status).toBe(401);
     expect(await anonymous.text()).toBe(JSON.stringify({ error: "web_session_required" }));
+  });
+
+  it("mints team-scoped embed tokens for API credentials and rejects anonymous callers", async () => {
+    const { env } = makeEnv();
+    const denied = await worker.fetch(request("/__api/v1/artifacts/embed-token", { method: "POST" }), env);
+    expect(denied.status).toBe(401);
+
+    const token = await accessToken();
+    const minted = await worker.fetch(request("/__api/v1/artifacts/embed-token", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token.token}` },
+    }), env);
+    expect(minted.status).toBe(200);
+    const payload = await minted.json() as Record<string, unknown>;
+    expect(payload.team).toBe("w3dev");
+    expect(typeof payload.token).toBe("string");
+    expect(await verifyEmbedToken({ JWT_SECRET } as never, payload.token as string)).toBe("team-abc123");
+    expect(typeof payload.expiresAt).toBe("string");
   });
 
   it("preserves multiple authentication cookies while adding no-store headers", () => {
