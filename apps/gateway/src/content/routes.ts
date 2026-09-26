@@ -11,9 +11,9 @@ const MAX_PATH_LENGTH = 1024;
 const ARTIFACT_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
   "script-src 'self' 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data: blob:",
-  "font-src 'self' data:",
+  "font-src 'self' data: https://fonts.gstatic.com",
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
@@ -141,6 +141,7 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
 
   let access: { teamId: string; team: string } | Response;
   let embedCookie: string | null = null;
+  let embedToken: string | null = null;
   if (request.headers.has("Authorization")) {
     access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION);
     if (access instanceof Response) {
@@ -167,12 +168,21 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
       const credential = await findEmbedCredential(request, env, scope.teamId);
       if (!credential) return access;
       access = { teamId: scope.teamId, team: scope.currentSlug };
-      if (credential === "query") embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
-    } else if (!(await findEmbedCredential(request, env, scope.teamId))) {
-      // Any session-authenticated artifact request that did not present a valid
-      // embed credential seeds one, so assets requested from embed contexts the
-      // browser grants document access to keep working for their subresources.
-      embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
+      if (credential === "query") {
+        embedToken = requestUrl.searchParams.get("token");
+        if (embedToken) embedCookie = embedToken;
+      }
+    } else {
+      const credential = await findEmbedCredential(request, env, scope.teamId);
+      if (credential === "query") {
+        embedToken = requestUrl.searchParams.get("token");
+        if (embedToken) embedCookie = embedToken;
+      } else if (!credential) {
+        // Any session-authenticated artifact request that did not present a
+        // valid embed credential seeds one, so assets requested from embed
+        // contexts the browser grants document access to keep working.
+        embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
+      }
     }
   }
 
@@ -187,9 +197,82 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
     headers.set("Content-Security-Policy", ARTIFACT_CONTENT_SECURITY_POLICY);
     headers.set("Referrer-Policy", "no-referrer");
     if (embedCookie) headers.append("Set-Cookie", embedCookieHeader(embedCookie));
-    return new Response(object.body, { headers });
+    let body: BodyInit | null = object.body;
+    const contentType = headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+    if (embedToken && contentType === "text/html") {
+      body = rewriteArtifactHtml(await new Response(object.body).text(), requestUrl, teamSlug, artifactSlug, embedToken);
+      headers.delete("Content-Encoding");
+      headers.delete("Content-Length");
+    } else if (embedToken && contentType === "text/css") {
+      body = rewriteArtifactCss(await new Response(object.body).text(), requestUrl, teamSlug, artifactSlug, embedToken);
+      headers.delete("Content-Encoding");
+      headers.delete("Content-Length");
+    }
+    return new Response(body, { headers });
   } catch {
     return authError(503, "artifact_storage_unavailable");
+  }
+}
+
+function rewriteArtifactHtml(
+  html: string,
+  requestUrl: URL,
+  teamSlug: string,
+  artifactSlug: string,
+  token: string,
+): string {
+  const resourceTagPattern = /<(?:link|script|img|source|audio|video|track|iframe|embed|object|input)\b[^>]*>/giu;
+  const rewritten = html.replace(resourceTagPattern, (tag) => {
+    const tagName = /^<([a-z]+)/iu.exec(tag)?.[1].toLowerCase();
+    const attributes = tagName === "link" ? "href" : tagName === "object" ? "data" : "src|poster";
+    const attributePattern = new RegExp(`(\\s(?:${attributes})\\s*=\\s*)(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\\x60]+))`, "giu");
+    return tag.replace(attributePattern, (_match, prefix: string, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
+      const value = doubleQuoted ?? singleQuoted ?? unquoted ?? "";
+      const rewrittenValue = appendArtifactToken(value.replace(/&amp;/giu, "&"), requestUrl, teamSlug, artifactSlug, token)
+        .replaceAll("&", "&amp;");
+      if (doubleQuoted !== undefined) return `${prefix}"${rewrittenValue}"`;
+      if (singleQuoted !== undefined) return `${prefix}'${rewrittenValue}'`;
+      return `${prefix}${rewrittenValue}`;
+    });
+  });
+  return rewritten.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/giu, (_match, open: string, css: string, close: string) =>
+    `${open}${rewriteArtifactCss(css, requestUrl, teamSlug, artifactSlug, token)}${close}`,
+  );
+}
+
+function rewriteArtifactCss(
+  css: string,
+  requestUrl: URL,
+  teamSlug: string,
+  artifactSlug: string,
+  token: string,
+): string {
+  const rewriteValue = (value: string) => appendArtifactToken(value.trim(), requestUrl, teamSlug, artifactSlug, token);
+  const withUrls = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/giu, (match, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
+    const value = doubleQuoted ?? singleQuoted ?? unquoted ?? "";
+    const rewritten = rewriteValue(value);
+    if (doubleQuoted !== undefined) return `url("${rewritten}")`;
+    if (singleQuoted !== undefined) return `url('${rewritten}')`;
+    return `url(${rewritten})`;
+  });
+  return withUrls.replace(/(@import\s+)("([^"]*)"|'([^']*)')/giu, (_match, prefix: string, quoted: string, doubleQuoted?: string, singleQuoted?: string) => {
+    const value = doubleQuoted ?? singleQuoted ?? "";
+    const rewritten = rewriteValue(value);
+    return `${prefix}${quoted[0]}${rewritten}${quoted[0]}`;
+  });
+}
+
+function appendArtifactToken(value: string, requestUrl: URL, teamSlug: string, artifactSlug: string, token: string): string {
+  if (!value || value.startsWith("#") || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/iu.test(value)) return value;
+  try {
+    const resolved = new URL(value, requestUrl);
+    const artifactPrefix = `/${teamSlug}/${artifactSlug}/`;
+    // A shared token must not escape to external URLs or another artifact.
+    if (resolved.origin !== requestUrl.origin || !resolved.pathname.startsWith(artifactPrefix)) return value;
+    resolved.searchParams.set("token", token);
+    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+  } catch {
+    return value;
   }
 }
 

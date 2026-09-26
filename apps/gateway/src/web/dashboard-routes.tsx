@@ -298,7 +298,14 @@ export function registerDashboardRoutes(app: DashboardApp): void {
       const webSession = await getWebSession(c.req.raw, c.env);
       if (!webSession || !isDashboardMutationAllowed(c.req.raw, form, webSession.csrfToken)) return forbidden(c);
     }
-    const authResponse = withNoStore(await createWebAuth(c.env).handler(proxyJsonRequest(c.req.raw, "/__api/auth/sign-out", "POST", { disableRedirect: true })));
+    const authResponse = withNoStore(await createWebAuth(c.env).handler(proxyJsonRequest(
+      c.req.raw,
+      "/__api/auth/sign-out",
+      "POST",
+      { disableRedirect: true },
+      { Origin: c.env.APP_ORIGIN },
+    )));
+    if (!authResponse.ok) return c.text("Could not sign out. Reload the page and try again.", authResponse.status as ContentfulStatusCode, Object.fromEntries(noStoreHeaders()));
     const headers = new Headers({ Location: "/auth/login", "Cache-Control": "no-store", Pragma: "no-cache" });
     authResponse.headers.forEach((value, name) => {
       if (name.toLowerCase() !== "set-cookie") headers.set(name, value);
@@ -326,10 +333,10 @@ function dashboardHtml(
   return c.html(content, status, pageSecurityHeaders);
 }
 
-function proxyJsonRequest(request: Request, path: string, method: "POST" | "PATCH", body: unknown): Request {
+function proxyJsonRequest(request: Request, path: string, method: "POST" | "PATCH", body: unknown, headers: Record<string, string> = {}): Request {
   return proxyRequest(request, path, method, {
     body: JSON.stringify(body),
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
   });
 }
 

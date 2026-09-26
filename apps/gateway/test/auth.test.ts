@@ -26,6 +26,7 @@ async function accessToken(overrides: Record<string, unknown> = {}, now = Math.f
 function makeEnv(db: D1Database | null = null) {
   const uploads: Array<{ key: string; body: string; contentType?: string }> = [];
   const lookups: string[] = [];
+  const objects = new Map<string, { body: string; contentType: string }>();
   const env = {
     JWT_SECRET,
     BETTER_AUTH_SECRET: "test-better-auth-secret-that-is-long-enough",
@@ -42,12 +43,13 @@ function makeEnv(db: D1Database | null = null) {
       },
       async get(key: string) {
         lookups.push(key);
+        const artifact = objects.get(key) ?? { body: "private artifact", contentType: "application/json" };
         return {
-          body: new Response("private artifact").body,
-          size: 16,
+          body: new Response(artifact.body).body,
+          size: new TextEncoder().encode(artifact.body).byteLength,
           uploaded: new Date("2026-09-23T00:00:00.000Z"),
           httpEtag: '"fixture"',
-          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", "application/json"); },
+          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", artifact.contentType); },
         };
       },
       async list(options: R2ListOptions) {
@@ -66,7 +68,7 @@ function makeEnv(db: D1Database | null = null) {
       },
     },
   };
-  return { env: env as never, uploads, lookups };
+  return { env: env as never, uploads, lookups, objects };
 }
 
 function request(path: string, init?: RequestInit): Request {
@@ -190,9 +192,9 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     const contentSecurityPolicy = response.headers.get("Content-Security-Policy") ?? "";
     expect(contentSecurityPolicy).toContain("default-src 'none'");
     expect(contentSecurityPolicy).toContain("script-src 'self' 'unsafe-inline'");
-    expect(contentSecurityPolicy).toContain("style-src 'self' 'unsafe-inline'");
+    expect(contentSecurityPolicy).toContain("style-src 'self' 'unsafe-inline' https://fonts.googleapis.com");
     expect(contentSecurityPolicy).toContain("img-src 'self' data: blob:");
-    expect(contentSecurityPolicy).toContain("font-src 'self' data:");
+    expect(contentSecurityPolicy).toContain("font-src 'self' data: https://fonts.gstatic.com");
     expect(contentSecurityPolicy).toContain("object-src 'none'");
     expect(contentSecurityPolicy).toContain("base-uri 'none'");
     expect(contentSecurityPolicy).toContain("form-action 'none'");
@@ -335,6 +337,40 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(await opaque.text()).toBe("Forbidden");
   });
 
+  it("forwards a trusted origin so Better Auth invalidates the dashboard session", async () => {
+    const { sqlite, db } = createMigratedDb();
+    const { env } = makeEnv(db);
+    (env as unknown as Record<string, unknown>).EMAIL = { send: async () => {} };
+    const auth = createWebAuth(env);
+    const signUp = await auth.api.signUpEmail({
+      body: { name: "Publisher", email: "publisher@example.test", password: "sync-test-password" },
+    });
+    if (!signUp) throw new Error("expected signup to succeed");
+    sqlite.exec("UPDATE user SET email_verified = 1 WHERE email = 'publisher@example.test'");
+    const signIn = await auth.api.signInEmail({
+      body: { email: "publisher@example.test", password: "sync-test-password" },
+      asResponse: true,
+    });
+    const sessionCookie = signIn.headers.getSetCookie()
+      .find((cookie) => cookie.startsWith("better-auth.session_token=") || cookie.startsWith("__Secure-better-auth.session_token="));
+    if (!sessionCookie) throw new Error("expected a session cookie from sign-in");
+    const sessionCookiePair = sessionCookie.split(";")[0];
+
+    const logout = await worker.fetch(request("/auth/logout", {
+      method: "POST",
+      headers: {
+        Origin: "https://artifact.w3dev.app",
+        Cookie: sessionCookiePair,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: "",
+    }), env);
+
+    expect(logout.status).toBe(303);
+    expect(logout.headers.get("Location")).toBe("/auth/login");
+    expect(await auth.api.getSession({ headers: new Headers({ Cookie: sessionCookiePair }) })).toBeNull();
+  });
+
   it("replaces untrusted return paths with the safe dashboard fallback", async () => {
     const { env } = makeEnv();
     const login = await worker.fetch(request("/auth/login?returnTo=%2F%3C%2Fscript%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"), env);
@@ -421,6 +457,40 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
     expect(setCookies.length).toBe(1);
     expect(setCookies[0]).toContain("artifact_embed=");
     expect(setCookies[0]).toContain("Partitioned");
+  });
+
+  it("passes an explicit embed token to same-artifact HTML and CSS helpers", async () => {
+    const { sqlite, db } = createMigratedDb();
+    const sessionToken = seedWebContext(sqlite);
+    const { env, objects } = makeEnv(db);
+    const embed = await issueEmbedToken({ JWT_SECRET } as never, "team-abc123");
+    objects.set("uploads/team-abc123/artifacts/reports/schemes/04/index.html", {
+      body: '<link rel="stylesheet" href="site.css"><script src="./helper.js"></script><img src="/w3dev/reports/images/logo.svg"><a href="next.html">Next</a><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Example"><style>.hero{background:url("images/inline.svg")}</style>',
+      contentType: "text/html; charset=utf-8",
+    });
+    objects.set("uploads/team-abc123/artifacts/reports/schemes/04/site.css", {
+      body: '@import "./theme.css"; .hero{background:url("../images/hero.svg")} .remote{background:url(https://cdn.example.test/image.svg)}',
+      contentType: "text/css; charset=utf-8",
+    });
+
+    const htmlResponse = await serveArtifact(request(`/w3dev/reports/schemes/04/index.html?token=${embed.token}`, {
+      headers: { Cookie: `better-auth.session_token=${sessionToken}; __Secure-better-auth.session_token=${sessionToken}` },
+    }), env, "w3dev");
+    const html = await htmlResponse.text();
+    expect(htmlResponse.status).toBe(200);
+    expect(html).toContain(`href="/w3dev/reports/schemes/04/site.css?token=${embed.token}"`);
+    expect(html).toContain(`src="/w3dev/reports/schemes/04/helper.js?token=${embed.token}"`);
+    expect(html).toContain(`src="/w3dev/reports/images/logo.svg?token=${embed.token}"`);
+    expect(html).toContain('href="https://fonts.googleapis.com/css2?family=Example"');
+    expect(html).toContain('href="next.html"');
+    expect(html).toContain(`images/inline.svg?token=${embed.token}`);
+
+    const cssResponse = await serveArtifact(request(`/w3dev/reports/schemes/04/site.css?token=${embed.token}`), env, "w3dev");
+    const css = await cssResponse.text();
+    expect(cssResponse.status).toBe(200);
+    expect(css).toContain(`@import "/w3dev/reports/schemes/04/theme.css?token=${embed.token}"`);
+    expect(css).toContain(`/w3dev/reports/schemes/images/hero.svg?token=${embed.token}`);
+    expect(css).toContain("url(https://cdn.example.test/image.svg)");
   });
 
   it("rejects embed credentials from another team, expired tokens, or absent credentials", async () => {

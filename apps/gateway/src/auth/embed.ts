@@ -105,9 +105,11 @@ export async function findEmbedCredential(
   env: GatewayEnv,
   expectedTeamId: string,
 ): Promise<EmbedCredentialSource | null> {
+  // Keep an explicit share URL authoritative when the browser also sends a
+  // session or partitioned cookie; HTML/CSS responses propagate this token.
   const candidates: Array<{ source: EmbedCredentialSource; value: string | null }> = [
-    { source: "cookie", value: readCookie(request, EMBED_COOKIE) },
     { source: "query", value: new URL(request.url).searchParams.get("token") },
+    { source: "cookie", value: readCookie(request, EMBED_COOKIE) },
   ];
   for (const { source, value } of candidates) {
     if (!value) continue;
