@@ -1,11 +1,12 @@
 import { and, count, desc, eq, gt, inArray, isNotNull, isNull, lt, or, type SQL } from "drizzle-orm";
 import { createDatabase } from "../db/client.ts";
-import { apiTokens, artifactProjects, artifacts, deviceAuthorizations, projects, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
+import { apiTokens, artifactProjects, artifactShares, artifacts, deviceAuthorizations, projects, teamMemberships, teamSlugChangeLocks, teamSlugs, teams, user } from "../db/schema.ts";
 import { authError } from "../auth/middleware.ts";
 import { safePermissions } from "../auth/permissions.ts";
 import { isValidTeamSlug, TEAM_SLUG_CHANGE_COOLDOWN_MS } from "../auth/team-slug.ts";
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebSession, type WebIdentity } from "../auth/web-session.ts";
+import { createArtifactShareToken } from "../content/share.ts";
 
 export type TeamRole = "owner" | "admin" | "member";
 export type DashboardLayout = "sidebar" | "topnav";
@@ -37,6 +38,14 @@ export interface DashboardArtifact {
   lastActivityAt: string | null;
   pinnedAt: string | null;
   projects: Array<{ id: string; name: string }>;
+  share: DashboardArtifactShare;
+}
+
+export interface DashboardArtifactShare {
+  active: boolean;
+  token: string | null;
+  createdAt: string | null;
+  revokedAt: string | null;
 }
 
 export interface DashboardProject {
@@ -256,6 +265,9 @@ interface ArtifactMetaRow {
   createdAt: Date;
   lastActivityAt: Date;
   pinnedAt: Date | null;
+  shareToken?: string | null;
+  shareCreatedAt?: Date | null;
+  shareRevokedAt?: Date | null;
 }
 
 async function loadArtifactMetadata(
@@ -269,7 +281,7 @@ async function loadArtifactMetadata(
   if (!env.DB) return { artifactRows: [], memberships: [], projects: [] };
   try {
     const db = createDatabase(env.DB);
-    const [rows, projectRows] = await Promise.all([
+    const [rows, projectRows, shareRows] = await Promise.all([
       db.select({
         slug: artifacts.slug,
         createdAt: artifacts.createdAt,
@@ -280,6 +292,15 @@ async function loadArtifactMetadata(
         .from(projects)
         .where(eq(projects.teamId, teamId))
         .orderBy(projects.name),
+      db.select({
+        slug: artifacts.slug,
+        token: artifactShares.token,
+        createdAt: artifactShares.createdAt,
+        revokedAt: artifactShares.revokedAt,
+      })
+        .from(artifactShares)
+        .innerJoin(artifacts, eq(artifactShares.artifactId, artifacts.id))
+        .where(eq(artifacts.teamId, teamId)),
     ]);
     const memberships = await db.select({
       slug: artifacts.slug,
@@ -290,7 +311,20 @@ async function loadArtifactMetadata(
       .innerJoin(projects, eq(artifactProjects.projectId, projects.id))
       .where(eq(artifacts.teamId, teamId))
       .orderBy(projects.name);
-    return { artifactRows: rows, memberships, projects: projectRows };
+    const sharesBySlug = new Map(shareRows.map((row) => [row.slug, row]));
+    return {
+      artifactRows: rows.map((row) => {
+        const share = sharesBySlug.get(row.slug);
+        return {
+          ...row,
+          shareToken: share?.token ?? null,
+          shareCreatedAt: share?.createdAt ?? null,
+          shareRevokedAt: share?.revokedAt ?? null,
+        };
+      }),
+      memberships,
+      projects: projectRows,
+    };
   } catch (error) {
     console.error("artifact metadata load failed", error);
     return { artifactRows: [], memberships: [], projects: [] };
@@ -317,12 +351,17 @@ export function mergeArtifacts(
     const row = rowsBySlug.get(slug);
     return {
       slug,
-      createdAt: row ? row.createdAt.toISOString() : null,
-      lastActivityAt: row ? row.lastActivityAt.toISOString() : null,
-      pinnedAt: row && row.pinnedAt ? row.pinnedAt.toISOString() : null,
+      createdAt: toIsoDate(row?.createdAt),
+      lastActivityAt: toIsoDate(row?.lastActivityAt),
+      pinnedAt: toIsoDate(row?.pinnedAt),
       projects: projectsBySlug.get(slug) ?? [],
+      share: row ? artifactShareView(row.shareToken, row.shareCreatedAt, row.shareRevokedAt) : privateArtifactShare(),
     };
   }).sort(compareArtifacts);
+}
+
+function toIsoDate(value: Date | null | undefined): string | null {
+  return value instanceof Date ? value.toISOString() : null;
 }
 
 export function compareArtifacts(a: DashboardArtifact, b: DashboardArtifact): number {
@@ -360,16 +399,109 @@ export async function getDashboardArtifact(env: GatewayEnv, teamId: string, slug
       .innerJoin(projects, eq(artifactProjects.projectId, projects.id))
       .where(eq(artifactProjects.artifactId, row.id))
       .orderBy(projects.name);
+    const [share] = await db.select({ token: artifactShares.token, createdAt: artifactShares.createdAt, revokedAt: artifactShares.revokedAt })
+      .from(artifactShares)
+      .where(eq(artifactShares.artifactId, row.id))
+      .limit(1);
     return {
       slug,
-      createdAt: row.createdAt.toISOString(),
-      lastActivityAt: row.lastActivityAt.toISOString(),
-      pinnedAt: row.pinnedAt?.toISOString() ?? null,
+      createdAt: toIsoDate(row.createdAt),
+      lastActivityAt: toIsoDate(row.lastActivityAt),
+      pinnedAt: toIsoDate(row.pinnedAt),
       projects: memberships.map((membership) => ({ id: membership.id, name: membership.name })),
+      share: artifactShareView(share?.token, share?.createdAt, share?.revokedAt),
     };
   } catch (error) {
     console.error("artifact metadata load failed", error);
     return null;
+  }
+}
+
+function privateArtifactShare(): DashboardArtifactShare {
+  return { active: false, token: null, createdAt: null, revokedAt: null };
+}
+
+function artifactShareView(
+  token: string | null | undefined,
+  createdAt: Date | null | undefined,
+  revokedAt: Date | null | undefined,
+): DashboardArtifactShare {
+  const active = Boolean(token && !revokedAt);
+  return {
+    active,
+    token: active ? token! : null,
+    createdAt: createdAt?.toISOString() ?? null,
+    revokedAt: revokedAt?.toISOString() ?? null,
+  };
+}
+
+export type ArtifactShareAction = "enable" | "revoke" | "regenerate";
+export type ArtifactShareError =
+  | "artifact_not_found"
+  | "entry_file_required"
+  | "share_service_unavailable"
+  | "team_owner_required";
+
+export async function updateArtifactShare(
+  env: GatewayEnv,
+  teamId: string,
+  slug: string,
+  action: ArtifactShareAction,
+  role: TeamRole,
+): Promise<{ ok: true; action: ArtifactShareAction } | { ok: false; error: ArtifactShareError }> {
+  if (role !== "owner") return { ok: false, error: "team_owner_required" };
+  if (!isValidTeamSlug(slug) || !env.DB) return { ok: false, error: "artifact_not_found" };
+
+  try {
+    const db = createDatabase(env.DB);
+    const artifactId = await ensureArtifactId(env, teamId, slug);
+    if (!artifactId) return { ok: false, error: "artifact_not_found" };
+
+    if (action === "revoke") {
+      await db.update(artifactShares)
+        .set({ revokedAt: new Date() })
+        .where(eq(artifactShares.artifactId, artifactId));
+      return { ok: true, action };
+    }
+
+    if (!await artifactHasEntryFile(env, teamId, slug)) {
+      return { ok: false, error: "entry_file_required" };
+    }
+
+    const [existing] = await db.select({ token: artifactShares.token, revokedAt: artifactShares.revokedAt })
+      .from(artifactShares)
+      .where(eq(artifactShares.artifactId, artifactId))
+      .limit(1);
+    if (action === "enable" && existing && !existing.revokedAt) return { ok: true, action };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const token = createArtifactShareToken();
+      try {
+        await db.insert(artifactShares)
+          .values({ artifactId, token, createdAt: new Date(), revokedAt: null })
+          .onConflictDoUpdate({
+            target: artifactShares.artifactId,
+            set: { token, createdAt: new Date(), revokedAt: null },
+          });
+        return { ok: true, action };
+      } catch (error) {
+        if (!isUniqueConstraintError(error) || attempt === 2) throw error;
+      }
+    }
+  } catch (error) {
+    console.error("artifact share update failed", error);
+    return { ok: false, error: "share_service_unavailable" };
+  }
+  return { ok: false, error: "share_service_unavailable" };
+}
+
+async function artifactHasEntryFile(env: GatewayEnv, teamId: string, slug: string): Promise<boolean> {
+  try {
+    if (typeof (env.ARTIFACTS_BUCKET as { head?: unknown }).head !== "function") return false;
+    return Boolean(await env.ARTIFACTS_BUCKET.head(`uploads/${teamId}/artifacts/${slug}/index.html`));
+  } catch (error) {
+    console.error("artifact entry file check failed", error);
+    return false;
   }
 }
 
@@ -759,6 +891,12 @@ export async function dashboardSettings(
 
 export function artifactHref(teamSlug: string, path: string): string {
   return `/${encodeURIComponent(teamSlug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+export function artifactShareHref(origin: string, teamSlug: string, artifactSlug: string, token: string): string {
+  const url = new URL(artifactHref(teamSlug, `${artifactSlug}/index.html`), origin);
+  url.searchParams.set("share", token);
+  return url.toString();
 }
 
 export function formatBytes(bytes: number): string {

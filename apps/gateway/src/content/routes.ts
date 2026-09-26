@@ -1,19 +1,34 @@
 import { and, eq } from "drizzle-orm";
 import { authenticate, authError, noStoreHeaders } from "../auth/middleware.ts";
-import { EMBED_COOKIE, embedCookieHeader, findEmbedCredential, issueArtifactEmbedToken, issueEmbedToken } from "../auth/embed.ts";
+import { embedCookieHeader, findEmbedCredential, issueArtifactEmbedToken, issueEmbedToken } from "../auth/embed.ts";
 import { isValidTeamSlug } from "../auth/team-slug.ts";
 import { PUBLISH_PERMISSION, READ_PERMISSION } from "../auth/types.ts";
-import type { GatewayEnv, PublisherIdentity } from "../auth/types.ts";
+import type { GatewayEnv } from "../auth/types.ts";
 import { getWebIdentity } from "../auth/web-session.ts";
 import { createDatabase } from "../db/client.ts";
 import { artifacts, teamMemberships, teamSlugs, teams } from "../db/schema.ts";
+import { findActiveArtifactShare } from "./share.ts";
 const MAX_PATH_LENGTH = 1024;
+const MAX_REWRITABLE_ARTIFACT_BYTES = 4 * 1024 * 1024;
 const ARTIFACT_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
   "script-src 'self' 'unsafe-inline'",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data: blob:",
   "font-src 'self' data: https://fonts.gstatic.com",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "sandbox allow-scripts",
+].join("; ");
+const SHARED_ARTIFACT_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "connect-src *",
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
@@ -128,16 +143,22 @@ export async function listArtifactFiles(
 }
 
 export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug: string): Promise<Response> {
-  if (!isValidTeamSlug(teamSlug)) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
   const requestUrl = new URL(request.url);
+  const sharedRequest = requestUrl.searchParams.has("share");
+  if (!isValidTeamSlug(teamSlug)) return sharedRequest ? sharedNotFound() : new Response("Not found", { status: 404, headers: noStoreHeaders() });
   const rawRelative = requestUrl.pathname.slice(teamSlug.length + 2);
   const relativePath = safeRelativePath(rawRelative.split("/").map(decodePathPart).join("/"));
-  if (!relativePath) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+  if (!relativePath) return sharedRequest ? sharedNotFound() : new Response("Not found", { status: 404, headers: noStoreHeaders() });
   const [artifactSlug, ...filePathParts] = relativePath.split("/");
   if (!isValidTeamSlug(artifactSlug) || filePathParts.length === 0) {
-    return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+    return sharedRequest ? sharedNotFound() : new Response("Not found", { status: 404, headers: noStoreHeaders() });
   }
   const artifactPath = filePathParts.join("/");
+
+  const shareToken = requestUrl.searchParams.get("share");
+  if (shareToken !== null) {
+    return serveSharedArtifact(env, requestUrl, teamSlug, artifactSlug, artifactPath, shareToken);
+  }
 
   let access: { teamId: string; team: string } | Response;
   let embedCookie: string | null = null;
@@ -187,32 +208,127 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
     if (!request.headers.has("Authorization") && !embedCredential) embedCookie = embedToken;
   }
 
+  return streamArtifactObject(env, access.teamId, requestUrl, teamSlug, artifactSlug, artifactPath, embedToken, "token", embedCookie);
+}
+
+async function serveSharedArtifact(
+  env: GatewayEnv,
+  requestUrl: URL,
+  teamSlug: string,
+  artifactSlug: string,
+  artifactPath: string,
+  shareToken: string,
+): Promise<Response> {
+  const share = await findActiveArtifactShare(env, shareToken);
+  if (!share || share.artifactSlug !== artifactSlug) return sharedNotFound();
+
+  const scope = await lookupTeamSlugScope(env, teamSlug);
+  if (scope instanceof Response || !scope || scope.teamId !== share.teamId) {
+    return sharedNotFound();
+  }
+  if (!scope.isCurrent) {
+    requestUrl.pathname = `/${scope.currentSlug}/${artifactSlug}/${artifactPath}`;
+    return new Response(null, {
+      status: 308,
+      headers: noStoreHeaders({ Location: requestUrl.toString(), "Referrer-Policy": "no-referrer" }),
+    });
+  }
+
+  return streamArtifactObject(env, share.teamId, requestUrl, teamSlug, artifactSlug, artifactPath, shareToken, "share", null, true);
+}
+
+async function streamArtifactObject(
+  env: GatewayEnv,
+  teamId: string,
+  requestUrl: URL,
+  teamSlug: string,
+  artifactSlug: string,
+  artifactPath: string,
+  rewriteToken: string | null,
+  queryParameter: "token" | "share",
+  embedCookie: string | null,
+  shared = false,
+): Promise<Response> {
   try {
-    const object = await env.ARTIFACTS_BUCKET.get(`uploads/${access.teamId}/artifacts/${artifactSlug}/${artifactPath}`);
-    if (!object) return new Response("Not found", { status: 404, headers: noStoreHeaders() });
+    const object = await env.ARTIFACTS_BUCKET.get(`uploads/${teamId}/artifacts/${artifactSlug}/${artifactPath}`);
+    if (!object) {
+      return new Response("Not found", {
+        status: 404,
+        headers: shared ? noStoreHeaders({ "Referrer-Policy": "no-referrer" }) : noStoreHeaders(),
+      });
+    }
     const headers = new Headers();
     object.writeHttpMetadata(headers);
     headers.set("ETag", object.httpEtag);
     headers.set("Cache-Control", "private, no-store");
     headers.set("X-Content-Type-Options", "nosniff");
-    headers.set("Content-Security-Policy", ARTIFACT_CONTENT_SECURITY_POLICY);
+    headers.set("Content-Security-Policy", shared ? SHARED_ARTIFACT_CONTENT_SECURITY_POLICY : ARTIFACT_CONTENT_SECURITY_POLICY);
     headers.set("Referrer-Policy", "no-referrer");
+    if (shared) {
+      // The sandboxed document has an opaque origin. Wildcard CORS keeps
+      // module scripts and explicit fetches usable without credentials.
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cross-Origin-Resource-Policy", "cross-origin");
+    }
     if (embedCookie) headers.append("Set-Cookie", embedCookieHeader(embedCookie));
     let body: BodyInit | null = object.body;
     const contentType = headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
-    if (embedToken && contentType === "text/html") {
-      body = rewriteArtifactHtml(await new Response(object.body).text(), requestUrl, teamSlug, artifactSlug, embedToken);
+    if (rewriteToken && contentType === "text/html") {
+      const source = await readRewritableArtifactText(object.body, object.size);
+      if (source === null) return artifactRewriteTooLarge(shared);
+      body = rewriteArtifactHtml(source, requestUrl, teamSlug, artifactSlug, rewriteToken, shared, queryParameter);
       headers.delete("Content-Encoding");
       headers.delete("Content-Length");
-    } else if (embedToken && contentType === "text/css") {
-      body = rewriteArtifactCss(await new Response(object.body).text(), requestUrl, teamSlug, artifactSlug, embedToken);
+    } else if (rewriteToken && contentType === "text/css") {
+      const source = await readRewritableArtifactText(object.body, object.size);
+      if (source === null) return artifactRewriteTooLarge(shared);
+      body = rewriteArtifactCss(source, requestUrl, teamSlug, artifactSlug, rewriteToken, queryParameter);
       headers.delete("Content-Encoding");
       headers.delete("Content-Length");
     }
     return new Response(body, { headers });
   } catch {
-    return authError(503, "artifact_storage_unavailable");
+    const response = authError(503, "artifact_storage_unavailable");
+    if (shared) response.headers.set("Referrer-Policy", "no-referrer");
+    return response;
   }
+}
+
+async function readRewritableArtifactText(
+  body: ReadableStream<Uint8Array>,
+  declaredSize: number | undefined,
+): Promise<string | null> {
+  if (declaredSize !== undefined && (!Number.isFinite(declaredSize) || declaredSize < 0 || declaredSize > MAX_REWRITABLE_ARTIFACT_BYTES)) {
+    return null;
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return text + decoder.decode();
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_REWRITABLE_ARTIFACT_BYTES) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The bounded read has already failed closed.
+      }
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
+function artifactRewriteTooLarge(shared: boolean): Response {
+  const response = authError(413, "artifact_content_too_large");
+  if (shared) response.headers.set("Referrer-Policy", "no-referrer");
+  return response;
+}
+
+function sharedNotFound(): Response {
+  return new Response("Not found", { status: 404, headers: noStoreHeaders({ "Referrer-Policy": "no-referrer" }) });
 }
 
 function rewriteArtifactHtml(
@@ -221,24 +337,78 @@ function rewriteArtifactHtml(
   teamSlug: string,
   artifactSlug: string,
   token: string,
+  rewriteNavigations = false,
+  queryParameter: "token" | "share" = "token",
 ): string {
-  const resourceTagPattern = /<(?:link|script|img|source|audio|video|track|iframe|embed|object|input)\b[^>]*>/giu;
+  const resourceTagPattern = rewriteNavigations
+    ? /<(?:a|base|link|script|img|source|audio|video|track|iframe|embed|object|input)\b[^>]*>/giu
+    : /<(?:link|script|img|source|audio|video|track|iframe|embed|object|input)\b[^>]*>/giu;
   const rewritten = html.replace(resourceTagPattern, (tag) => {
     const tagName = /^<([a-z]+)/iu.exec(tag)?.[1].toLowerCase();
-    const attributes = tagName === "link" ? "href" : tagName === "object" ? "data" : "src|poster";
+    const attributes = rewriteNavigations
+      ? tagName === "link" || tagName === "a" || tagName === "base" ? "href" : tagName === "object" ? "data" : "src|srcset|poster"
+      : tagName === "link" ? "href" : tagName === "object" ? "data" : "src|poster";
     const attributePattern = new RegExp(`(\\s(?:${attributes})\\s*=\\s*)(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\\x60]+))`, "giu");
     return tag.replace(attributePattern, (_match, prefix: string, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
       const value = doubleQuoted ?? singleQuoted ?? unquoted ?? "";
-      const rewrittenValue = appendArtifactToken(value.replace(/&amp;/giu, "&"), requestUrl, teamSlug, artifactSlug, token)
+      const decodedValue = value.replace(/&amp;/giu, "&");
+      const rewrittenValue = (/\bsrcset\s*=\s*$/iu.test(prefix)
+        ? rewriteArtifactSrcset(decodedValue, requestUrl, teamSlug, artifactSlug, token, queryParameter)
+        : appendArtifactToken(decodedValue, requestUrl, teamSlug, artifactSlug, token, queryParameter))
         .replaceAll("&", "&amp;");
       if (doubleQuoted !== undefined) return `${prefix}"${rewrittenValue}"`;
       if (singleQuoted !== undefined) return `${prefix}'${rewrittenValue}'`;
       return `${prefix}${rewrittenValue}`;
     });
   });
-  return rewritten.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/giu, (_match, open: string, css: string, close: string) =>
-    `${open}${rewriteArtifactCss(css, requestUrl, teamSlug, artifactSlug, token)}${close}`,
+  const withInlineStyles = rewritten.replace(/<[a-z][^>]*>/giu, (tag) => tag.replace(/(\sstyle\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'=<>\x60]+))/giu, (_match, prefix: string, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
+    const value = (doubleQuoted ?? singleQuoted ?? unquoted ?? "").replace(/&amp;/giu, "&");
+    const rewrittenValue = rewriteArtifactCss(value, requestUrl, teamSlug, artifactSlug, token, queryParameter).replaceAll("&", "&amp;");
+    if (doubleQuoted !== undefined) return `${prefix}"${rewrittenValue}"`;
+    if (singleQuoted !== undefined) return `${prefix}'${rewrittenValue}'`;
+    return `${prefix}${rewrittenValue}`;
+  }));
+  return withInlineStyles.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/giu, (_match, open: string, css: string, close: string) =>
+    `${open}${rewriteArtifactCss(css, requestUrl, teamSlug, artifactSlug, token, queryParameter)}${close}`,
   );
+}
+
+function rewriteArtifactSrcset(
+  value: string,
+  requestUrl: URL,
+  teamSlug: string,
+  artifactSlug: string,
+  token: string,
+  queryParameter: "token" | "share",
+): string {
+  const candidates = parseSrcsetCandidates(value);
+  if (!candidates) return value;
+  let cursor = 0;
+  let rewritten = "";
+  for (const candidate of candidates) {
+    rewritten += value.slice(cursor, candidate.urlStart);
+    rewritten += appendArtifactToken(value.slice(candidate.urlStart, candidate.urlEnd), requestUrl, teamSlug, artifactSlug, token, queryParameter);
+    cursor = candidate.urlEnd;
+  }
+  return rewritten + value.slice(cursor);
+}
+
+function parseSrcsetCandidates(value: string): Array<{ urlStart: number; urlEnd: number }> | null {
+  const candidates: Array<{ urlStart: number; urlEnd: number }> = [];
+  let index = 0;
+  while (index < value.length) {
+    while (index < value.length && (/[\t\n\f\r ]/u.test(value[index]) || value[index] === ",")) index += 1;
+    if (index >= value.length) break;
+    const urlStart = index;
+    const isDataUrl = value.slice(index, index + 5).toLowerCase() === "data:";
+    let urlEnd = index;
+    while (urlEnd < value.length && (isDataUrl ? !/[\t\n\f\r ]/u.test(value[urlEnd]) : !/[\t\n\f\r ,]/u.test(value[urlEnd]))) urlEnd += 1;
+    if (urlEnd === urlStart) return null;
+    candidates.push({ urlStart, urlEnd });
+    while (urlEnd < value.length && value[urlEnd] !== ",") urlEnd += 1;
+    index = urlEnd < value.length ? urlEnd + 1 : value.length;
+  }
+  return candidates.length ? candidates : null;
 }
 
 function rewriteArtifactCss(
@@ -247,8 +417,9 @@ function rewriteArtifactCss(
   teamSlug: string,
   artifactSlug: string,
   token: string,
+  queryParameter: "token" | "share" = "token",
 ): string {
-  const rewriteValue = (value: string) => appendArtifactToken(value.trim(), requestUrl, teamSlug, artifactSlug, token);
+  const rewriteValue = (value: string) => appendArtifactToken(value.trim(), requestUrl, teamSlug, artifactSlug, token, queryParameter);
   const withUrls = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/giu, (match, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
     const value = doubleQuoted ?? singleQuoted ?? unquoted ?? "";
     const rewritten = rewriteValue(value);
@@ -263,14 +434,14 @@ function rewriteArtifactCss(
   });
 }
 
-function appendArtifactToken(value: string, requestUrl: URL, teamSlug: string, artifactSlug: string, token: string): string {
+function appendArtifactToken(value: string, requestUrl: URL, teamSlug: string, artifactSlug: string, token: string, queryParameter = "token"): string {
   if (!value || value.startsWith("#") || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/iu.test(value)) return value;
   try {
     const resolved = new URL(value, requestUrl);
     const artifactPrefix = `/${teamSlug}/${artifactSlug}/`;
     // A shared token must not escape to external URLs or another artifact.
     if (resolved.origin !== requestUrl.origin || !resolved.pathname.startsWith(artifactPrefix)) return value;
-    resolved.searchParams.set("token", token);
+    resolved.searchParams.set(queryParameter, token);
     return `${resolved.pathname}${resolved.search}${resolved.hash}`;
   } catch {
     return value;

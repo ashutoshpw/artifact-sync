@@ -159,6 +159,15 @@ export const artifacts = sqliteTable("artifacts", {
   index("artifacts_team_activity_idx").on(table.teamId, table.lastActivityAt),
 ]);
 
+export const artifactShares = sqliteTable("artifact_shares", {
+  artifactId: text("artifact_id").primaryKey().references(() => artifacts.id, { onDelete: "cascade" }),
+  token: text("token").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
+}, (table) => [
+  uniqueIndex("artifact_shares_token_unique").on(table.token),
+]);
+
 export const projects = sqliteTable("projects", {
   id: text("id").primaryKey(),
   teamId: text("team_id").notNull().references(() => teams.id, { onDelete: "cascade" }),

@@ -2,7 +2,7 @@ import type { Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HtmlEscapedString } from "hono/utils/html";
 import { createWebAuth } from "../auth/better-auth.ts";
-import { isDashboardMutationAllowed } from "../auth/csrf.ts";
+import { isDashboardMutationAllowed, matchesDashboardCsrfToken } from "../auth/csrf.ts";
 import { issueEmbedToken } from "../auth/embed.ts";
 import { handleApiTokens, handleDeviceApprove, handleRevokeApiToken } from "../auth/routes.ts";
 import { noStoreHeaders, withNoStore } from "../auth/middleware.ts";
@@ -10,7 +10,7 @@ import { handleTeam } from "../auth/team-routes.ts";
 import type { GatewayEnv } from "../auth/types.ts";
 import { getWebSession } from "../auth/web-session.ts";
 import { ArtifactDetailPage, ArtifactsPage, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, NoTeamsPage, OverviewPage, ProjectsPage, TokensPage } from "./dashboard.tsx";
-import { dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
+import { artifactShareStyles, dashboardScript, dashboardStyles } from "./dashboard-assets.ts";
 import {
   createDashboardProject,
   dashboardCounts,
@@ -26,6 +26,7 @@ import {
   requireDashboardSession,
   setArtifactProjects,
   toggleArtifactPin,
+  updateArtifactShare,
   type DashboardSession,
 } from "./dashboard-service.ts";
 import { assetHeaders, pageSecurityHeaders } from "./http.ts";
@@ -36,6 +37,7 @@ type DashboardContext = Context<DashboardEnv>;
 
 export function registerDashboardRoutes(app: DashboardApp): void {
   app.get("/assets/dashboard.css", (c) => c.body(dashboardStyles, 200, assetHeaders("text/css; charset=utf-8")));
+  app.get("/assets/dashboard-share.css", (c) => c.body(artifactShareStyles, 200, assetHeaders("text/css; charset=utf-8")));
   app.get("/assets/dashboard.js", (c) => c.body(dashboardScript, 200, assetHeaders("text/javascript; charset=utf-8")));
 
   app.get("/settings/api-tokens", async (c) => {
@@ -59,10 +61,10 @@ export function registerDashboardRoutes(app: DashboardApp): void {
       dashboardCounts(c.env, session.identity, session.team),
     ]);
     if (list instanceof Response) {
-      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} artifactsTotal={0} counts={counts} storageError={actionMessage("artifact_storage_unavailable")} />);
+      return dashboardHtml(c, <OverviewPage session={session} artifacts={[]} artifactsTotal={0} counts={counts} origin={new URL(c.req.url).origin} storageError={actionMessage("artifact_storage_unavailable")} />);
     }
     scheduleArtifactReconciliation(c, session.team.id, list.missingSlugs);
-    return dashboardHtml(c, <OverviewPage session={session} artifacts={list.items} artifactsTotal={list.total} counts={counts} />);
+    return dashboardHtml(c, <OverviewPage session={session} artifacts={list.items} artifactsTotal={list.total} counts={counts} origin={new URL(c.req.url).origin} />);
   });
 
   app.get("/dashboard/:teamId/artifacts", async (c) => {
@@ -72,10 +74,10 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     const result = await listDashboardArtifacts(c.env, session.team.id, c.req.query("after") ?? null, { projectId: activeProjectId });
     if (result instanceof Response) {
       if (result.status === 404) return c.text("Not found", 404);
-      return dashboardHtml(c, <ArtifactsPage session={session} list={{ items: [], total: 0, nextCursor: null, projects: [] }} activeProjectId={activeProjectId} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
+      return dashboardHtml(c, <ArtifactsPage session={session} list={{ items: [], total: 0, nextCursor: null, projects: [] }} activeProjectId={activeProjectId} origin={new URL(c.req.url).origin} storageError={actionMessage("artifact_storage_unavailable")} />, result.status as ContentfulStatusCode);
     }
     scheduleArtifactReconciliation(c, session.team.id, result.missingSlugs);
-    return dashboardHtml(c, <ArtifactsPage session={session} list={result} activeProjectId={activeProjectId} feedback={artifactFeedback(c)} />);
+    return dashboardHtml(c, <ArtifactsPage session={session} list={result} activeProjectId={activeProjectId} origin={new URL(c.req.url).origin} feedback={artifactFeedback(c)} />);
   });
 
   app.post("/dashboard/:teamId/artifacts/:artifactSlug/pin", async (c) => {
@@ -96,6 +98,29 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     const project = typeof form.get("project") === "string" && form.get("project") ? `project=${encodeURIComponent(String(form.get("project")))}` : "";
     const query = [project, pinState].filter(Boolean).join("&");
     return c.redirect(`/dashboard/${encodeURIComponent(teamId)}/artifacts${query ? `?${query}` : ""}`, 303);
+  });
+
+  app.post("/dashboard/:teamId/artifacts/:artifactSlug/share", async (c) => {
+    if (hasForeignOrigin(c.req.raw)) return forbidden(c);
+    const form = await c.req.raw.formData();
+    if (isOpaqueOrigin(c.req.raw) && typeof form.get("csrfToken") !== "string") return forbidden(c);
+    const teamId = c.req.param("teamId");
+    const session = await dashboardSession(c, teamId);
+    if (session instanceof Response || !session.team) return session instanceof Response ? session : c.text("Not found", 404);
+    if (!matchesDashboardCsrfToken(form.get("csrfToken"), session.csrfToken)) return forbidden(c);
+    const action = String(form.get("action") ?? "");
+    if (action !== "enable" && action !== "revoke" && action !== "regenerate") return forbidden(c);
+    const result = await updateArtifactShare(c.env, session.team.id, c.req.param("artifactSlug"), action, session.team.role);
+    if (!result.ok && result.error === "team_owner_required") return forbidden(c);
+    const context = String(form.get("context") ?? "detail");
+    const destination = context === "list"
+      ? `/dashboard/${encodeURIComponent(teamId)}/artifacts${typeof form.get("project") === "string" && form.get("project") ? `?project=${encodeURIComponent(String(form.get("project")))}&` : "?"}`
+      : `/dashboard/${encodeURIComponent(teamId)}/artifacts/${encodeURIComponent(c.req.param("artifactSlug"))}?`;
+    const feedback = result.ok ? `share=${result.action === "enable" ? "enabled" : result.action === "revoke" ? "revoked" : "regenerated"}` : `shareError=${result.error}`;
+    return new Response(null, {
+      status: 303,
+      headers: noStoreHeaders({ Location: `${destination}${feedback}` }),
+    });
   });
 
   app.post("/dashboard/:teamId/artifacts/:artifactSlug/projects", async (c) => {
@@ -124,11 +149,11 @@ export function registerDashboardRoutes(app: DashboardApp): void {
     ]);
     if (filesResult instanceof Response) {
       if (filesResult.status === 404) return c.text("Not found", 404);
-      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, filesResult.status as ContentfulStatusCode);
+      return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} origin={new URL(c.req.url).origin} files={[]} nextCursor={null} storageError={actionMessage("artifact_storage_unavailable")} />, filesResult.status as ContentfulStatusCode);
     }
     if (!c.req.query("cursor") && filesResult.items.length === 0) return c.text("Not found", 404);
     if (!artifactMeta) scheduleArtifactReconciliation(c, session.team.id, [artifactSlug]);
-    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} files={filesResult.items} nextCursor={filesResult.nextCursor} feedback={artifactFeedback(c)} />);
+    return dashboardHtml(c, <ArtifactDetailPage session={session} artifact={artifactSlug} artifactMeta={artifactMeta} projects={projects.map(({ id, name }) => ({ id, name }))} embedToken={embed.token} origin={new URL(c.req.url).origin} files={filesResult.items} nextCursor={filesResult.nextCursor} feedback={artifactFeedback(c)} />);
   });
 
   app.get("/dashboard/:teamId/projects", async (c) => {
@@ -372,6 +397,15 @@ function queryFeedback(c: DashboardContext): { error?: string; notice?: string }
 }
 
 function artifactFeedback(c: DashboardContext): { error?: string; notice?: string } | undefined {
+  const share = c.req.query("share");
+  if (share === "enabled") return { notice: "Anyone with the link can open this artifact." };
+  if (share === "revoked") return { notice: "Share link revoked. Existing embedding tokens remain valid until expiry." };
+  if (share === "regenerated") return { notice: "Share link regenerated. The previous link stops working immediately." };
+  const shareError = c.req.query("shareError");
+  if (shareError === "entry_file_required") return { error: "Add a root index.html file before enabling a share link." };
+  if (shareError === "artifact_not_found") return { error: "That artifact could not be found." };
+  if (shareError === "share_service_unavailable") return { error: "Sharing is temporarily unavailable." };
+  if (shareError === "team_owner_required") return { error: "Only a team owner can change this sharing setting." };
   const pin = c.req.query("pin");
   if (pin === "1") return { notice: "Artifact pinned. It stays at the top of every artifact list." };
   if (pin === "0") return { notice: "Artifact unpinned." };

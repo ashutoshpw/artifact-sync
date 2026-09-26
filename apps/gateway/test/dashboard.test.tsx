@@ -4,6 +4,7 @@ import { createMigratedDb } from "./d1.ts";
 import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, ProjectsPage, TokensPage } from "../src/web/dashboard.tsx";
 import {
   createDashboardProject,
+  backfillArtifactMetadata,
   groupArtifacts,
   listDashboardArtifactFiles,
   listDashboardArtifacts,
@@ -12,6 +13,8 @@ import {
   reconcileArtifacts,
   setArtifactProjects,
   toggleArtifactPin,
+  updateArtifactShare,
+  getDashboardArtifact,
   type DashboardArtifact,
   type DashboardSession,
 } from "../src/web/dashboard-service.ts";
@@ -22,6 +25,7 @@ const team = {
   slug: "w3dev",
   role: "owner" as const,
 };
+const shareToken = "s".repeat(43);
 
 function session(layout: "sidebar" | "topnav"): DashboardSession {
   return {
@@ -35,10 +39,16 @@ function session(layout: "sidebar" | "topnav"): DashboardSession {
 }
 
 function artifact(slug: string, overrides: Partial<DashboardArtifact> = {}) {
-  return { slug, createdAt: null, lastActivityAt: null, pinnedAt: null, projects: [], ...overrides };
+  return {
+    slug,
+    createdAt: null,
+    lastActivityAt: null,
+    pinnedAt: null,
+    projects: [],
+    share: { active: false, token: null, createdAt: null, revokedAt: null },
+    ...overrides,
+  };
 }
-
-
 
 function createTestEnv(files: Record<string, Array<{ key: string; uploaded: Date }>> = {}) {
   const { sqlite, db } = createMigratedDb();
@@ -63,6 +73,16 @@ function createTestEnv(files: Record<string, Array<{ key: string; uploaded: Date
         })),
         delimitedPrefixes: [],
         truncated: false,
+      };
+    },
+    async head(key: string) {
+      const match = /^(uploads\/[^/]+\/artifacts\/[^/]+\/)(.+)$/u.exec(key);
+      if (!match || !(files[match[1]] ?? []).some((entry) => entry.key === match[2])) return null;
+      return {
+        size: 1,
+        uploaded: new Date("2026-09-24T10:00:00.000Z"),
+        httpEtag: '"index"',
+        writeHttpMetadata(headers: Headers) { headers.set("Content-Type", "text/html; charset=utf-8"); },
       };
     },
   };
@@ -112,13 +132,18 @@ describe("dashboard server rendering", () => {
         activeProjectId={null}
         list={{
           items: [
-            artifact("reports", { pinnedAt: "2026-01-02T10:00:00.000Z", lastActivityAt: "2026-01-05T10:00:00.000Z" }),
+            artifact("reports", {
+              pinnedAt: "2026-01-02T10:00:00.000Z",
+              lastActivityAt: "2026-01-05T10:00:00.000Z",
+              share: { active: true, token: shareToken, createdAt: "2026-01-05T10:00:00.000Z", revokedAt: null },
+            }),
             artifact("notes", { lastActivityAt: "2026-01-04T10:00:00.000Z" }),
           ],
           total: 2,
           nextCursor: "2",
           projects: [{ id: "p1", name: "Relay" }],
         }}
+        origin="https://artifact.w3dev.app"
       />,
     );
 
@@ -143,9 +168,14 @@ describe("dashboard server rendering", () => {
       <ArtifactDetailPage
         session={session("sidebar")}
         artifact="reports"
-        artifactMeta={artifact("reports", { pinnedAt: "2026-01-02T10:00:00.000Z", projects: [{ id: "p1", name: "Relay" }] })}
+        artifactMeta={artifact("reports", {
+          pinnedAt: "2026-01-02T10:00:00.000Z",
+          projects: [{ id: "p1", name: "Relay" }],
+          share: { active: true, token: shareToken, createdAt: "2026-01-05T10:00:00.000Z", revokedAt: null },
+        })}
         projects={[{ id: "p1", name: "Relay" }, { id: "p2", name: "Scratch" }]}
         embedToken="embed-token-value"
+        origin="https://artifact.w3dev.app"
         nextCursor="next-page"
         files={[{ path: "daily/today.json", size: 16, uploadedAt: "2026-09-24T10:00:00.000Z" }]}
       />,
@@ -160,7 +190,36 @@ describe("dashboard server rendering", () => {
     expect(html).toContain('id="embed-token"');
     expect(html).toContain("?token=embed-token-value");
     expect(html).toContain("Copy token");
+    expect(html).toContain("Anyone with the link");
+    expect(html).toContain(`https://artifact.w3dev.app/w3dev/reports/index.html?share=${shareToken}`);
+    expect(html).toContain("Regenerate link");
     expect(html).toContain('value="csrf-token"');
+  });
+
+  it("renders the same share choices for members while disabling mutations", async () => {
+    const memberSession: DashboardSession = {
+      ...session("sidebar"),
+      team: { ...team, role: "member" },
+      teams: [{ ...team, role: "member" }],
+    };
+    const html = await renderToString(
+      <ArtifactDetailPage
+        session={memberSession}
+        artifact="reports"
+        artifactMeta={artifact("reports", { share: { active: false, token: null, createdAt: null, revokedAt: "2026-01-05T10:00:00.000Z" } })}
+        projects={[]}
+        embedToken={null}
+        origin="https://artifact.w3dev.app"
+        files={[]}
+        nextCursor={null}
+      />,
+    );
+
+    expect(html).toContain("Only me");
+    expect(html).toContain("Anyone with the link");
+    expect(html).toContain("Only a team owner can change this sharing setting.");
+    expect(html).toContain('disabled=""');
+    expect(html).not.toContain("Regenerate link");
   });
 
   it("shows an explicit empty state when the team has no artifact directories", async () => {
@@ -440,6 +499,7 @@ describe("artifact organization services", () => {
     expect(second.items.map((item) => item.slug)).toEqual(["reports", "notes"]);
     expect(second.items[1].lastActivityAt).toBe("2026-09-24T10:00:00.000Z");
     expect(second.items[1].createdAt).toBe("2026-09-21T09:00:00.000Z");
+    expect(second.items.every((item) => item.share.active === false && item.share.token === null)).toBe(true);
 
     expect(await toggleArtifactPin(env as never, "team-1", "reports", false)).toBe(true);
     const third = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
@@ -479,5 +539,64 @@ describe("artifact organization services", () => {
     const projects = await listDashboardProjects(env as never, "team-1");
     expect(projects.map((project) => [project.name, project.artifactCount])).toEqual([["Relay", 1], ["Scratch", 2]]);
     expect(projects[0].createdAt).toBeTypeOf("string");
+  });
+
+  it("keeps one owner-controlled share row across enable, regenerate, revoke, and backfill", async () => {
+    const { env, sqlite } = createTestEnv({
+      "uploads/team-1/artifacts/reports/": [
+        { key: "index.html", uploaded: new Date("2026-09-24T10:00:00.000Z") },
+        { key: "app.js", uploaded: new Date("2026-09-24T10:01:00.000Z") },
+      ],
+    });
+
+    expect(await updateArtifactShare(env as never, "team-1", "reports", "enable", "admin")).toEqual({ ok: false, error: "team_owner_required" });
+    expect(await updateArtifactShare(env as never, "team-1", "reports", "enable", "member")).toEqual({ ok: false, error: "team_owner_required" });
+
+    const enabled = await updateArtifactShare(env as never, "team-1", "reports", "enable", "owner");
+    expect(enabled).toEqual({ ok: true, action: "enable" });
+    const firstRow = sqlite.prepare("SELECT token, created_at, revoked_at FROM artifact_shares WHERE artifact_id = (SELECT id FROM artifacts WHERE team_id = 'team-1' AND slug = 'reports')").get() as { token: string; created_at: number; revoked_at: number | null };
+    expect(firstRow.token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(firstRow.revoked_at).toBeNull();
+
+    const idempotent = await updateArtifactShare(env as never, "team-1", "reports", "enable", "owner");
+    expect(idempotent).toEqual({ ok: true, action: "enable" });
+    const unchangedRow = sqlite.prepare("SELECT token, created_at FROM artifact_shares WHERE artifact_id = (SELECT id FROM artifacts WHERE team_id = 'team-1' AND slug = 'reports')").get();
+    expect(unchangedRow).toEqual({ token: firstRow.token, created_at: firstRow.created_at });
+
+    const beforeBackfill = await getDashboardArtifact(env as never, "team-1", "reports");
+    expect(beforeBackfill?.share).toMatchObject({ active: true, token: firstRow.token });
+    const list = await listDashboardArtifacts(env as never, "team-1", null, { limit: 10 });
+    if (list instanceof Response) throw new Error("expected artifact list");
+    expect(list.items.find((item) => item.slug === "reports")?.share).toMatchObject({ active: true, token: firstRow.token });
+    expect(await backfillArtifactMetadata(env as never, "team-1", "reports")).toBe(true);
+    const afterBackfill = await getDashboardArtifact(env as never, "team-1", "reports");
+    expect(afterBackfill?.share).toMatchObject({ active: true, token: firstRow.token });
+
+    const regenerated = await updateArtifactShare(env as never, "team-1", "reports", "regenerate", "owner");
+    expect(regenerated).toEqual({ ok: true, action: "regenerate" });
+    const regeneratedRow = sqlite.prepare("SELECT token, revoked_at FROM artifact_shares WHERE artifact_id = (SELECT id FROM artifacts WHERE team_id = 'team-1' AND slug = 'reports')").get() as { token: string; revoked_at: number | null };
+    expect(regeneratedRow.token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(regeneratedRow.token).not.toBe(firstRow.token);
+    expect(regeneratedRow.revoked_at).toBeNull();
+
+    const revoked = await updateArtifactShare(env as never, "team-1", "reports", "revoke", "owner");
+    expect(revoked).toEqual({ ok: true, action: "revoke" });
+    const afterRevoke = await getDashboardArtifact(env as never, "team-1", "reports");
+    expect(afterRevoke?.share.active).toBe(false);
+    expect(afterRevoke?.share.token).toBeNull();
+    expect(afterRevoke?.share.revokedAt).toBeTypeOf("string");
+  });
+
+  it("requires a live index entry and rejects foreign or missing artifacts", async () => {
+    const missingIndex = createTestEnv({
+      "uploads/team-1/artifacts/readme/": [{ key: "README.md", uploaded: new Date("2026-09-24T10:00:00.000Z") }],
+    });
+    expect(await updateArtifactShare(missingIndex.env as never, "team-1", "readme", "enable", "owner"))
+      .toEqual({ ok: false, error: "entry_file_required" });
+
+    expect(await updateArtifactShare(missingIndex.env as never, "other-team", "readme", "enable", "owner"))
+      .toEqual({ ok: false, error: "artifact_not_found" });
+    expect(await updateArtifactShare(missingIndex.env as never, "team-1", "missing", "enable", "owner"))
+      .toEqual({ ok: false, error: "artifact_not_found" });
   });
 });

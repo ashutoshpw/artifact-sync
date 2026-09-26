@@ -1,6 +1,7 @@
 import { Fragment, type Child } from "hono/jsx";
 import {
   artifactHref,
+  artifactShareHref,
   formatBytes,
   groupArtifacts,
   type DashboardArtifact,
@@ -89,6 +90,7 @@ export function DashboardDocument({ session, title, active, children, bodyClass 
         <meta name="theme-color" content="#0a0c0b" />
         <title>{title} · Artifact Sync</title>
         <link rel="stylesheet" href="/assets/dashboard.css" />
+        <link rel="stylesheet" href="/assets/dashboard-share.css" />
         <script src="/assets/dashboard.js" defer />
       </head>
       <body class={bodyClass}>
@@ -230,12 +232,14 @@ export function OverviewPage({
   artifacts,
   artifactsTotal,
   counts,
+  origin,
   storageError,
 }: {
   session: DashboardSession;
   artifacts: DashboardArtifact[];
   artifactsTotal: number;
   counts: { tokens: number; devices: number };
+  origin?: string;
   storageError?: string | null;
 }) {
   const team = session.team!;
@@ -281,7 +285,7 @@ export function OverviewPage({
           </div>
           <Feedback error={storageError} />
           {artifacts.length ? (
-            <ArtifactDirectoryTable teamId={team.id} sections={sections} timeZone={session.timeZone} manageable={false} csrfToken={session.csrfToken} />
+            <ArtifactDirectoryTable team={team} origin={origin} sections={sections} timeZone={session.timeZone} manageable={false} csrfToken={session.csrfToken} />
           ) : (
             <EmptyState title="No artifacts published yet" body="Create a folder under ~/.agents/artifacts and run the Artifact Sync daemon to publish it." actionHref="/auth/device" actionLabel="Connect a device" />
           )}
@@ -295,12 +299,14 @@ export function ArtifactsPage({
   session,
   list,
   activeProjectId,
+  origin,
   storageError,
   feedback,
 }: {
   session: DashboardSession;
   list: { items: DashboardArtifact[]; total: number; nextCursor: string | null; projects: Array<{ id: string; name: string }> };
   activeProjectId: string | null;
+  origin?: string;
   storageError?: string | null;
   feedback?: ActionFeedback;
 }) {
@@ -336,7 +342,7 @@ export function ArtifactsPage({
       ) : null}
       <Feedback error={storageError} notice={feedback?.notice} />
       {list.items.length ? (
-        <ArtifactDirectoryTable teamId={team.id} sections={sections} timeZone={session.timeZone} manageable csrfToken={session.csrfToken} activeProjectId={activeProjectId} />
+        <ArtifactDirectoryTable team={team} origin={origin} sections={sections} timeZone={session.timeZone} manageable csrfToken={session.csrfToken} activeProjectId={activeProjectId} />
       ) : (
         <EmptyState
           title={activeProject ? "No artifacts in this project" : "No artifacts found"}
@@ -356,6 +362,7 @@ export function ArtifactDetailPage({
   artifactMeta,
   projects,
   embedToken,
+  origin,
   files,
   nextCursor,
   storageError,
@@ -366,6 +373,7 @@ export function ArtifactDetailPage({
   artifactMeta: DashboardArtifact | null;
   projects: Array<{ id: string; name: string }>;
   embedToken: string | null;
+  origin?: string;
   files: DashboardArtifactFile[];
   nextCursor: string | null;
   storageError?: string | null;
@@ -395,7 +403,15 @@ export function ArtifactDetailPage({
       <Feedback error={storageError ?? feedback?.error} notice={feedback?.notice} />
       <section class="content-section">
         <div class="section-heading">
-          <div><h2>Embedding</h2><p>Browsers block session cookies for artifact assets loaded from other sites. Append this token to artifact URLs used outside the dashboard; it grants read access to this team's artifacts for 24 hours.</p></div>
+          <div><h2>Share</h2><p>Choose whether this artifact stays with the team or anyone with the link can open it.</p></div>
+        </div>
+        <div class="table-panel share-panel">
+          <ArtifactShareControl team={team} artifact={artifactMeta ?? artifactWithPrivateShare(artifact)} origin={origin} csrfToken={session.csrfToken} context="detail" />
+        </div>
+      </section>
+      <section class="content-section">
+        <div class="section-heading">
+          <div><h2>Embedding</h2><p>Browsers block session cookies for artifact assets loaded from other sites. Append this token to artifact URLs used outside the dashboard; it grants read access to this team's artifacts for 24 hours. This is separate from Share, so Only me does not revoke existing embed tokens before they expire.</p></div>
         </div>
         <div class="table-panel">
           {embedToken ? (
@@ -441,14 +457,16 @@ export function ArtifactDetailPage({
 }
 
 function ArtifactDirectoryTable({
-  teamId,
+  team,
+  origin,
   sections,
   timeZone,
   manageable,
   csrfToken,
   activeProjectId,
 }: {
-  teamId: string;
+  team: NonNullable<DashboardSession["team"]>;
+  origin?: string;
   sections: ReturnType<typeof groupArtifacts>;
   timeZone: string;
   manageable: boolean;
@@ -465,8 +483,9 @@ function ArtifactDirectoryTable({
             {section.artifacts.map((artifact) => (
               <ArtifactRow
                 key={artifact.slug}
-                teamId={teamId}
+                team={team}
                 artifact={artifact}
+                origin={origin}
                 timeZone={timeZone}
                 manageable={manageable}
                 csrfToken={csrfToken}
@@ -481,20 +500,23 @@ function ArtifactDirectoryTable({
 }
 
 function ArtifactRow({
-  teamId,
+  team,
   artifact,
+  origin,
   timeZone,
   manageable,
   csrfToken,
   activeProjectId,
 }: {
-  teamId: string;
+  team: NonNullable<DashboardSession["team"]>;
   artifact: DashboardArtifact;
+  origin?: string;
   timeZone: string;
   manageable: boolean;
   csrfToken: string;
   activeProjectId?: string | null;
 }) {
+  const teamId = team!.id;
   const detailHref = `/dashboard/${teamId}/artifacts/${encodeURIComponent(artifact.slug)}`;
   return (
     <div class="table-row" role="row">
@@ -515,6 +537,7 @@ function ArtifactRow({
       </span>
       <span class="row-actions">
         <a class="row-action" href={detailHref}>Browse →</a>
+        <ArtifactShareControl team={team} artifact={artifact} origin={origin} csrfToken={csrfToken} context="list" activeProjectId={activeProjectId} />
         {manageable ? (
           <>
             <a class="row-action" href={`${detailHref}#projects`}>Organize</a>
@@ -528,6 +551,77 @@ function ArtifactRow({
         ) : null}
       </span>
     </div>
+  );
+}
+
+function artifactWithPrivateShare(slug: string): DashboardArtifact {
+  return {
+    slug,
+    createdAt: null,
+    lastActivityAt: null,
+    pinnedAt: null,
+    projects: [],
+    share: { active: false, token: null, createdAt: null, revokedAt: null },
+  };
+}
+
+function ArtifactShareControl({
+  team,
+  artifact,
+  origin,
+  csrfToken,
+  context,
+  activeProjectId,
+}: {
+  team: NonNullable<DashboardSession["team"]>;
+  artifact: DashboardArtifact;
+  origin?: string;
+  csrfToken: string;
+  context: "list" | "detail";
+  activeProjectId?: string | null;
+}) {
+  const canManage = team.role === "owner";
+  const shareUrl = origin && artifact.share.active && artifact.share.token
+    ? artifactShareHref(origin, team.slug, artifact.slug, artifact.share.token)
+    : null;
+  const shareId = `share-url-${team.id}-${artifact.slug}`;
+  const actionPath = `/dashboard/${team.id}/artifacts/${encodeURIComponent(artifact.slug)}/share`;
+  const stateLabel = artifact.share.active ? "Anyone with the link" : "Only me";
+  return (
+    <details class={`share-control${context === "list" ? " share-control-compact" : ""}`}>
+      <summary><span>Share</span><span class={`status ${artifact.share.active ? "active" : "private"}`}>{stateLabel}</span></summary>
+      <div class="share-popover">
+        <p class="share-explanation">Only me keeps access with authenticated members of this team. Anyone with the link can open the shared artifact without a dashboard session. Existing embedding tokens are a separate 24-hour capability and remain valid until expiry; Only me does not revoke them.</p>
+        <form method="post" action={actionPath}>
+          <CsrfField token={csrfToken} />
+          <input type="hidden" name="context" value={context} />
+          {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
+          <div class="share-choices" role="group" aria-label="Artifact sharing">
+            <button class={`share-choice${!artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="revoke" disabled={!canManage} aria-pressed={!artifact.share.active ? "true" : "false"}>
+              <strong>Only me</strong><small>Authenticated team members keep their existing access.</small>
+            </button>
+            <button class={`share-choice${artifact.share.active ? " selected" : ""}`} type="submit" name="action" value="enable" disabled={!canManage} aria-pressed={artifact.share.active ? "true" : "false"}>
+              <strong>Anyone with the link</strong><small>Share the artifact URL with people outside the team.</small>
+            </button>
+          </div>
+        </form>
+        {shareUrl ? (
+          <div class="share-link">
+            <code id={shareId}>{shareUrl}</code>
+            <button class="button secondary" type="button" data-copy-target={shareId}>Copy link</button>
+          </div>
+        ) : null}
+        {canManage && artifact.share.active ? (
+          <form method="post" action={actionPath} data-confirm="Regenerate this link? The current link will stop working immediately.">
+            <CsrfField token={csrfToken} />
+            <input type="hidden" name="context" value={context} />
+            {activeProjectId ? <input type="hidden" name="project" value={activeProjectId} /> : null}
+            <button class="danger-link" type="submit" name="action" value="regenerate">Regenerate link</button>
+          </form>
+        ) : null}
+        {!canManage ? <p class="permission-note">Only a team owner can change this sharing setting.</p> : null}
+      </div>
+    </details>
   );
 }
 

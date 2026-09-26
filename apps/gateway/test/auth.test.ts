@@ -3,7 +3,9 @@ import worker from "../src/index.tsx";
 import { withNoStore } from "../src/auth/middleware.ts";
 import { issueAccessToken } from "../src/auth/jwt.ts";
 import { issueEmbedToken, verifyEmbedToken } from "../src/auth/embed.ts";
-import { serveArtifact } from "../src/content/routes.ts";
+import { issueDashboardCsrfToken } from "../src/auth/csrf.ts";
+import { serveArtifact, uploadArtifact } from "../src/content/routes.ts";
+import { createArtifactShareToken } from "../src/content/share.ts";
 import { createWebAuth } from "../src/auth/better-auth.ts";
 import { ACCESS_TOKEN_SECONDS, PUBLISH_PERMISSION, READ_PERMISSION } from "../src/auth/types.ts";
 import { createMigratedDb } from "./d1.ts";
@@ -26,7 +28,7 @@ async function accessToken(overrides: Record<string, unknown> = {}, now = Math.f
 function makeEnv(db: D1Database | null = null) {
   const uploads: Array<{ key: string; body: string; contentType?: string }> = [];
   const lookups: string[] = [];
-  const objects = new Map<string, { body: string; contentType: string }>();
+  const objects = new Map<string, { body: string; contentType: string; size?: number }>();
   const env = {
     JWT_SECRET,
     BETTER_AUTH_SECRET: "test-better-auth-secret-that-is-long-enough",
@@ -38,15 +40,27 @@ function makeEnv(db: D1Database | null = null) {
       async put(key: string, body: ReadableStream<Uint8Array>, options?: R2PutOptions) {
         const metadata = options?.httpMetadata;
         const contentType = metadata && !(metadata instanceof Headers) ? metadata.contentType : undefined;
-        uploads.push({ key, body: await new Response(body).text(), contentType });
+        const text = await new Response(body).text();
+        uploads.push({ key, body: text, contentType });
+        objects.set(key, { body: text, contentType: contentType ?? "application/octet-stream" });
         return {};
+      },
+      async head(key: string) {
+        const artifact = objects.get(key);
+        if (!artifact) return null;
+        return {
+          size: artifact.size ?? new TextEncoder().encode(artifact.body).byteLength,
+          uploaded: new Date("2026-09-23T00:00:00.000Z"),
+          httpEtag: '"fixture"',
+          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", artifact.contentType); },
+        };
       },
       async get(key: string) {
         lookups.push(key);
         const artifact = objects.get(key) ?? { body: "private artifact", contentType: "application/json" };
         return {
           body: new Response(artifact.body).body,
-          size: new TextEncoder().encode(artifact.body).byteLength,
+          size: artifact.size ?? new TextEncoder().encode(artifact.body).byteLength,
           uploaded: new Date("2026-09-23T00:00:00.000Z"),
           httpEtag: '"fixture"',
           writeHttpMetadata(headers: Headers) { headers.set("Content-Type", artifact.contentType); },
@@ -89,6 +103,21 @@ function seedWebContext(sqlite: import("bun:sqlite").Database): string {
     VALUES ('team-abc123', 'user-1', 'owner', ${now});
   `);
   return "session-token-1";
+}
+
+function seedArtifactShare(
+  sqlite: import("bun:sqlite").Database,
+  options: { artifactSlug?: string; token?: string; revokedAt?: number | null } = {},
+): string {
+  const artifactSlug = options.artifactSlug ?? "reports";
+  const token = options.token ?? createArtifactShareToken();
+  const now = Date.now();
+  const artifactId = `artifact-${artifactSlug}`;
+  sqlite.prepare("INSERT INTO artifacts (id, team_id, slug, created_at, last_activity_at) VALUES (?, ?, ?, ?, ?)")
+    .run(artifactId, "team-abc123", artifactSlug, now, now);
+  sqlite.prepare("INSERT INTO artifact_shares (artifact_id, token, created_at, revoked_at) VALUES (?, ?, ?, ?)")
+    .run(artifactId, token, now, options.revokedAt ?? null);
+  return token;
 }
 
 async function signInPublisherWithTeam(
@@ -540,6 +569,231 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
 
     const otherArtifact = await serveArtifact(request(`/${teamSlug}/other-artifact/today.json?token=${token}`), env, teamSlug);
     expect(otherArtifact.status).toBe(401);
+  });
+
+  it("serves shared HTML, CSS, and assets with scoped URLs and public isolation headers", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env, objects, lookups } = makeEnv(db);
+    const shareToken = seedArtifactShare(sqlite);
+    objects.set("uploads/team-abc123/artifacts/reports/index.html", {
+      body: '<link rel="stylesheet" href="styles/site.css?mode=dark"><script type="module" src="./helper.js"></script><img srcset="data:image/svg+xml,%3Csvg%3E 1x, /w3dev/reports/images/b.png 2x"><div style=\'background:url("images/inline.svg");mask-image:url(data:image/svg+xml,%3Csvg%3E)\'></div><a href="next.html#part">Next</a><a href="/w3dev/reports/next.html?from=index">Root next</a><a href="/w3dev/sibling/index.html">Sibling</a><a href="https://cdn.example.test/page">External</a>',
+      contentType: "text/html; charset=utf-8",
+    });
+    objects.set("uploads/team-abc123/artifacts/reports/styles/site.css", {
+      body: '@import "./theme.css"; .hero{background:url("../images/hero.svg")} .remote{background:url(https://cdn.example.test/image.svg)} .sibling{background:url("/w3dev/other/image.svg")}',
+      contentType: "text/css; charset=utf-8",
+    });
+    objects.set("uploads/team-abc123/artifacts/reports/helper.js", {
+      body: "export const ready = true;",
+      contentType: "text/javascript; charset=utf-8",
+    });
+
+    const htmlResponse = await serveArtifact(request(`/w3dev/reports/index.html?share=${shareToken}`), env, "w3dev");
+    const html = await htmlResponse.text();
+    expect(htmlResponse.status).toBe(200);
+    expect(html).toContain(`href="/w3dev/reports/styles/site.css?mode=dark&amp;share=${shareToken}"`);
+    expect(html).toContain(`src="/w3dev/reports/helper.js?share=${shareToken}"`);
+    expect(html).toContain(`srcset="data:image/svg+xml,%3Csvg%3E 1x, /w3dev/reports/images/b.png?share=${shareToken} 2x"`);
+    expect(html).toContain(`/w3dev/reports/images/b.png?share=${shareToken} 2x`);
+    expect(html).toContain(`style='background:url("/w3dev/reports/images/inline.svg?share=${shareToken}");mask-image:url(data:image/svg+xml,%3Csvg%3E)'`);
+    expect(html).toContain(`href="/w3dev/reports/next.html?share=${shareToken}#part"`);
+    expect(html).toContain(`href="/w3dev/reports/next.html?from=index&amp;share=${shareToken}"`);
+    expect(html).toContain('href="/w3dev/sibling/index.html"');
+    expect(html).toContain('href="https://cdn.example.test/page"');
+    expect(htmlResponse.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(htmlResponse.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(htmlResponse.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(htmlResponse.headers.get("Cross-Origin-Resource-Policy")).toBe("cross-origin");
+    expect(htmlResponse.headers.get("Set-Cookie")).toBeNull();
+    expect(htmlResponse.headers.get("Content-Security-Policy")).toContain("sandbox allow-scripts");
+    expect(htmlResponse.headers.get("Content-Security-Policy")).toContain("connect-src *");
+
+    const cssResponse = await serveArtifact(request(`/w3dev/reports/styles/site.css?share=${shareToken}`), env, "w3dev");
+    const css = await cssResponse.text();
+    expect(cssResponse.status).toBe(200);
+    expect(css).toContain(`@import "/w3dev/reports/styles/theme.css?share=${shareToken}"`);
+    expect(css).toContain(`/w3dev/reports/images/hero.svg?share=${shareToken}`);
+    expect(css).toContain("url(https://cdn.example.test/image.svg)");
+    expect(css).toContain('url("/w3dev/other/image.svg")');
+
+    const helperResponse = await serveArtifact(request(`/w3dev/reports/helper.js?share=${shareToken}`), env, "w3dev");
+    expect(helperResponse.status).toBe(200);
+    expect(await helperResponse.text()).toContain("ready");
+    expect(helperResponse.headers.get("Set-Cookie")).toBeNull();
+    expect(lookups).toEqual([
+      "uploads/team-abc123/artifacts/reports/index.html",
+      "uploads/team-abc123/artifacts/reports/styles/site.css",
+      "uploads/team-abc123/artifacts/reports/helper.js",
+    ]);
+  });
+
+  it("fails closed for malformed, revoked, foreign, sibling, and traversal share requests before R2", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env, lookups } = makeEnv(db);
+    const activeToken = seedArtifactShare(sqlite);
+    const revokedToken = seedArtifactShare(sqlite, { artifactSlug: "old", revokedAt: Date.now() });
+
+    const responses = await Promise.all([
+      serveArtifact(request("/w3dev/reports/index.html?share=too-short"), env, "w3dev"),
+      serveArtifact(request(`/w3dev/old/index.html?share=${revokedToken}`), env, "w3dev"),
+      serveArtifact(request(`/another-team/reports/index.html?share=${activeToken}`), env, "another-team"),
+      serveArtifact(request(`/w3dev/sibling/index.html?share=${activeToken}`), env, "w3dev"),
+      serveArtifact(request(`/w3dev/reports/%2e%2e/secret?share=${activeToken}`), env, "w3dev"),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([404, 404, 404, 404, 404]);
+    expect(responses.every((response) => response.headers.get("Cache-Control") === "no-store")).toBe(true);
+    expect(responses.every((response) => response.headers.get("Referrer-Policy") === "no-referrer")).toBe(true);
+    expect(lookups).toEqual([]);
+  });
+
+  it("bounds shared HTML and CSS rewriting by the declared object size", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env } = makeEnv(db);
+    const shareToken = seedArtifactShare(sqlite);
+    const oversized = 4 * 1024 * 1024 + 1;
+    (env as unknown as { ARTIFACTS_BUCKET: { get: (key: string) => Promise<unknown> } }).ARTIFACTS_BUCKET = {
+      async get(key: string) {
+        const contentType = key.endsWith(".css") ? "text/css; charset=utf-8" : "text/html; charset=utf-8";
+        return {
+          body: new Response("small body").body,
+          size: oversized,
+          httpEtag: '"oversized"',
+          writeHttpMetadata(headers: Headers) { headers.set("Content-Type", contentType); },
+        };
+      },
+    } as never;
+
+    for (const path of ["index.html", "site.css"]) {
+      const response = await serveArtifact(request(`/w3dev/reports/${path}?share=${shareToken}`), env, "w3dev");
+      expect(response.status).toBe(413);
+      const body = await response.json() as unknown as { error: string };
+      expect(body).toEqual({ error: "artifact_content_too_large" });
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    }
+  });
+
+  it("keeps an enabled link live for uploads and blocks it immediately after revoke", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env, objects, lookups } = makeEnv(db);
+    const shareToken = seedArtifactShare(sqlite);
+    objects.set("uploads/team-abc123/artifacts/reports/index.html", {
+      body: "initial",
+      contentType: "text/html; charset=utf-8",
+    });
+
+    const initial = await serveArtifact(request(`/w3dev/reports/index.html?share=${shareToken}`), env, "w3dev");
+    expect(initial.status).toBe(200);
+    expect(await initial.text()).toBe("initial");
+
+    const publisher = await accessToken();
+    const upload = await uploadArtifact(request("/__api/v1/uploads?artifact=reports&path=live.json", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${publisher.token}`, "Content-Type": "application/json" },
+      body: '{"live":true}',
+    }), env);
+    expect(upload.status).toBe(201);
+    const live = await serveArtifact(request(`/w3dev/reports/live.json?share=${shareToken}`), env, "w3dev");
+    expect(live.status).toBe(200);
+    expect(await live.text()).toBe('{"live":true}');
+    expect(sqlite.prepare("SELECT revoked_at FROM artifact_shares WHERE token = ?").get(shareToken)).toEqual({ revoked_at: null });
+
+    sqlite.prepare("UPDATE artifact_shares SET revoked_at = ? WHERE token = ?").run(Date.now(), shareToken);
+    const revoked = await serveArtifact(request(`/w3dev/reports/index.html?share=${shareToken}`), env, "w3dev");
+    expect(revoked.status).toBe(404);
+    expect(lookups).toEqual([
+      "uploads/team-abc123/artifacts/reports/index.html",
+      "uploads/team-abc123/artifacts/reports/live.json",
+    ]);
+  });
+
+  it("keeps the legacy 24-hour embed capability separate from revocable share links", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env, objects } = makeEnv(db);
+    const shareToken = seedArtifactShare(sqlite);
+    objects.set("uploads/team-abc123/artifacts/reports/index.html", {
+      body: "legacy embed",
+      contentType: "text/html; charset=utf-8",
+    });
+    const embed = await issueEmbedToken({ JWT_SECRET } as never, "team-abc123");
+
+    sqlite.prepare("UPDATE artifact_shares SET revoked_at = ? WHERE token = ?").run(Date.now(), shareToken);
+    const legacy = await serveArtifact(request(`/w3dev/reports/index.html?token=${embed.token}`), env, "w3dev");
+    expect(legacy.status).toBe(200);
+    expect(await legacy.text()).toBe("legacy embed");
+    expect(legacy.headers.getSetCookie().length).toBe(1);
+  });
+
+  it("preserves a share query while redirecting historical team slugs", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    sqlite.prepare("INSERT INTO team_slugs (slug, team_id, is_current, created_at, changed_at, changed_by_user_id) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("old-w3dev", "team-abc123", 0, Date.now(), Date.now(), "user-1");
+    const { env } = makeEnv(db);
+    const shareToken = seedArtifactShare(sqlite);
+    const response = await serveArtifact(request(`/old-w3dev/reports/index.html?share=${shareToken}&view=full`), env, "old-w3dev");
+
+    expect(response.status).toBe(308);
+    expect(response.headers.get("Location")).toBe(`https://artifact.w3dev.app/w3dev/reports/index.html?share=${shareToken}&view=full`);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+  });
+
+  it("requires strict CSRF and an owner role for dashboard share mutations", async () => {
+    const { sqlite, db } = createMigratedDb();
+    const { env, objects } = makeEnv(db);
+    const sessionCookie = await signInPublisherWithTeam(sqlite, env);
+    const sessionToken = decodeURIComponent(sessionCookie.slice(sessionCookie.indexOf("=") + 1)).split(".", 1)[0];
+    const csrfToken = await issueDashboardCsrfToken("test-better-auth-secret-that-is-long-enough", sessionToken);
+    const shareToken = seedArtifactShare(sqlite);
+    objects.set("uploads/team-abc123/artifacts/reports/index.html", {
+      body: "dashboard share",
+      contentType: "text/html; charset=utf-8",
+    });
+
+    const postShare = (options: { csrfToken?: string; origin?: string; action?: string } = {}) => {
+      const form = new URLSearchParams({
+        action: options.action ?? "enable",
+        context: "detail",
+        csrfToken: options.csrfToken ?? csrfToken,
+      });
+      return worker.fetch(request("/dashboard/team-abc123/artifacts/reports/share", {
+        method: "POST",
+        headers: {
+          Cookie: sessionCookie,
+          Origin: options.origin ?? "https://artifact.w3dev.app",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: form,
+      }), env);
+    };
+
+    expect((await postShare({ origin: "https://attacker.example" })).status).toBe(403);
+    expect((await postShare({ csrfToken: "invalid" })).status).toBe(403);
+    const enabled = await postShare();
+    expect(enabled.status).toBe(303);
+    expect(enabled.headers.get("Location")).toContain("share=enabled");
+    expect(sqlite.prepare("SELECT token, revoked_at FROM artifact_shares WHERE artifact_id = ?").get("artifact-reports"))
+      .toEqual({ token: shareToken, revoked_at: null });
+
+    for (const role of ["admin", "member"] as const) {
+      sqlite.prepare("UPDATE team_memberships SET role = ? WHERE team_id = ?").run(role, "team-abc123");
+      expect((await postShare({ action: "revoke" })).status).toBe(403);
+      expect(sqlite.prepare("SELECT revoked_at FROM artifact_shares WHERE artifact_id = ?").get("artifact-reports"))
+        .toEqual({ revoked_at: null });
+      sqlite.prepare("UPDATE team_memberships SET role = 'owner' WHERE team_id = ?").run("team-abc123");
+    }
+
+    const revoked = await postShare({ action: "revoke" });
+    expect(revoked.status).toBe(303);
+    expect(revoked.headers.get("Location")).toContain("share=revoked");
+    expect(sqlite.prepare("SELECT revoked_at FROM artifact_shares WHERE artifact_id = ?").get("artifact-reports")).not.toEqual({ revoked_at: null });
   });
 
   it("rejects embed credentials from another team, expired tokens, or absent credentials", async () => {
