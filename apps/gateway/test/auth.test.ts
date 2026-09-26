@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import worker from "../src/index.tsx";
 import { withNoStore } from "../src/auth/middleware.ts";
 import { issueAccessToken } from "../src/auth/jwt.ts";
+import { issueEmbedToken, verifyEmbedToken } from "../src/auth/embed.ts";
+import { serveArtifact } from "../src/content/routes.ts";
+import { createWebAuth } from "../src/auth/better-auth.ts";
 import { ACCESS_TOKEN_SECONDS, PUBLISH_PERMISSION, READ_PERMISSION } from "../src/auth/types.ts";
+import { createMigratedDb } from "./d1.ts";
 
 const JWT_SECRET = "test-secret-for-hmac-that-is-at-least-32-bytes";
 
@@ -19,7 +23,7 @@ async function accessToken(overrides: Record<string, unknown> = {}, now = Math.f
   }, now);
 }
 
-function makeEnv() {
+function makeEnv(db: D1Database | null = null) {
   const uploads: Array<{ key: string; body: string; contentType?: string }> = [];
   const lookups: string[] = [];
   const env = {
@@ -27,7 +31,7 @@ function makeEnv() {
     BETTER_AUTH_SECRET: "test-better-auth-secret-that-is-long-enough",
     APP_ORIGIN: "https://artifact.w3dev.app",
     DASHBOARD_LAYOUT: "sidebar",
-    DB: {},
+    DB: db ?? {},
     EMAIL: {},
     ARTIFACTS_BUCKET: {
       async put(key: string, body: ReadableStream<Uint8Array>, options?: R2PutOptions) {
@@ -67,6 +71,22 @@ function makeEnv() {
 
 function request(path: string, init?: RequestInit): Request {
   return new Request(`https://artifact.w3dev.app${path}`, init);
+}
+
+function seedWebContext(sqlite: import("bun:sqlite").Database): string {
+  const now = Date.now();
+  sqlite.exec(`
+    INSERT INTO user (id, name, email, email_verified, image, created_at, updated_at)
+    VALUES ('user-1', 'Publisher', 'publisher@example.test', 1, NULL, ${now}, ${now});
+    INSERT INTO session (id, expires_at, token, created_at, updated_at, ip_address, user_agent, user_id)
+    VALUES ('session-1', ${now + 3600000}, 'session-token-1', ${now}, ${now}, NULL, NULL, 'user-1');
+    INSERT INTO teams (id, name, slug, created_at) VALUES ('team-abc123', 'W3Dev', 'w3dev', ${now});
+    INSERT INTO team_slugs (slug, team_id, is_current, created_at, changed_at, changed_by_user_id)
+    VALUES ('w3dev', 'team-abc123', 1, ${now}, NULL, NULL);
+    INSERT INTO team_memberships (team_id, user_id, role, created_at)
+    VALUES ('team-abc123', 'user-1', 'owner', ${now});
+  `);
+  return "session-token-1";
 }
 
 describe("team-scoped JWT authentication and private artifact routes", () => {
@@ -322,6 +342,103 @@ describe("team-scoped JWT authentication and private artifact routes", () => {
 
     expect(html).not.toContain("</script><script>alert(1)</script>");
     expect(html).toContain('data-return-to="/dashboard"');
+  });
+
+  it("seeds a partitioned embed cookie on session-authenticated artifact documents", async () => {
+    const { sqlite, db } = createMigratedDb();
+    const { env: baseEnv } = makeEnv(db);
+    const env = baseEnv as unknown as Record<string, unknown>;
+    env.EMAIL = { send: async () => {} };
+    const auth = createWebAuth(env as never);
+    const signUp = await auth.api.signUpEmail({
+      body: { name: "Publisher", email: "publisher@example.test", password: "sync-test-password" },
+    });
+    if (!signUp) throw new Error("expected signup to succeed");
+    sqlite.exec(`UPDATE user SET email_verified = 1 WHERE email = 'publisher@example.test'`);
+    const now = Date.now();
+    const [member] = sqlite.prepare(`SELECT id FROM user WHERE email = 'publisher@example.test'`).all() as Array<{ id: string }>;
+    sqlite.exec(`
+      INSERT INTO teams (id, name, slug, created_at) VALUES ('team-abc123', 'W3Dev', 'w3dev', ${now});
+      INSERT INTO team_slugs (slug, team_id, is_current, created_at, changed_at, changed_by_user_id)
+      VALUES ('w3dev', 'team-abc123', 1, ${now}, NULL, NULL);
+      INSERT INTO team_memberships (team_id, user_id, role, created_at)
+      VALUES ('team-abc123', '${member.id}', 'owner', ${now});
+    `);
+    const signIn = await auth.api.signInEmail({
+      body: { email: "publisher@example.test", password: "sync-test-password" },
+      asResponse: true,
+    });
+    const sessionCookie = signIn.headers.getSetCookie()
+      .find((cookie) => cookie.startsWith("better-auth.session_token=") || cookie.startsWith("__Secure-better-auth.session_token="));
+    if (!sessionCookie) throw new Error("expected a session cookie from sign-in");
+    const sessionCookiePair = sessionCookie.split(";")[0];
+    const response = await serveArtifact(request("/w3dev/reports/today.json", {
+      headers: {
+        Cookie: sessionCookiePair,
+        "Sec-Fetch-Dest": "document",
+      },
+    }), env as never, "w3dev");
+
+    expect(response.status).toBe(200);
+    const setCookies = response.headers.getSetCookie();
+    expect(setCookies.length).toBe(1);
+    expect(setCookies[0]).toContain("artifact_embed=");
+    expect(setCookies[0]).toContain("HttpOnly");
+    expect(setCookies[0]).toContain("Secure");
+    expect(setCookies[0]).toContain("SameSite=None");
+    expect(setCookies[0]).toContain("Partitioned");
+    const token = /artifact_embed=([^;]+)/.exec(setCookies[0])![1];
+    expect(await verifyEmbedToken({ JWT_SECRET } as never, token)).toBe("team-abc123");
+  });
+
+  it("serves artifact assets from the embed cookie without a session", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env } = makeEnv(db);
+    const embed = await issueEmbedToken({ JWT_SECRET } as never, "team-abc123");
+    const response = await serveArtifact(request("/w3dev/reports/today.json", {
+      headers: {
+        Cookie: `artifact_embed=${embed.token}`,
+        "Sec-Fetch-Dest": "style",
+      },
+    }), env, "w3dev");
+
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
+  it("accepts an embed token query parameter and seeds the partitioned cookie", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env } = makeEnv(db);
+    const embed = await issueEmbedToken({ JWT_SECRET } as never, "team-abc123");
+    const response = await serveArtifact(request(`/w3dev/reports/today.json?token=${embed.token}`, {
+      headers: { "Sec-Fetch-Dest": "style" },
+    }), env, "w3dev");
+
+    expect(response.status).toBe(200);
+    const setCookies = response.headers.getSetCookie();
+    expect(setCookies.length).toBe(1);
+    expect(setCookies[0]).toContain("artifact_embed=");
+    expect(setCookies[0]).toContain("Partitioned");
+  });
+
+  it("rejects embed credentials from another team, expired tokens, or absent credentials", async () => {
+    const { sqlite, db } = createMigratedDb();
+    seedWebContext(sqlite);
+    const { env } = makeEnv(db);
+
+    const foreign = await issueEmbedToken({ JWT_SECRET } as never, "team-other");
+    const foreignResponse = await serveArtifact(request(`/w3dev/reports/today.json?token=${foreign.token}`), env, "w3dev");
+    expect(foreignResponse.status).toBe(401);
+
+    const expired = await issueEmbedToken({ JWT_SECRET } as never, "team-abc123", Math.floor(Date.now() / 1000) - 25 * 60 * 60);
+    const expiredResponse = await serveArtifact(request(`/w3dev/reports/today.json?token=${expired.token}`), env, "w3dev");
+    expect(expiredResponse.status).toBe(401);
+
+    const anonymous = await serveArtifact(request("/w3dev/reports/today.json"), env, "w3dev");
+    expect(anonymous.status).toBe(401);
+    expect(await anonymous.text()).toBe(JSON.stringify({ error: "web_session_required" }));
   });
 
   it("preserves multiple authentication cookies while adding no-store headers", () => {

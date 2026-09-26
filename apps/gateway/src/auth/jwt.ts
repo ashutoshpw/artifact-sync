@@ -91,7 +91,7 @@ export async function verifyAccessToken(
   };
 }
 
-async function signingKey(env: GatewayEnv): Promise<CryptoKey> {
+export async function signingKey(env: GatewayEnv): Promise<CryptoKey> {
   if (typeof env.JWT_SECRET !== "string" || new TextEncoder().encode(env.JWT_SECRET).byteLength < 32) {
     throw new JwtConfigurationError();
   }

@@ -1,8 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { Database } from "bun:sqlite";
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { renderToString } from "hono/jsx/dom/server";
+import { createMigratedDb } from "./d1.ts";
 import { ArtifactDetailPage, ArtifactsPage, DashboardDocument, DeviceApprovalPage, DevicesPage, GeneralSettingsPage, OverviewPage, ProjectsPage, TokensPage } from "../src/web/dashboard.tsx";
 import {
   createDashboardProject,
@@ -40,53 +38,10 @@ function artifact(slug: string, overrides: Partial<DashboardArtifact> = {}) {
   return { slug, createdAt: null, lastActivityAt: null, pinnedAt: null, projects: [], ...overrides };
 }
 
-function createD1Shim(sqlite: Database): D1Database {
-  const client = {
-    prepare(query: string) {
-      const statement = sqlite.prepare(query);
-      return {
-        bind(...parameters: unknown[]) {
-          const args = parameters as never[];
-          return {
-            all: async () => ({ results: statement.all(...args) }),
-            // bun:sqlite's raw() yields BLOB-style values, so emulate D1's raw
-            // mode with plain values in the statement's column order.
-            raw: async () => {
-              const rows = statement.all(...args) as Array<Record<string, unknown>>;
-              const columns = (statement as unknown as { columnNames: string[] }).columnNames;
-              return rows.map((row) => columns.map((column) => row[column]));
-            },
-            run: async () => {
-              statement.run(...args);
-              return { success: true, meta: {} };
-            },
-            first: async () => statement.get(...args) ?? null,
-          };
-        },
-      };
-    },
-    async batch() {
-      throw new Error("batch is not supported by the test shim");
-    },
-  };
-  return client as unknown as D1Database;
-}
 
-function applyMigrations(sqlite: Database): void {
-  const directory = join(import.meta.dir, "..", "drizzle");
-  const files = readdirSync(directory).filter((name) => name.endsWith(".sql")).sort();
-  for (const file of files) {
-    const sql = readFileSync(join(directory, file), "utf8");
-    for (const statement of sql.split("--> statement-breakpoint")) {
-      const trimmed = statement.trim();
-      if (trimmed) sqlite.exec(trimmed);
-    }
-  }
-}
 
 function createTestEnv(files: Record<string, Array<{ key: string; uploaded: Date }>> = {}) {
-  const sqlite = new Database(":memory:");
-  applyMigrations(sqlite);
+  const { sqlite, db } = createMigratedDb();
   sqlite.exec(`INSERT INTO teams (id, name, slug, created_at) VALUES ('team-1', 'W3Dev', 'w3dev', 0)`);
   const bucket = {
     async list(options: R2ListOptions) {
@@ -111,7 +66,7 @@ function createTestEnv(files: Record<string, Array<{ key: string; uploaded: Date
       };
     },
   };
-  return { env: { DB: createD1Shim(sqlite), ARTIFACTS_BUCKET: bucket }, sqlite };
+  return { env: { DB: db, ARTIFACTS_BUCKET: bucket }, sqlite };
 }
 
 describe("dashboard server rendering", () => {

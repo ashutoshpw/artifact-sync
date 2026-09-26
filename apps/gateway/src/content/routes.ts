@@ -1,5 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { authenticate, authError, noStoreHeaders } from "../auth/middleware.ts";
+import { EMBED_COOKIE, embedCookieHeader, findEmbedCredential, issueEmbedToken } from "../auth/embed.ts";
 import { isValidTeamSlug } from "../auth/team-slug.ts";
 import { PUBLISH_PERMISSION, READ_PERMISSION } from "../auth/types.ts";
 import type { GatewayEnv, PublisherIdentity } from "../auth/types.ts";
@@ -139,6 +140,7 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
   const artifactPath = filePathParts.join("/");
 
   let access: { teamId: string; team: string } | Response;
+  let embedCookie: string | null = null;
   if (request.headers.has("Authorization")) {
     access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION);
     if (access instanceof Response) {
@@ -157,7 +159,21 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
       return Response.redirect(requestUrl, 308);
     }
     access = await resolveTeamAccess(request, env, teamSlug, READ_PERMISSION, scope.teamId);
-    if (access instanceof Response) return access;
+    if (access instanceof Response) {
+      // Cross-site embeds withhold the session cookie from subresource requests
+      // (third-party cookie enforcement), so an embedded artifact document can
+      // load while its relative assets get 401s. Accept a short-lived embed
+      // credential minted for this team instead.
+      const credential = await findEmbedCredential(request, env, scope.teamId);
+      if (!credential) return access;
+      access = { teamId: scope.teamId, team: scope.currentSlug };
+      if (credential === "query") embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
+    } else if (isDocumentNavigation(request) && !(await findEmbedCredential(request, env, scope.teamId))) {
+      // The document navigation still carries the session cookie even when the
+      // browser blocks it for the page's subresources. Seed a partitioned embed
+      // cookie so asset requests authenticate within the same embed context.
+      embedCookie = (await issueEmbedToken(env, scope.teamId)).token;
+    }
   }
 
   try {
@@ -170,10 +186,16 @@ export async function serveArtifact(request: Request, env: GatewayEnv, teamSlug:
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("Content-Security-Policy", ARTIFACT_CONTENT_SECURITY_POLICY);
     headers.set("Referrer-Policy", "no-referrer");
+    if (embedCookie) headers.append("Set-Cookie", embedCookieHeader(embedCookie));
     return new Response(object.body, { headers });
   } catch {
     return authError(503, "artifact_storage_unavailable");
   }
+}
+
+function isDocumentNavigation(request: Request): boolean {
+  const destination = request.headers.get("Sec-Fetch-Dest");
+  return !destination || destination === "document";
 }
 
 async function lookupTeamSlugScope(
