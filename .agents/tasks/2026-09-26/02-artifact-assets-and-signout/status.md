@@ -1,6 +1,6 @@
 # Status
 
-- **State:** in-progress
+- **State:** done
 - **Updated:** 2026-09-26
 
 ## Notes
@@ -10,6 +10,7 @@
 - `bun run test:gateway`, `bun run check:gateway`, and `git diff --check` pass.
 - Commit `248efa1` is on `origin/main`; GitHub Actions run `36253136216` passed verification, applied D1 migrations, and deployed the production Worker.
 - The first deployment's retest path required the artifact detail page's `?token=...`; the follow-up addresses session-authenticated pages with no query token.
-- Follow-up: a session-authenticated document without an explicit `?token=` still depended on the browser accepting the partitioned cookie. Add artifact-only query credentials to its local helper URLs so this path also works when third-party cookies are blocked.
-- Follow-up implementation: session-authenticated HTML and linked CSS now use artifact-scoped tokens; regression coverage verifies helper access and sibling-artifact denial. `bun run test:gateway` (42 tests), `bun run check:gateway`, and `git diff --check` pass.
-- Follow-up commit and production deployment are pending.
+- Follow-up: session-authenticated documents without `?token=` now receive artifact-scoped helper tokens, so linked CSS loads when the browser withholds the partitioned cookie.
+- Regression coverage exercises the reported team/artifact path, follows its tokenized stylesheet and CSS imports, and confirms the token cannot read a sibling artifact. `bun run test:gateway` (42 tests), `bun run check:gateway`, and `git diff --check` pass.
+- Commit `40831a5` is on `origin/main`; GitHub Actions run `36263257848` passed gateway verification, applied D1 migrations, and deployed the production Worker.
+- Ready for the user to retest the reported URL while signed in, without adding a query token.

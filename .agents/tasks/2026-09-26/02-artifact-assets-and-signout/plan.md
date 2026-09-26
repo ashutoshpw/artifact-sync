@@ -24,7 +24,7 @@ Use the supplied HAR to fix authenticated published artifact subresources and re
 - [x] Commit and push to `origin/main`.
 - [x] Confirm the matching GitHub Actions deployment and report when retesting is ready.
 - [x] Add an artifact-scoped resource token for session-authenticated artifact pages that do not have an explicit `?token=`.
-- [ ] Deploy the follow-up and report retest readiness.
+- [x] Deploy the follow-up and report retest readiness.
 
 ## Acceptance criteria
 - [x] Relative helper assets for a published artifact load under the same access conditions as its HTML document.
