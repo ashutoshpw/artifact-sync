@@ -4,13 +4,13 @@ use super::credentials::{
     TokenExchange, is_access_token, is_refresh_credential,
 };
 use super::store::{CredentialStore, StoreError};
-use crate::config::{ConfigError, default_auth_config_path, path_is_inside};
+use crate::config::{ConfigError, path_is_inside};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
@@ -146,19 +146,38 @@ fn device_name() -> String {
 }
 
 fn open_browser_best_effort(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = "open";
-    #[cfg(target_os = "linux")]
-    let command = "xdg-open";
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let command = return;
+    #[cfg(windows)]
+    {
+        let Ok(url) = crate::windows::wide(url) else {
+            return;
+        };
+        unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "macos")]
+        let command = "open";
+        #[cfg(target_os = "linux")]
+        let command = "xdg-open";
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let command = return;
 
-    let _ = Command::new(command)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        let _ = Command::new(command)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
 }
 
 pub async fn whoami(auth_path: PathBuf, artifact_root: PathBuf) -> Result<(), CommandError> {
@@ -405,14 +424,7 @@ fn auth_command_error(error: AuthClientError) -> CommandError {
 }
 
 async fn notify_daemon_auth_changed() -> Result<bool, std::io::Error> {
-    let socket_path = default_auth_config_path()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
-        })?
-        .parent()
-        .unwrap()
-        .join("daemon.sock");
-    match UnixStream::connect(socket_path).await {
+    match crate::control::connect().await {
         Ok(mut stream) => {
             stream.write_all(b"AUTH_CHANGED\n").await?;
             let mut response = [0u8; 8];

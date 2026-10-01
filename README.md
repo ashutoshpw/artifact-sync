@@ -4,7 +4,13 @@
 
 The daemon creates and watches `~/.agents/artifacts/` as the artifact root. Every immediate child directory is one artifact, named by its exact lowercase URL-safe folder name; files and nested folders inside it stay together. Empty folders, invalid slug names, and loose files directly under the root are not uploaded. The team comes from the server-validated credential; no local file can select the server destination. The only configuration file is the authentication config at `~/.config/artifact-sync/config.json`, and the artifact root never contains daemon configuration.
 
-Build the CLI with Rust 1.88 or newer:
+Install the prebuilt CLI on Linux x64 (glibc) or Windows x64 with Node.js 18 or newer:
+
+```sh
+npm install --global artifact-sync
+```
+
+Or build the CLI with Rust 1.88 or newer (Windows builds also require the Visual Studio C++ build tools and Windows SDK):
 
 ```sh
 cargo build --release -p artifact-sync
@@ -33,6 +39,19 @@ artifact-sync service uninstall
 ```
 
 Service management uses macOS `launchd` or Linux `systemd --user`, requires no root access, and never captures environment tokens. Install after logging in; it may reconcile and upload existing artifacts, so interactive installs ask first and headless installs with existing files require `--yes`. See the authentication guide for lifecycle, status, and Linux session behavior.
+
+## Windows
+
+On Windows x64, run `artifact-sync daemon` in a PowerShell or Command Prompt terminal after logging in. In another terminal, inspect it or stop it gracefully:
+
+```powershell
+artifact-sync daemon --status
+artifact-sync daemon --stop
+```
+
+Ctrl+C also stops the foreground daemon. Restart it with `artifact-sync daemon`; credentials and pending uploads survive shutdown. Automatic Windows service installation is not supported. Windows arm64 and macOS npm binaries are not included.
+
+Windows paths are `%USERPROFILE%\.agents\artifacts` for artifacts, `%USERPROFILE%\.config\artifact-sync\config.json` for credentials, and `%USERPROFILE%\.local\state\artifact-sync\state.sqlite3` for pending sync state. Use a local filesystem that supports Windows ACLs (such as NTFS). Private storage is owned by the current user and grants access only to that user; credential paths containing reparse points (including junctions) are rejected. Daemon control uses a local named pipe restricted to the current user. See [authentication](docs/authentication.md) for storage and credential details.
 
 ## Dashboard
 

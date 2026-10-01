@@ -13,12 +13,14 @@ use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -77,7 +79,7 @@ type JobResult = (PendingItem, Result<UploadOutcome, UploadError>);
 
 enum LoopEvent {
     Filesystem(Option<notify::Result<notify::Event>>),
-    Control(std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>),
+    Control(std::io::Result<crate::control::Stream>),
     Upload(Option<Result<JobResult, tokio::task::JoinError>>),
     AuthReload,
     Retry,
@@ -132,7 +134,7 @@ pub async fn run(
         );
     }
 
-    let (control_listener, _socket_guard) = bind_control_socket().await?;
+    let (mut control_listener, _socket_guard) = crate::control::bind().await?;
     let mut jobs = JoinSet::<JobResult>::new();
     let mut in_flight = HashSet::<String>::new();
     let mut changed_paths = HashSet::<PathBuf>::new();
@@ -147,10 +149,8 @@ pub async fn run(
     let mut cancellation = CancellationToken::new();
     let mut retry_timer = tokio::time::interval(Duration::from_secs(1));
     retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let shutdown_signal = tokio::signal::ctrl_c();
+    let shutdown_signal = crate::control::shutdown_signal();
     tokio::pin!(shutdown_signal);
-    let mut terminate_signal =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     info!(team = expected_team.as_deref().unwrap_or("resolved from credential"), root = %root.display(), "artifact sync daemon started");
 
     loop {
@@ -162,7 +162,6 @@ pub async fn run(
             _ = &mut debounce_sleep, if debounce_armed => LoopEvent::Debounce,
             _ = &mut auth_reload_sleep, if auth_reload_armed => LoopEvent::AuthReload,
             _ = &mut shutdown_signal => LoopEvent::Shutdown,
-            _ = terminate_signal.recv() => LoopEvent::Shutdown,
         };
 
         match event {
@@ -212,7 +211,7 @@ pub async fn run(
                     "filesystem watcher stopped unexpectedly".into(),
                 ));
             }
-            LoopEvent::Control(Ok((mut stream, _))) => {
+            LoopEvent::Control(Ok(mut stream)) => {
                 let mut command = [0u8; 64];
                 if let Ok(Ok(length)) =
                     tokio::time::timeout(Duration::from_secs(2), stream.read(&mut command)).await
@@ -221,6 +220,13 @@ pub async fn run(
                         .unwrap_or_default()
                         .trim()
                     {
+                        "STOP" => {
+                            let _ = stream.write_all(b"OK\n").await;
+                            cancellation.cancel();
+                            jobs.abort_all();
+                            while jobs.join_next().await.is_some() {}
+                            return Ok(());
+                        }
                         "AUTH_CHANGED" => {
                             auth_reload_armed = false;
                             auth_reload_sleep
@@ -629,6 +635,7 @@ fn is_ignored_path(root: &Path, path: &Path) -> bool {
     })
 }
 
+#[cfg(unix)]
 pub fn daemon_socket_path() -> Result<PathBuf, std::io::Error> {
     let home = dirs::home_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
@@ -636,6 +643,7 @@ pub fn daemon_socket_path() -> Result<PathBuf, std::io::Error> {
     Ok(home.join(".config/artifact-sync/daemon.sock"))
 }
 
+#[cfg(unix)]
 pub async fn daemon_is_running() -> Result<bool, std::io::Error> {
     let path = daemon_socket_path()?;
     let metadata = match fs::symlink_metadata(&path) {
@@ -665,18 +673,20 @@ pub async fn daemon_is_running() -> Result<bool, std::io::Error> {
 }
 
 pub async fn query_status() -> Result<Option<DaemonStatus>, std::io::Error> {
-    if !daemon_is_running().await? {
-        return Ok(None);
-    }
-    let mut stream = UnixStream::connect(daemon_socket_path()?).await?;
+    let mut stream = match crate::control::connect().await {
+        Ok(stream) => stream,
+        Err(error) if daemon_unavailable(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     stream.write_all(b"STATUS\n").await?;
     stream.shutdown().await?;
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon status timed out")
-        })??;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        BufReader::new(stream).read_until(b'\n', &mut response),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon status timed out"))??;
     if response.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -693,7 +703,38 @@ pub async fn query_status() -> Result<Option<DaemonStatus>, std::io::Error> {
         })
 }
 
-async fn bind_control_socket() -> Result<(UnixListener, SocketGuard), DaemonError> {
+pub async fn stop() -> Result<bool, std::io::Error> {
+    let mut stream = match crate::control::connect().await {
+        Ok(stream) => stream,
+        Err(error) if daemon_unavailable(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    stream.write_all(b"STOP\n").await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        BufReader::new(stream).read_until(b'\n', &mut response),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon stop timed out"))??;
+    if response != b"OK\n" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon did not acknowledge shutdown",
+        ));
+    }
+    Ok(true)
+}
+
+fn daemon_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+#[cfg(unix)]
+pub(crate) async fn bind_control_socket() -> Result<(UnixListener, SocketGuard), DaemonError> {
     let directory = daemon_socket_path()?
         .parent()
         .ok_or_else(|| DaemonError::Message("daemon control path has no parent".into()))?
@@ -733,7 +774,9 @@ async fn bind_control_socket() -> Result<(UnixListener, SocketGuard), DaemonErro
     Ok((listener, SocketGuard(path)))
 }
 
-struct SocketGuard(PathBuf);
+#[cfg(unix)]
+pub(crate) struct SocketGuard(PathBuf);
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);

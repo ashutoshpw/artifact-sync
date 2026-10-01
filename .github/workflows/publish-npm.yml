@@ -16,8 +16,15 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify CLI
-    runs-on: ubuntu-latest
+    name: Verify CLI (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -28,6 +35,10 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup default 1.88.0
           rustup component add --toolchain 1.88.0 rustfmt clippy
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Run Rust tests
@@ -39,9 +50,11 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +62,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             native: true
+            binary: artifact-sync
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            native: true
+            binary: artifact-sync.exe
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -67,15 +85,43 @@ jobs:
       - name: Smoke test native binary
         if: matrix.native
         run: |
-          chmod +x target/${{ matrix.target }}/release/artifact-sync
-          target/${{ matrix.target }}/release/artifact-sync --version
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --version
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/artifact-sync
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 7
+
+  smoke:
+    name: Test npm install (${{ matrix.runner }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+      - name: Stage and install the actual npm tarball
+        run: |
+          node scripts/prepare-npm-package.mjs --source-dir dist/artifacts --output-dir dist/npm/artifact-sync
+          npm pack ./dist/npm/artifact-sync --pack-destination dist --ignore-scripts
+          npm install --prefix ./dist/install --ignore-scripts ./dist/artifact-sync-*.tgz
+          node ./dist/install/node_modules/artifact-sync/bin/artifact-sync.js --version
+          node ./dist/install/node_modules/artifact-sync/bin/artifact-sync.js daemon --status
 
   publish:
     name: Publish npm package
@@ -83,7 +129,7 @@ jobs:
       github.event_name != 'pull_request' &&
       github.repository == 'ashutoshpw/artifact-sync' &&
       github.ref == 'refs/heads/main'
-    needs: [verify, build]
+    needs: [verify, build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: read

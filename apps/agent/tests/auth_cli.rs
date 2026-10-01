@@ -170,6 +170,7 @@ fn spawn_command(
     command
         .env_clear()
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP", "1")
         .env("RUST_LOG", "debug")
         .arg("--auth-config")
@@ -244,6 +245,7 @@ fn spawn_daemon_with_environment_server(
     command
         .env_clear()
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("ARTIFACT_SYNC_ALLOW_INSECURE_HTTP", "1")
         .env("RUST_LOG", "debug")
         .env("ARTIFACT_SYNC_SERVER_URL", server_origin)
@@ -257,14 +259,33 @@ fn spawn_daemon_with_environment_server(
 }
 
 async fn wait_for_daemon_ready(home: &Path) {
-    let socket_path = home.join(".config/artifact-sync/daemon.sock");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !socket_path.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("daemon control socket did not appear");
+    #[cfg(unix)]
+    {
+        let socket_path = home.join(".config/artifact-sync/daemon.sock");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !socket_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon control socket did not appear");
+    }
+    #[cfg(windows)]
+    {
+        let auth_path = home.join(".config/artifact-sync/config.json");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let output =
+                    run_command(home, &auth_path, &["daemon", "--status"], None, None, None).await;
+                if output.status.success() && output_text(&output).contains("processId") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon control pipe did not appear");
+    }
 }
 
 #[tokio::test]
@@ -526,8 +547,11 @@ async fn logout_preserves_other_settings_and_reports_environment_credential() {
         serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
     raw["customSetting"] = serde_json::Value::String("keep-me".into());
     std::fs::write(&auth_path, serde_json::to_vec(&raw).unwrap()).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let logout = run_command(
         &home,

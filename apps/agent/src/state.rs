@@ -1,6 +1,9 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -39,9 +42,7 @@ pub struct SyncState {
 
 impl SyncState {
     pub fn pending_count_default() -> Result<usize, StateError> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
-        })?;
+        let home = crate::config::home_dir().map_err(std::io::Error::other)?;
         let home = fs::canonicalize(home)?;
         let directory = home.join(".local/state/artifact-sync");
         let mut current = PathBuf::new();
@@ -59,7 +60,9 @@ impl SyncState {
                 Err(error) => return Err(error.into()),
             }
         }
+        #[cfg(unix)]
         let metadata = fs::symlink_metadata(&directory)?;
+        #[cfg(unix)]
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o777 != 0o700
         {
@@ -67,24 +70,34 @@ impl SyncState {
                 "state directory must be owned by the current user with mode 0700".into(),
             ));
         }
+        #[cfg(windows)]
+        let _directory = crate::windows::open_private_directory(&directory)?;
         pending_count_from_path(&directory.join("state.sqlite3"))
     }
 
     pub fn open_default() -> Result<Self, StateError> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
-        })?;
+        let home = crate::config::home_dir().map_err(std::io::Error::other)?;
         let directory = home.join(".local/state/artifact-sync");
-        fs::create_dir_all(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(&directory)?;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(windows)]
+        let _directory = crate::windows::open_private_directory(&directory)?;
         let database = directory.join("state.sqlite3");
         if !database.exists() {
+            #[cfg(unix)]
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&database)?;
+            #[cfg(windows)]
+            crate::windows::open_private_file(&database, true, true)?;
         }
+        #[cfg(windows)]
+        crate::windows::open_private_file(&database, false, false)?;
         let connection = Connection::open(&database)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -108,6 +121,10 @@ impl SyncState {
 
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        #[cfg(windows)]
+        if !path.exists() {
+            crate::windows::open_private_file(path, true, true)?;
+        }
         let connection = Connection::open(path)?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS uploaded (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, uploaded_at INTEGER NOT NULL);
@@ -258,12 +275,15 @@ fn pending_count_from_path(path: &Path) -> Result<usize, StateError> {
             "state database must be a regular file, not a symlink".into(),
         ));
     }
+    #[cfg(unix)]
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
         return Err(StateError::Unsafe(
             "state database must be owned by the current user and not group/world accessible"
                 .into(),
         ));
     }
+    #[cfg(windows)]
+    let _file = crate::windows::open_private_file(path, false, false)?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection
         .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
@@ -490,6 +510,7 @@ mod tests {
         assert_eq!(pending_count_from_path(&database).unwrap(), 0);
 
         let state = SyncState::open(&database).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         state
             .connection
