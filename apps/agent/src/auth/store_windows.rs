@@ -138,12 +138,18 @@ impl CredentialStore {
         );
         let mut bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
         bytes.push(b'\n');
-        let mut file = parent.open_file(std::ffi::OsStr::new(&temporary), true, true)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        parent
-            .replace(&file, self.file_name()?)
-            .map_err(StoreError::from)
+        let mut file = parent.create_temporary_file(std::ffi::OsStr::new(&temporary))?;
+        let result = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            parent
+                .replace(&file, self.file_name()?)
+                .map_err(StoreError::from)
+        })();
+        if result.is_err() {
+            let _ = windows::remove_file(&file);
+        }
+        result
     }
 }
 

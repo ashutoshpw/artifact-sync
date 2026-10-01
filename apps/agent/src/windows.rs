@@ -27,9 +27,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TRAVERSE, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING,
-    SYNCHRONIZE,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+    LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -205,13 +205,27 @@ impl PrivateDirectory {
         create: bool,
         exclusive: bool,
     ) -> io::Result<File> {
+        self.open(name, create, exclusive, false)
+    }
+
+    pub(crate) fn create_temporary_file(&self, name: &OsStr) -> io::Result<File> {
+        self.open(name, true, true, true)
+    }
+
+    fn open(
+        &self,
+        name: &OsStr,
+        create: bool,
+        exclusive: bool,
+        delete_access: bool,
+    ) -> io::Result<File> {
         if Path::new(name).components().count() != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private file name must be a single path component",
             ));
         }
-        open_relative_file(self.handle(), name, create, exclusive)
+        open_relative_file(self.handle(), name, create, exclusive, delete_access)
     }
 
     pub(crate) fn replace(&self, source: &File, destination: &OsStr) -> io::Result<()> {
@@ -334,6 +348,7 @@ fn open_relative_file(
     name: &OsStr,
     create: bool,
     exclusive: bool,
+    delete_access: bool,
 ) -> io::Result<File> {
     let security = PrivateSecurity::new()?;
     let mut name = wide(name)?;
@@ -353,7 +368,9 @@ fn open_relative_file(
         SecurityDescriptor: security.0.0.cast(),
         SecurityQualityOfService: null(),
     };
-    let access = GENERIC_READ | if create { GENERIC_WRITE | DELETE } else { 0 };
+    let access = GENERIC_READ
+        | if create { GENERIC_WRITE } else { 0 }
+        | if delete_access { DELETE } else { 0 };
     let disposition = if exclusive {
         FILE_CREATE
     } else if create {
@@ -405,6 +422,22 @@ pub(crate) fn lock(file: &File) -> io::Result<()> {
             1,
             0,
             &mut overlapped,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_file(file: &File) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::addr_of!(disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
     } == 0
     {
