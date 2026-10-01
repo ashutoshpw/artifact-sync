@@ -8,7 +8,8 @@ const repositoryRoot = path.resolve(scriptDirectory, "..");
 const defaultPackageDirectory = path.join(repositoryRoot, "packages", "artifact-sync");
 const defaultCargoManifest = path.join(repositoryRoot, "apps", "agent", "Cargo.toml");
 const targets = [
-  { triple: "x86_64-unknown-linux-gnu", filename: "artifact-sync-linux-x64" }
+  { triple: "x86_64-unknown-linux-gnu", filename: "artifact-sync-linux-x64", source: "artifact-sync" },
+  { triple: "x86_64-pc-windows-msvc", filename: "artifact-sync-win32-x64.exe", source: "artifact-sync.exe" }
 ];
 
 function readCargoPackageVersion(contents) {
@@ -106,7 +107,7 @@ async function main() {
   );
 
   for (const target of targets) {
-    const sourcePath = path.join(sourceDirectory, target.triple, "artifact-sync");
+    const sourcePath = path.join(sourceDirectory, target.triple, target.source);
     let sourceStat;
     try {
       sourceStat = await lstat(sourcePath);

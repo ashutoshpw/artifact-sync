@@ -51,7 +51,7 @@ secret-manager read artifact-sync/api-token | artifact-sync login \
 
 There is intentionally no `--token <secret>` option. Login validates the exchange with `GET /__api/v1/auth/me` and only then atomically saves the new credential. A failed login leaves an existing credential unchanged. Login does not start the watcher, upload files, or rebind sync state.
 
-Saved authentication is the CLI's only configuration file and has this shape at `~/.config/artifact-sync/config.json` on macOS and Linux:
+Saved authentication is the CLI's only configuration file and has this shape at `~/.config/artifact-sync/config.json` on macOS and Linux, or `%USERPROFILE%\.config\artifact-sync\config.json` on Windows:
 
 ```json
 {
@@ -113,6 +113,16 @@ artifact-sync service start --yes
 If the CLI executable is moved or replaced at another path, run `service install` again to update the native definition. The daemon has its own bounded network retry behavior; native managers restart unexpected process failures with throttling (systemd also applies a start limit). A definitive 401/403 during publishing pauses uploads and preserves pending work; invalid credentials at initial startup are reported in manager logs and are never retried in a tight loop or prompted from a background process.
 
 On macOS/Linux the application auth directory is created with mode `0700`, and auth/temporary files with mode `0600` before secret bytes are written. The store validates ownership and permissions, rejects symlinked credential files/path components, locks updates, and atomically replaces the file inside the protected directory. It leaves no credential-bearing backups. V1 JSON storage is plaintext protected by filesystem access controls: it does not protect against another process running as the same user or a compromised account. The credential store is isolated from watcher/upload logic so a future OS keychain backend can replace it.
+
+## Windows daemon and storage
+
+Windows x64 supports browser device login, stdin token login, `whoami`, logout, and a foreground daemon. Start it with `artifact-sync daemon` and keep the terminal open. From another terminal, `artifact-sync daemon --status` reports local publishing state without contacting the gateway, and `artifact-sync daemon --stop` requests graceful shutdown. Ctrl+C also shuts it down. Pending uploads are preserved and reconciled on restart. The Windows `service` commands report that automatic user-service installation is unsupported.
+
+The default Windows artifact root is `%USERPROFILE%\.agents\artifacts`; sync state lives at `%USERPROFILE%\.local\state\artifact-sync\state.sqlite3`. The CLI uses `USERPROFILE` when it is an absolute path, falling back to the Windows known profile directory. Paths containing spaces are supported; quote explicit `--auth-config` paths in your shell.
+
+Windows private directories and credential/temporary files are created with protected ACLs that grant access only to the current user. Existing private storage is checked for ownership and access grants to other identities; reparse points (including junctions) in credential paths are rejected. Updates use Windows file locking and atomic replacement. Use a local filesystem with ACL support, such as NTFS; broadly accessible existing credential/state directories must be repaired or replaced before use. Credentials remain plaintext protected by filesystem access controls, with the same same-user/compromised-account limitations as Unix storage.
+
+Daemon control uses a local named pipe restricted to the current user's SID and profile, with remote clients rejected. Windows arm64 is not included in the npm release. Native Windows CI covers credential security, authentication, file watching/uploads, daemon status/stop/restart, and installation of the packaged executable.
 
 ## Identity and storage implementation
 

@@ -24,10 +24,11 @@ test("maps supported platforms to binary names", () => {
   assert.equal(launcher.targetName("linux", "arm64"), undefined);
   assert.equal(launcher.targetName("darwin", "x64"), undefined);
   assert.equal(launcher.targetName("darwin", "arm64"), undefined);
-  assert.equal(launcher.targetName("win32", "x64"), undefined);
+  assert.equal(launcher.targetName("win32", "x64"), "artifact-sync-win32-x64.exe");
+  assert.equal(launcher.targetName("win32", "arm64"), undefined);
 });
 
-test("passes stdin through the real launcher", async () => {
+test("passes stdin through the real launcher", { skip: process.platform === "win32" }, async () => {
   const filename = launcher.targetName(process.platform, process.arch);
   if (filename === undefined) {
     return;
@@ -102,13 +103,33 @@ test("reports unsupported platforms", async () => {
   const errors = [];
   const code = await launcher.run({
     platform: "win32",
-    arch: "x64",
+    arch: "arm64",
     stderr: (message) => errors.push(message),
     forwardSignals: false
   });
 
   assert.equal(code, 1);
-  assert.match(errors[0], /unsupported on win32-x64/);
+  assert.match(errors[0], /unsupported on win32-arm64/);
+});
+
+test("launches the Windows executable directly with stdin and no shell", async () => {
+  let invocation;
+  const code = await launcher.run({
+    platform: "win32",
+    arch: "x64",
+    vendorDirectory: "C:\\Program Files\\artifact-sync\\vendor",
+    argv: ["login", "--token-stdin"],
+    fileExists: () => true,
+    spawnProcess: (binary, args, options) => {
+      invocation = { binary, args, options };
+      return childThatExits(0);
+    },
+    forwardSignals: false
+  });
+  assert.equal(code, 0);
+  assert.match(invocation.binary, /artifact-sync-win32-x64\.exe$/);
+  assert.deepEqual(invocation.args, ["login", "--token-stdin"]);
+  assert.deepEqual(invocation.options, { stdio: "inherit" });
 });
 
 test("reports a missing binary", async () => {

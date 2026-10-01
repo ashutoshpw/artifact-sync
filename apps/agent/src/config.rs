@@ -10,6 +10,13 @@ pub enum ConfigError {
 }
 
 pub fn home_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(profile);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+    }
     dirs::home_dir().ok_or(ConfigError::HomeUnavailable)
 }
 

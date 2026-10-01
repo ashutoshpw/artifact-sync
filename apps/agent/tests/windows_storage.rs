@@ -1,0 +1,114 @@
+#![cfg(windows)]
+
+use artifact_sync::auth::credentials::{CachedIdentity, SavedAuth, SecretString};
+use artifact_sync::auth::store::CredentialStore;
+use std::process::Command;
+use std::sync::Arc;
+
+fn auth() -> SavedAuth {
+    SavedAuth {
+        auth_type: "team_token".into(),
+        access_token: SecretString::new(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcnRpZmFjdC1zeW5jIn0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+        refresh_token: SecretString::new("as_rf_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        token_id: "api_test".into(),
+        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+        cached_identity: CachedIdentity {
+            user_id: "user".into(),
+            email: "user@example.test".into(),
+            name: "User".into(),
+            team_id: "team".into(),
+            team: "test".into(),
+            permissions: vec!["artifacts:publish".into()],
+        },
+    }
+}
+
+#[test]
+fn credentials_remain_atomic_under_concurrent_reads_login_and_logout() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(CredentialStore::new(
+        temp.path().join("private/config.json"),
+    ));
+    store.save_login("https://example.test", &auth()).unwrap();
+    std::thread::scope(|scope| {
+        for index in 0..6 {
+            let store = Arc::clone(&store);
+            scope.spawn(move || {
+                for _ in 0..20 {
+                    match index % 3 {
+                        0 => store.save_login("https://example.test", &auth()).unwrap(),
+                        1 => {
+                            store.logout().unwrap();
+                        }
+                        _ => {
+                            assert_eq!(store.load().unwrap().unwrap().version, 1);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+    value["unrelated"] = serde_json::json!({"enabled": true});
+    std::fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+    store.save_login("https://example.test", &auth()).unwrap();
+    assert!(store.logout().unwrap());
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+    assert_eq!(value["unrelated"]["enabled"], true);
+    assert!(value.get("auth").is_none());
+}
+
+#[test]
+fn rejects_credentials_or_directory_with_access_granted_to_everyone() {
+    for directory in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(temp.path().join("private/config.json"));
+        store.save_login("https://example.test", &auth()).unwrap();
+        let path = if directory {
+            store.path().parent().unwrap()
+        } else {
+            store.path()
+        };
+        let output = Command::new("icacls")
+            .arg(path)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(store.load().is_err());
+        assert!(store.save_login("https://example.test", &auth()).is_err());
+    }
+}
+
+#[test]
+fn rejects_junctions_in_credential_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = CredentialStore::new(temp.path().join("private/config.json"));
+    store.save_login("https://example.test", &auth()).unwrap();
+    let junction = temp.path().join("junction");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(store.path().parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        CredentialStore::new(junction.join("config.json"))
+            .load()
+            .is_err()
+    );
+    std::fs::remove_dir(&junction).unwrap();
+}

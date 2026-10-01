@@ -6,7 +6,8 @@ const { existsSync } = require("node:fs");
 const path = require("node:path");
 
 const supportedTargets = Object.freeze({
-  "linux-x64": "artifact-sync-linux-x64"
+  "linux-x64": "artifact-sync-linux-x64",
+  "win32-x64": "artifact-sync-win32-x64.exe"
 });
 
 function targetName(platform = process.platform, arch = process.arch) {
@@ -64,7 +65,7 @@ async function run({
     return 1;
   }
 
-  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+  const signals = platform === "win32" ? [] : ["SIGINT", "SIGTERM", "SIGHUP"];
   const handlers = new Map();
   if (forwardSignals) {
     for (const signal of signals) {

@@ -10,7 +10,7 @@ Install the published CLI globally with npm:
 npm install --global artifact-sync
 ```
 
-The package contains a prebuilt Linux x64 binary and does not require Rust or a compiler at install time.
+The package contains prebuilt Linux x64 (glibc) and Windows x64 binaries and does not require Rust or a compiler at install time. Node.js 18 or newer is required.
 
 ## Usage
 
@@ -38,8 +38,12 @@ artifact-sync service stop
 artifact-sync service uninstall
 ```
 
-The npm package currently supports Linux x64 and uses `systemd --user`; it does not require root access. Add `--yes` to `service install` or `service start` when existing artifacts may upload non-interactively. Uninstalling preserves credentials and sync state.
+On Linux, service management uses `systemd --user` and does not require root access. Add `--yes` to `service install` or `service start` when existing artifacts may upload non-interactively. Uninstalling preserves credentials and sync state.
+
+On Windows, keep `artifact-sync daemon` running in a PowerShell or Command Prompt terminal. Use a second terminal to run `artifact-sync daemon --status` or `artifact-sync daemon --stop`. Ctrl+C also stops the daemon. Restarting preserves credentials and reconciles files changed while stopped. Automatic Windows service installation is not supported.
+
+Windows artifacts live in `%USERPROFILE%\.agents\artifacts`, credentials in `%USERPROFILE%\.config\artifact-sync\config.json`, and sync state in `%USERPROFILE%\.local\state\artifact-sync\state.sqlite3`. Credential and state storage requires a filesystem with Windows ACL support (such as NTFS); private storage grants access only to the current user and rejects reparse points in credential paths. Local daemon control uses a named pipe restricted to the current user.
 
 ## Supported platforms
 
-The npm release supports Linux x64 with glibc. macOS, Linux arm64, and Windows support are not included in this release. Windows support is tracked in [issue #1](https://github.com/ashutoshpw/artifact-sync/issues/1).
+The npm release supports Linux x64 with glibc and Windows x64. macOS, Linux arm64, and Windows arm64 binaries are not included. CI builds and tests the CLI on native Linux and Windows runners and installs the actual npm tarball on both platforms before publishing.

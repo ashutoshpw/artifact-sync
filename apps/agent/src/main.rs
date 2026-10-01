@@ -8,7 +8,7 @@ use std::path::PathBuf;
     name = "artifact-sync",
     version,
     about = "Publish local artifacts to a team-scoped artifact server",
-    after_help = "Complete command reference:\n  login [--server <SERVER>] [--token-stdin]\n  whoami\n  logout\n  daemon\n  service install [--yes]\n  service status\n  service start [--yes]\n  service stop\n  service uninstall\n\nFor command-specific options and guidance, run `artifact-sync <COMMAND> --help`; for example, `artifact-sync service install --help`.\n`--yes` on service install/start confirms that existing artifacts may upload when the daemon starts."
+    after_help = "Complete command reference:\n  login [--server <SERVER>] [--token-stdin]\n  whoami\n  logout\n  daemon [--status | --stop]\n  service install [--yes]\n  service status\n  service start [--yes]\n  service stop\n  service uninstall\n\nFor command-specific options and guidance, run `artifact-sync <COMMAND> --help`; for example, `artifact-sync service install --help`.\n`--yes` on service install/start confirms that existing artifacts may upload when the daemon starts."
 )]
 struct Cli {
     #[arg(
@@ -44,6 +44,12 @@ enum Command {
     Logout,
     /// Run the artifact watcher in the foreground.
     Daemon {
+        /// Inspect the running daemon without contacting the gateway
+        #[arg(long, conflicts_with = "stop")]
+        status: bool,
+        /// Ask the running daemon to shut down gracefully
+        #[arg(long)]
+        stop: bool,
         /// Ignore environment credentials; used by installed per-user services
         #[arg(long, hide = true)]
         auth_file_only: bool,
@@ -81,7 +87,35 @@ async fn run(cli: Cli) -> Result<(), CommandError> {
         } => commands::login(&server, token_stdin, auth_path, artifact_root).await,
         Command::Whoami => commands::whoami(auth_path, artifact_root).await,
         Command::Logout => commands::logout(auth_path, artifact_root).await,
-        Command::Daemon { auth_file_only } => {
+        Command::Daemon { status: true, .. } => {
+            match artifact_sync::daemon::query_status()
+                .await
+                .map_err(|error| CommandError::Message(error.to_string()))?
+            {
+                Some(status) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|error| CommandError::Message(error.to_string()))?
+                ),
+                None => println!("Daemon is not running."),
+            }
+            Ok(())
+        }
+        Command::Daemon { stop: true, .. } => {
+            let stopped = artifact_sync::daemon::stop()
+                .await
+                .map_err(|error| CommandError::Message(error.to_string()))?;
+            println!(
+                "{}",
+                if stopped {
+                    "Daemon shutdown requested."
+                } else {
+                    "Daemon is not running."
+                }
+            );
+            Ok(())
+        }
+        Command::Daemon { auth_file_only, .. } => {
             artifact_sync::daemon::run(auth_path, artifact_root, auth_file_only)
                 .await
                 .map_err(|error| CommandError::Message(error.to_string()))
