@@ -133,6 +133,7 @@ fn read_write_only_lock_files_allow_credential_updates() {
     ] {
         let output = Command::new("icacls")
             .arg(path)
+            .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("*{sid}:{permissions}"))
             .output()
