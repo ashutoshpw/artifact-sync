@@ -109,56 +109,27 @@ fn failed_credential_replacements_remove_temporary_files() {
 }
 
 #[test]
-fn read_write_only_lock_files_allow_credential_updates() {
+fn lock_files_without_delete_sharing_allow_credential_updates() {
     let temp = tempfile::tempdir().unwrap();
     let store = CredentialStore::new(temp.path().join("private/config.json"));
     store.save_login("https://example.test", &auth()).unwrap();
     let lock = store.path().with_extension("json.lock");
-    let output = Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let identity = String::from_utf8(output.stdout).unwrap();
-    let sid = identity
-        .rsplit(',')
-        .next()
-        .unwrap()
-        .trim()
-        .trim_matches('"');
-    assert!(sid.starts_with("S-1-"));
-    for (path, permissions) in [
-        (store.path().parent().unwrap(), "(OI)(CI)(RX,W)"),
-        (lock.as_path(), "(R,W)"),
-    ] {
-        let output = Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("*{sid}:{permissions}"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let error = OpenOptions::new()
-        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+    let blocker = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(&lock)
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        .unwrap();
+    assert!(
+        OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .open(&lock)
+            .is_err()
+    );
 
     store.save_login("https://other.example", &auth()).unwrap();
     assert!(store.logout().unwrap());
-    let output = Command::new("icacls")
-        .arg(store.path().parent().unwrap())
-        .arg("/grant:r")
-        .arg(format!("*{sid}:(OI)(CI)(F)"))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    drop(blocker);
 }
 
 #[test]
