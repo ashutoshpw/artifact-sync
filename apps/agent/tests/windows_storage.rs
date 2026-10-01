@@ -63,6 +63,47 @@ fn credentials_remain_atomic_under_concurrent_reads_login_and_logout() {
 }
 
 #[test]
+fn login_rejects_newer_configuration_versions_without_modifying_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = CredentialStore::new(temp.path().join("private/config.json"));
+    store.save_login("https://example.test", &auth()).unwrap();
+    let newer = br#"{"version":2,"serverUrl":"https://future.example"}"#;
+    std::fs::write(store.path(), newer).unwrap();
+
+    assert!(store.save_login("https://example.test", &auth()).is_err());
+    assert_eq!(std::fs::read(store.path()).unwrap(), newer);
+}
+
+#[test]
+fn rejects_sqlite_sidecars_granted_to_everyone() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = temp.path().join("state profile");
+    std::fs::create_dir(&profile).unwrap();
+    let previous_profile = std::env::var_os("USERPROFILE");
+    unsafe { std::env::set_var("USERPROFILE", &profile) };
+    let state = artifact_sync::state::SyncState::open_default().unwrap();
+    let sidecar = profile.join(".local/state/artifact-sync/state.sqlite3-wal");
+    assert!(sidecar.exists());
+    let output = Command::new("icacls")
+        .arg(&sidecar)
+        .args(["/grant", "*S-1-1-0:(R)"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reopened = artifact_sync::state::SyncState::open_default();
+    drop(state);
+    match previous_profile {
+        Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
+        None => unsafe { std::env::remove_var("USERPROFILE") },
+    }
+    assert!(reopened.is_err());
+}
+
+#[test]
 fn rejects_credentials_or_directory_with_access_granted_to_everyone() {
     for directory in [false, true] {
         let temp = tempfile::tempdir().unwrap();
