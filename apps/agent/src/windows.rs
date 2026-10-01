@@ -9,7 +9,8 @@ use std::ptr::{null, null_mut};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree, RtlNtStatusToDosError,
@@ -26,9 +27,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx,
-    OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING,
+    SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -250,7 +251,13 @@ pub(crate) fn open_private_directory(path: &Path) -> io::Result<PrivateDirectory
             Component::Normal(_) => current.push(component),
         }
         let name = wide(&current)?;
-        let directory = match open_handle(&name, 0x00020000, OPEN_EXISTING, null(), true) {
+        let directory = match open_handle(
+            &name,
+            0x00020000 | FILE_TRAVERSE,
+            OPEN_EXISTING,
+            null(),
+            true,
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0
@@ -258,7 +265,13 @@ pub(crate) fn open_private_directory(path: &Path) -> io::Result<PrivateDirectory
                 {
                     return Err(io::Error::last_os_error());
                 }
-                open_handle(&name, 0x00020000, OPEN_EXISTING, null(), true)?
+                open_handle(
+                    &name,
+                    0x00020000 | FILE_TRAVERSE,
+                    OPEN_EXISTING,
+                    null(),
+                    true,
+                )?
             }
             Err(error) => return Err(error),
         };
@@ -404,9 +417,9 @@ fn replace_relative(parent: &File, source: &File, destination: &OsStr) -> io::Re
     let mut destination = wide(destination)?;
     destination.pop();
     let name_bytes = destination.len() * 2;
-    let size = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes;
+    let size = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes;
     let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = parent.as_raw_handle();
@@ -417,16 +430,20 @@ fn replace_relative(parent: &File, source: &File, destination: &OsStr) -> io::Re
             destination.len(),
         );
     }
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+    let result = unsafe {
+        NtSetInformationFile(
             source.as_raw_handle(),
-            FileRenameInfo,
+            &mut status,
             info.cast(),
             size as u32,
+            FileRenameInformation,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(result) } as i32,
+        ));
     }
     Ok(())
 }
