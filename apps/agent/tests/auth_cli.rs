@@ -183,6 +183,11 @@ fn spawn_command(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.env(
+        "SYSTEMROOT",
+        std::env::var_os("SYSTEMROOT").expect("Windows requires SYSTEMROOT"),
+    );
     if let Some(token) = environment_token {
         command.env("ARTIFACTS_PUBLISH_TOKEN", token);
     }
@@ -255,6 +260,11 @@ fn spawn_daemon_with_environment_server(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.env(
+        "SYSTEMROOT",
+        std::env::var_os("SYSTEMROOT").expect("Windows requires SYSTEMROOT"),
+    );
     command.spawn().unwrap()
 }
 
