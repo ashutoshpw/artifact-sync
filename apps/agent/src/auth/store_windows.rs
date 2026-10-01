@@ -1,7 +1,6 @@
 use super::credentials::{AuthFile, SavedAuth, is_access_token, is_refresh_credential};
 use crate::windows::{self, PrivateDirectory};
 use serde_json::{Map, Value};
-use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,8 +35,8 @@ impl CredentialStore {
     }
 
     pub fn load(&self) -> Result<Option<AuthFile>, StoreError> {
-        let _parent = self.open_parent()?;
-        let Some(value) = self.read_value()? else {
+        let parent = self.open_parent()?;
+        let Some(value) = self.read_value(&parent)? else {
             return Ok(None);
         };
         let config: AuthFile = serde_json::from_value(value)
@@ -53,8 +52,8 @@ impl CredentialStore {
 
     pub fn save_login(&self, server_origin: &str, auth: &SavedAuth) -> Result<(), StoreError> {
         validate_auth(auth)?;
-        self.with_lock(|| {
-            let mut root = self.read_value()?.unwrap_or_else(|| {
+        self.with_lock(|parent| {
+            let mut root = self.read_value(parent)?.unwrap_or_else(|| {
                 let mut map = Map::new();
                 map.insert("version".into(), Value::from(1));
                 Value::Object(map)
@@ -62,16 +61,18 @@ impl CredentialStore {
             let map = root.as_object_mut().ok_or_else(|| {
                 StoreError::Malformed("configuration root must be an object".into())
             })?;
-            map.insert("version".into(), Value::from(1));
+            if map.get("version").and_then(Value::as_u64) != Some(1) {
+                return Err(StoreError::Malformed("unsupported version".into()));
+            }
             map.insert("serverUrl".into(), Value::from(server_origin));
             map.insert("auth".into(), serde_json::to_value(auth)?);
-            self.write_value(&root)
+            self.write_value(parent, &root)
         })
     }
 
     pub fn logout(&self) -> Result<bool, StoreError> {
-        self.with_lock(|| {
-            let Some(mut root) = self.read_value()? else {
+        self.with_lock(|parent| {
+            let Some(mut root) = self.read_value(parent)? else {
                 return Ok(false);
             };
             let map = root.as_object_mut().ok_or_else(|| {
@@ -79,7 +80,7 @@ impl CredentialStore {
             })?;
             let removed = map.remove("auth").is_some();
             if removed {
-                self.write_value(&root)?;
+                self.write_value(parent, &root)?;
             }
             Ok(removed)
         })
@@ -95,18 +96,24 @@ impl CredentialStore {
 
     fn with_lock<T>(
         &self,
-        update: impl FnOnce() -> Result<T, StoreError>,
+        update: impl FnOnce(&PrivateDirectory) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let _parent = self.open_parent()?;
-        let mut name = self.path.as_os_str().to_os_string();
+        let parent = self.open_parent()?;
+        let mut name = self.file_name()?.to_os_string();
         name.push(".lock");
-        let lock = windows::open_private_file(Path::new(&name), true, false)?;
+        let lock = parent.open_file(&name, true, false)?;
         windows::lock(&lock)?;
-        update()
+        update(&parent)
     }
 
-    fn read_value(&self) -> Result<Option<Value>, StoreError> {
-        let mut file = match windows::open_private_file(&self.path, false, false) {
+    fn file_name(&self) -> Result<&std::ffi::OsStr, StoreError> {
+        self.path
+            .file_name()
+            .ok_or_else(|| StoreError::Unsafe("configuration path has no file name".into()))
+    }
+
+    fn read_value(&self, parent: &PrivateDirectory) -> Result<Option<Value>, StoreError> {
+        let mut file = match parent.open_file(self.file_name()?, false, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -118,31 +125,25 @@ impl CredentialStore {
             .map_err(|error| StoreError::Malformed(error.to_string()))
     }
 
-    fn write_value(&self, value: &Value) -> Result<(), StoreError> {
-        let parent = self.open_parent()?;
-        match windows::open_private_file(&self.path, false, false) {
+    fn write_value(&self, parent: &PrivateDirectory, value: &Value) -> Result<(), StoreError> {
+        match parent.open_file(self.file_name()?, false, false) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let temporary = parent.path.join(format!(
+        let temporary = format!(
             ".artifact-sync-{}-{}.tmp",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        );
         let mut bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
         bytes.push(b'\n');
-        let result = (|| {
-            let mut file = windows::open_private_file(&temporary, true, true)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            windows::replace(&temporary, &self.path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result.map_err(StoreError::from)
+        let mut file = parent.open_file(std::ffi::OsStr::new(&temporary), true, true)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        parent
+            .replace(&file, self.file_name()?)
+            .map_err(StoreError::from)
     }
 }
 

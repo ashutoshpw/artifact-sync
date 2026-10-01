@@ -38,6 +38,8 @@ pub struct ArtifactFilePath {
 
 pub struct SyncState {
     connection: Mutex<Connection>,
+    #[cfg(windows)]
+    _directory: Option<crate::windows::PrivateDirectory>,
 }
 
 impl SyncState {
@@ -84,7 +86,7 @@ impl SyncState {
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         }
         #[cfg(windows)]
-        let _directory = crate::windows::open_private_directory(&directory)?;
+        let private_directory = crate::windows::open_private_directory(&directory)?;
         let database = directory.join("state.sqlite3");
         if !database.exists() {
             #[cfg(unix)]
@@ -94,10 +96,19 @@ impl SyncState {
                 .mode(0o600)
                 .open(&database)?;
             #[cfg(windows)]
-            crate::windows::open_private_file(&database, true, true)?;
+            private_directory.open_file("state.sqlite3".as_ref(), true, true)?;
         }
         #[cfg(windows)]
-        crate::windows::open_private_file(&database, false, false)?;
+        {
+            private_directory.open_file("state.sqlite3".as_ref(), false, false)?;
+            for sidecar in ["state.sqlite3-wal", "state.sqlite3-shm"] {
+                match private_directory.open_file(sidecar.as_ref(), false, false) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         let connection = Connection::open(&database)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -114,16 +125,38 @@ impl SyncState {
                next_attempt_at INTEGER NOT NULL DEFAULT 0
              );",
         )?;
+        #[cfg(windows)]
+        for sidecar in ["state.sqlite3-wal", "state.sqlite3-shm"] {
+            private_directory.open_file(sidecar.as_ref(), false, false)?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
+            #[cfg(windows)]
+            _directory: Some(private_directory),
         })
     }
 
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
+        })?;
+        #[cfg(unix)]
+        fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        let directory = crate::windows::open_private_directory(parent)?;
         #[cfg(windows)]
         if !path.exists() {
-            crate::windows::open_private_file(path, true, true)?;
+            directory.open_file(
+                path.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "state path has no file name",
+                    )
+                })?,
+                true,
+                true,
+            )?;
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(
@@ -132,6 +165,8 @@ impl SyncState {
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
+            #[cfg(windows)]
+            _directory: None,
         })
     }
 
@@ -424,7 +459,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("artifacts");
         fs::create_dir(&root).unwrap();
-        let database = temp.path().join("state.sqlite3");
+        let database = temp.path().join("private/state.sqlite3");
         let state = SyncState::open(&database).unwrap();
         fs::write(root.join("config.json"), r#"{"team":"w3dev"}"#).unwrap();
         fs::write(root.join("loose.txt"), "ignored").unwrap();
@@ -460,7 +495,7 @@ mod tests {
         fs::create_dir_all(root.join("UpperCase")).unwrap();
         fs::write(root.join("UpperCase/secret.txt"), "ignored").unwrap();
         fs::write(root.join("loose.txt"), "ignored").unwrap();
-        let database = temp.path().join("state.sqlite3");
+        let database = temp.path().join("private/state.sqlite3");
         let state = SyncState::open(&database).unwrap();
         state
             .connection
@@ -506,7 +541,7 @@ mod tests {
     #[test]
     fn read_only_pending_count_handles_missing_and_existing_databases() {
         let temp = tempfile::tempdir().unwrap();
-        let database = temp.path().join("state.sqlite3");
+        let database = temp.path().join("private/state.sqlite3");
         assert_eq!(pending_count_from_path(&database).unwrap(), 0);
 
         let state = SyncState::open(&database).unwrap();
