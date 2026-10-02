@@ -122,6 +122,14 @@ jobs:
           npm install --prefix ./dist/install --ignore-scripts ./dist/artifact-sync-*.tgz
           node ./dist/install/node_modules/artifact-sync/bin/artifact-sync.js --version
           node ./dist/install/node_modules/artifact-sync/bin/artifact-sync.js daemon --status
+      - name: Smoke test Windows npm command shim
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & './dist/install/node_modules/.bin/artifact-sync.cmd' --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & './dist/install/node_modules/.bin/artifact-sync.cmd' daemon --status
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   publish:
     name: Publish npm package
